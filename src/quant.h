@@ -58,4 +58,12 @@ inline i8 requantize(i32 acc, i32 multiplier, uint32_t shift) {
     return saturate(round_shift(product, shift));
 }
 
+// The activation pipeline's arithmetic, in the one place both the reference
+// model and the timed model can call it: bias is added in int64 so a large bias
+// cannot overflow before scaling. Equivalent to requantize() when bias is 0.
+inline i8 requantize_biased(i32 acc, i32 bias, i32 multiplier, uint32_t shift) {
+    const int64_t biased = static_cast<int64_t>(acc) + bias;
+    return saturate(round_shift(biased * multiplier, shift));
+}
+
 }  // namespace quant
