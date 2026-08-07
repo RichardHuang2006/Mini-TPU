@@ -42,7 +42,10 @@ $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS_REL) -MMD -MP -c $< -o $@
 
 # ------------------------------------------------------ debug / sanitized ---
-debug: $(BUILD)/minitpu-debug
+# Building the sanitized binary is only half the point; the reason to have an
+# instrumented build is to run the whole suite under it.
+debug: $(BUILD)/minitpu-debug $(BUILD)/test_main-debug
+	./$(BUILD)/test_main-debug
 
 $(BUILD)/minitpu-debug: $(DBG_OBJ) | $(BUILD)
 	@if [ -z "$(DBG_OBJ)" ]; then echo "no src/*.cpp to build"; exit 1; fi
@@ -72,6 +75,10 @@ $(BUILD)/test_main: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
 	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
 	$(CXX) $(CXXFLAGS_REL) $(TEST_SRC) $(LIB_SRC) -o $@
 
+$(BUILD)/test_main-debug: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
+	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
+	$(CXX) $(CXXFLAGS_DBG) $(TEST_SRC) $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
+
 test: $(BUILD)/test_main examples
 	./$(BUILD)/test_main
 
@@ -85,7 +92,7 @@ clean:
 help:
 	@echo "Mini-TPU targets:"
 	@echo "  all      build/minitpu         (release, -O2, warnings on)"
-	@echo "  debug    build/minitpu-debug   (ASan + UBSan, -O1 -g)"
+	@echo "  debug    build/minitpu-debug   (ASan + UBSan, -O1 -g) + run the suite sanitized"
 	@echo "  test     compile+run tests/test_main after regenerating examples/"
 	@echo "  clean    remove build/ and examples/"
 
