@@ -55,7 +55,7 @@ $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 	$(CXX) $(CXXFLAGS_DBG) -MMD -MP -c $< -o $@
 
 # --------------------------------------------------------------- tooling ---
-$(BUILD)/gen_examples: $(TOOLS_SRC) | $(BUILD)
+$(BUILD)/gen_examples: $(TOOLS_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(TOOLS_SRC) -o $@
 
 # Skipped while the generator does not exist, rather than failing on a
