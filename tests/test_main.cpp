@@ -29,6 +29,7 @@
 #include "weight_fifo.h"
 #include "dma.h"
 #include "tpu.h"
+#include "stats.h"
 #include "tpuasm.h"
 #include "ref.h"
 #include "workloads.h"   // the layer tiler, shared with tools/gen_examples.cpp
@@ -306,9 +307,11 @@ std::string diff_run(const std::vector<RawInst>& prog, const Config& cfg,
 // The real thing: the cycle-accurate machine against the oracle. Returns "" when
 // they agree on every comparand.
 std::string diff_tpu(const std::vector<RawInst>& prog, const Config& cfg,
-                     const Setup& rsetup = {}, const TpuSetup& tsetup = {}) {
-    ref::Machine m(cfg);
-    Tpu          t(cfg);
+                     const Setup& rsetup = {}, const TpuSetup& tsetup = {},
+                     std::size_t host_bytes = 1u << 16,
+                     std::size_t weight_bytes = 1u << 16) {
+    ref::Machine m(cfg, host_bytes, weight_bytes);
+    Tpu          t(cfg, host_bytes, weight_bytes);
     if (rsetup) rsetup(m);
     if (tsetup) tsetup(t);
 
@@ -2977,14 +2980,25 @@ SECTION("weight_overlap") {
     // Without one, each of the two loads costs dim exposed cycles.
     REQUIRE(nodb.second.weight_load_bubble == 2ull * dim);
 
-    // The second weight load overlaps the first matmul when double buffered, so
-    // only one DDR latency is ever exposed: the first, which has nothing to hide
-    // behind.
-    REQUIRE(db.first == latency + 2 * mm + 1);
+    // Only one DDR latency is ever exposed. The prefetcher requested both tiles
+    // before the program issued anything, so the second was already on its way
+    // while the first was being waited for; what is left is the first tile, which
+    // has nothing to hide behind.
+    REQUIRE_MSG(db.first == latency + 2 * mm + 2,
+                "    double-buffered: " + std::to_string(db.first) + " cycles, want " +
+                    std::to_string(latency + 2 * mm + 2) + "\n");
 
-    // Without double buffering the loads serialize behind the matmuls entirely.
-    REQUIRE(nodb.first == 2 * (latency + dim) + 2 * mm + 1);
+    // Without a shadow plane each load also costs dim exposed cycles shifting into
+    // the array, and the second cannot start until the first matmul has finished
+    // with the plane it is about to overwrite.
+    REQUIRE_MSG(nodb.first == latency + 2 * dim + 2 * mm + 1,
+                "    single-plane:    " + std::to_string(nodb.first) + " cycles, want " +
+                    std::to_string(latency + 2 * dim + 2 * mm + 1) + "\n");
     REQUIRE(nodb.first > db.first);
+
+    // The DDR latency shows up as the array waiting on the FIFO, once.
+    REQUIRE(db.second.weight_fifo_empty == latency);
+    REQUIRE(nodb.second.weight_fifo_empty == latency);
 
     // The array itself confirms it: with a shadow plane it switches planes on
     // every matmul, and it never stood idle for a load.
@@ -2999,7 +3013,82 @@ SECTION("weight_overlap") {
         REQUIRE(t.run(p.code()).halted);
         REQUIRE(t.mxu().stats().plane_switches == 2);
         REQUIRE(t.mxu().stats().weight_load_bubble == 0);
-        REQUIRE(t.stalls().weight_stall > 0);      // the matmuls did wait for tiles
+        // The wait is on DDR, not on the plane: with a shadow plane to load into,
+        // nothing ever blocks on the resident tile itself.
+        REQUIRE(t.stalls().weight_fifo_empty > 0);
+        REQUIRE(t.stalls().weight_stall == 0);
+    }
+
+    // ---- FIFO depth is what decides how much latency is hidden --------------
+    // Four tiles, so a deep FIFO can have them all in flight at once and pay the
+    // DDR latency once, while a 1-deep FIFO cannot start a fetch until the previous
+    // tile has been consumed and pays it four times over.
+    //
+    // The latency here is deliberately longer than a matmul. A shallow FIFO still
+    // starts its next fetch while the array works, so with a short latency the wait
+    // hides behind the compute and the depth costs nothing measurable -- depth only
+    // buys something once DDR is slower than the work available to cover it.
+    {
+        const uint32_t slow_ddr = 40;      // longer than mm
+        REQUIRE(slow_ddr > mm);
+
+        tpuasm::Program four;
+        four.read_weights(0).matmul(0, len, 0)
+            .read_weights(tile_bytes).matmul(0, len, 1)
+            .read_weights(2 * tile_bytes).matmul(0, len, 0)
+            .read_weights(3 * tile_bytes).matmul(0, len, 1)
+            .halt();
+
+        auto run_depth = [&](uint32_t depth) {
+            Config cfg = small_cfg(dim, 2);
+            cfg.ub_bytes = 1024;
+            cfg.ddr_tile_latency = slow_ddr;
+            cfg.double_buffer = true;
+            cfg.weight_fifo_depth = depth;
+
+            Inputs many = in;
+            many.weights.assign(4 * tile_bytes, 0);
+            Lcg rng(4242);
+            for (i8& v : many.weights) v = rng.byte();
+
+            Tpu t(cfg);
+            tpu_setup(many)(t);
+            for (uint32_t i = 0; i < len * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+            const TpuResult r = t.run(four.code());
+            REQUIRE(r.halted);
+            return std::make_pair(r.cycles, t.stalls().weight_fifo_empty);
+        };
+
+        const auto deep    = run_depth(4);
+        const auto shallow = run_depth(1);
+
+        // Deep: one exposed latency for the first tile, the rest hidden.
+        REQUIRE_MSG(deep.second == slow_ddr,
+                    "    depth 4 waited " + std::to_string(deep.second) +
+                        " cycles on DDR, want " + std::to_string(slow_ddr) + "\n");
+        // Shallow: the FIFO holds one tile, so every load waits on DDR again, and
+        // the waits are too long to hide behind the matmuls.
+        REQUIRE(shallow.second > deep.second);
+        REQUIRE_MSG(shallow.first > deep.first,
+                    "    depth 1: " + std::to_string(shallow.first) + " cycles, depth 4: " +
+                        std::to_string(deep.first) + "\n");
+
+        // And the depth changes only the schedule, not the answer.
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 1024;
+        cfg.ddr_tile_latency = slow_ddr;
+        cfg.weight_fifo_depth = 1;
+
+        Inputs many = in;
+        many.weights.assign(4 * tile_bytes, 0);
+        Lcg rng(4242);
+        for (i8& v : many.weights) v = rng.byte();
+        many.ub_at = 0;
+        many.ub_bytes.assign(in.host_bytes.begin(), in.host_bytes.end());
+
+        const std::string diff =
+            diff_tpu(four.code(), cfg, ref_setup(many), tpu_setup(many));
+        REQUIRE_MSG(diff.empty(), diff);
     }
 
     // Faster must still mean identical: both configurations agree with the oracle.
@@ -4392,6 +4481,799 @@ SECTION("mlp") {
             }
         }
         REQUIRE(same);
+    }
+}
+
+// ------------------------------------------------ characterization helpers ---
+
+// Run a shipped workload on a given configuration and gather its statistics.
+struct Measured {
+    stats::Stats stats;
+    std::vector<i8> got;
+    bool halted = false;
+    uint64_t cycles = 0;
+};
+
+// How much host and weight memory a workload's addresses reach, so a big array
+// does not silently run out of room.
+std::size_t host_span(const wl::Workload& w) {
+    const std::size_t a_end = w.a_host + w.a.size();
+    const std::size_t y_end = w.y_host + w.y_bytes;
+    return std::max<std::size_t>(1u << 16, std::max(a_end, y_end) + 64);
+}
+
+std::size_t weight_span(const wl::Workload& w) {
+    return std::max<std::size_t>(1u << 16, w.b_ddr + w.b.size() + 64);
+}
+
+Inputs tensors_of(const wl::Workload& w) {
+    Inputs in;
+    in.host_at    = w.a_host;
+    in.host_bytes = w.a;
+    in.ddr_at     = w.b_ddr;
+    in.weights    = w.b;
+    return in;
+}
+
+Measured measure(const wl::Workload& w, const Config& cfg) {
+    const Inputs tensors = tensors_of(w);
+
+    Measured out;
+    Tpu t(cfg, host_span(w), weight_span(w));
+    tpu_setup(tensors)(t);
+
+    const TpuResult r = t.run(w.code);
+    out.halted = r.halted;
+    out.cycles = r.cycles;
+    out.stats  = stats::gather(t, r, w.macs, /*useful_known=*/true);
+
+    std::vector<i8> packed(w.y_bytes, 0);
+    for (std::size_t i = 0; i < packed.size(); ++i) {
+        packed[i] = static_cast<i8>(t.host()[w.y_host + i]);
+    }
+    out.got = wl::unpack(packed, w.out_rows, w.out_cols, cfg.dim);
+    return out;
+}
+
+// ------------------------------------------------------- @section("stats") ---
+SECTION("stats") {
+    // ---- the accounting balances ------------------------------------------
+    // Everything else in this section reads a number off the breakdown, so first
+    // establish that the breakdown is a partition: every cycle is either one the
+    // array was busy or one charged to exactly one cause. Without this a "dominant
+    // cause" would just be whichever bucket got double counted the most.
+    {
+        const std::vector<wl::Workload> all = wl::corpus();
+        for (const wl::Workload& w : all) {
+            const Measured m = measure(w, w.cfg);
+            REQUIRE_MSG(m.halted, "    " + w.name + "\n");
+
+            const stats::Stats& s = m.stats;
+            REQUIRE_MSG(s.balances(),
+                        "    " + w.name + ": busy " + std::to_string(s.array_busy) +
+                            " + idle " + std::to_string(s.lost.idle()) + " != cycles " +
+                            std::to_string(s.cycles) + "; stream " +
+                            std::to_string(s.stream_cycles) + " + fill/drain " +
+                            std::to_string(s.lost.array_fill_drain) + " != busy\n");
+
+            // And the run did real work, so the balance is not the trivial one.
+            REQUIRE(s.cycles > 0);
+            REQUIRE(s.array_busy > 0);
+            REQUIRE(s.stream_cycles > 0);
+            REQUIRE(s.macs_useful == w.macs);
+            REQUIRE(s.dma_bytes > 0);
+            REQUIRE(s.retired == w.code.size());
+        }
+    }
+
+    // ---- per-instruction cycle counts ------------------------------------
+    {
+        Config cfg;
+        cfg.dim = 8;
+        cfg.ub_bytes = 4096;
+        cfg.act_pipeline_depth = 4;
+        cfg.dma_bytes_per_cycle = 8;
+
+        tpuasm::Program p;
+        p.read_host(0, 0, 64)          // 64 bytes at 8 B/cyc = 8 cycles
+         .read_weights(0)
+         .matmul(0, 8, 0)              // 8 + 2*8 - 1 = 23 cycles
+         .activate(0, 512, 8, ActFn::RELU, 1, 4)   // 8*8 + 4 = 68 cycles
+         .halt();
+
+        Tpu t(cfg);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        const stats::Stats s = stats::gather(t, r);
+        REQUIRE(s.balances());
+
+        const auto idx = [](Op op) { return static_cast<std::size_t>(op); };
+        REQUIRE(s.op_count[idx(Op::READ_HOST)] == 1);
+        REQUIRE(s.op_cycles[idx(Op::READ_HOST)] == 8);
+        REQUIRE(s.op_count[idx(Op::MATMUL)] == 1);
+        REQUIRE(s.op_cycles[idx(Op::MATMUL)] == 8 + 2 * 8 - 1);
+        REQUIRE(s.op_count[idx(Op::ACTIVATE)] == 1);
+        REQUIRE(s.op_cycles[idx(Op::ACTIVATE)] == 8 * 8 + 4);
+        REQUIRE(s.dma_bytes == 64);
+
+        // With no workload MAC count supplied, "useful" falls back to what the
+        // array performed, so there is no phantom padding waste.
+        REQUIRE(!s.useful_known);
+        REQUIRE(s.macs_useful == s.macs_performed);
+        REQUIRE(s.lost.partial_tile_waste == 0);
+    }
+
+    // ---- utilization and TOPS move the way they should --------------------
+    {
+        wl::Layer l;
+        l.M = 64; l.K = 64; l.N = 64;
+        l.multiplier = 1; l.shift = 10; l.fn = ActFn::RELU;
+
+        Config small = wl::example_config();
+        small.dim = 8;
+        Config big = wl::example_config();
+        big.dim = 64;
+
+        const wl::Workload ws = wl::dense_workload("s", "", l, small, 8000);
+        const wl::Workload wb = wl::dense_workload("b", "", l, big, 8000);
+
+        const Measured ms = measure(ws, small);
+        const Measured mb = measure(wb, big);
+        REQUIRE(ms.halted);
+        REQUIRE(mb.halted);
+
+        // Same useful work either way.
+        REQUIRE(ms.stats.macs_useful == mb.stats.macs_useful);
+        REQUIRE(ms.stats.macs_useful == 64ull * 64 * 64);
+
+        // The big array finishes sooner in cycles but wastes a larger share of its
+        // width doing it, so utilization falls as the array grows past the problem.
+        REQUIRE(mb.cycles < ms.cycles);
+        REQUIRE(mb.stats.utilization() < ms.stats.utilization());
+
+        // Utilization is a fraction, and TOPS scales with useful work over time.
+        REQUIRE(ms.stats.utilization() > 0.0 && ms.stats.utilization() <= 1.0);
+        REQUIRE(mb.stats.utilization() > 0.0 && mb.stats.utilization() <= 1.0);
+        REQUIRE(ms.stats.tops() > 0.0);
+        REQUIRE(mb.stats.tops(1.4) > mb.stats.tops(0.7));   // twice the clock
+    }
+
+    // ---- padding shows up as partial_tile_waste ---------------------------
+    {
+        Config cfg;
+        cfg.dim = 16;
+        cfg.ub_bytes = 8192;
+
+        // K = 1 on a 16-wide array: fifteen sixteenths of every MAC is padding.
+        wl::Layer thin;
+        thin.M = 16; thin.K = 1; thin.N = 16;
+        thin.multiplier = 1; thin.shift = 4; thin.fn = ActFn::RELU;
+
+        wl::Layer full = thin;
+        full.K = 16;
+
+        const Measured a = measure(wl::dense_workload("thin", "", thin, cfg, 8100), cfg);
+        const Measured b = measure(wl::dense_workload("full", "", full, cfg, 8100), cfg);
+        REQUIRE(a.halted);
+        REQUIRE(b.halted);
+
+        // Both perform the same number of MACs; only the useful fraction differs.
+        REQUIRE(a.stats.macs_performed == b.stats.macs_performed);
+        REQUIRE(a.stats.macs_useful * 16 == b.stats.macs_useful);
+        REQUIRE(a.stats.lost.partial_tile_waste > b.stats.lost.partial_tile_waste);
+        REQUIRE(b.stats.lost.partial_tile_waste == 0);   // nothing padded
+        REQUIRE(a.stats.utilization() < b.stats.utilization());
+    }
+
+    // ---- the breakdown diagnoses a starved configuration ------------------
+    // The point of the breakdown. Take a workload, starve one resource, and the
+    // bucket named after that resource must account for the slowdown.
+    //
+    // This is checked as a *delta* rather than as a dominant cause because on these
+    // workloads the largest bucket is almost always array_fill_drain -- a matmul
+    // streams dim rows but pays 2*dim-1 cycles of pipeline latency, so most of the
+    // array's time goes into filling and draining whatever the configuration. That
+    // is a property of a small systolic array, not a provisioning problem, and a
+    // breakdown that only ever answered "array_fill_drain" would be useless. What
+    // makes it a diagnosis is that when a resource is taken away, the extra cycles
+    // land in that resource's bucket and nowhere else.
+    {
+        struct Starved {
+            const char*  name;
+            Config       cfg;
+            stats::Cause expect;
+        };
+
+        for (const wl::Spec& spec : wl::specs()) {
+            Config base = spec.cfg;
+            base.dim = 16;              // one array size, so only the knob varies
+            base.ub_bytes = 64 * 1024;
+
+            // A 1-deep FIFO on its own is not a stress: the prefetcher starts the
+            // next fetch while the array works, and the default 8-cycle DDR latency
+            // hides completely behind a single matmul. Depth only costs anything
+            // once DDR is slower than the compute available to cover it, so the
+            // weight-starved configuration slows DDR down too.
+            Config fifo = base;
+            fifo.weight_fifo_depth = 1;
+            fifo.ddr_tile_latency  = 400;
+
+            Config dma = base;
+            dma.dma_bytes_per_cycle = 1;
+
+            const Starved cases[] = {
+                {"1-deep FIFO, slow DDR", fifo, stats::Cause::WEIGHT_FIFO_EMPTY},
+                {"1 byte/cycle DMA",      dma,  stats::Cause::DMA_BOUND},
+            };
+
+            const Measured ref = measure(wl::build(spec, base), base);
+            REQUIRE(ref.halted);
+
+            for (const Starved& s : cases) {
+                const Measured m = measure(wl::build(spec, s.cfg), s.cfg);
+                const std::string where = "    " + spec.name + " / " + s.name + ": ";
+                REQUIRE_MSG(m.halted, where + "did not halt\n");
+
+                // Starving the resource cost time,
+                REQUIRE_MSG(m.cycles > ref.cycles,
+                            where + std::to_string(m.cycles) + " cycles vs baseline " +
+                                std::to_string(ref.cycles) + "\n");
+
+                // the named bucket grew,
+                const uint64_t before = ref.stats.weight_of(s.expect);
+                const uint64_t after  = m.stats.weight_of(s.expect);
+                REQUIRE_MSG(after > before,
+                            where + std::string(stats::cause_name(s.expect)) + " " +
+                                std::to_string(before) + " -> " + std::to_string(after) +
+                                "\n");
+
+                // and it grew by enough to explain most of the slowdown. Not all of
+                // it: a stall that delays issue also shifts everything behind it, so
+                // a few cycles leak into neighbouring buckets.
+                const uint64_t slower = m.cycles - ref.cycles;
+                const uint64_t grew   = after - before;
+                REQUIRE_MSG(2 * grew >= slower,
+                            where + std::to_string(slower) + " cycles slower but " +
+                                stats::cause_name(s.expect) + " only grew by " +
+                                std::to_string(grew) + "\n");
+
+                // and no other bucket grew more than it did, so the breakdown points
+                // at the resource that was actually taken away.
+                const stats::Cause others[] = {
+                    stats::Cause::WEIGHT_FIFO_EMPTY, stats::Cause::UB_BANK_CONFLICT,
+                    stats::Cause::ACCUM_HAZARD,      stats::Cause::DMA_BOUND,
+                    stats::Cause::ACTIVATION,        stats::Cause::OTHER,
+                };
+                for (const stats::Cause c : others) {
+                    if (c == s.expect) continue;
+                    const uint64_t b = ref.stats.weight_of(c);
+                    const uint64_t a = m.stats.weight_of(c);
+                    const uint64_t g = a > b ? a - b : 0;
+                    REQUIRE_MSG(g <= grew,
+                                where + std::string(cause_name(c)) + " grew by " +
+                                    std::to_string(g) + ", more than " +
+                                    stats::cause_name(s.expect) + "'s " +
+                                    std::to_string(grew) + "\n");
+                }
+            }
+        }
+    }
+
+    // ---- Unified Buffer port contention -----------------------------------
+    // A single-bank UB is a much weaker stress than the plan expected, and it is
+    // worth being precise about why rather than reporting a number that only looks
+    // like a diagnosis.
+    //
+    // A bank carries one read and one write per cycle, so the bank count limits how
+    // many transfers in the same direction can be in flight. But at most one
+    // instruction per unit is ever in flight, so the only same-direction pairs that
+    // can exist are a matmul and a Write_Host reading, or a Read_Host and an
+    // Activate writing -- two streams per direction, whatever the workload. One bank
+    // therefore serializes at most one pair at a time, and above one bank there is
+    // no contention left to find at any depth.
+    //
+    // So: the mechanism is real and worth measuring, but on the shipped workloads it
+    // is worth tens of cycles, not thousands, and it is never the dominant cause.
+    // Making it one would take more concurrency than this sequencer has.
+    {
+        const uint32_t dim = 8, len = 8;
+        const uint32_t a_ub = 0, c_ub = 256;
+        const uint32_t drain_bytes = 1024;   // long enough to outlast the activation
+
+        // A long drain of one region overlapping matmuls that read another. Nothing
+        // connects them but the buffer's read ports.
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(a_ub, len, 0)
+         .activate(0, c_ub, len, ActFn::IDENTITY, 1, 0)
+         .write_host(c_ub, 0, drain_bytes)
+         .matmul(a_ub, len, 1)
+         .matmul(a_ub, len, 2)
+         .halt();
+
+        auto run_banks = [&](uint32_t nbanks) {
+            Config cfg = small_cfg(dim, 3);
+            cfg.ub_bytes = 4096;
+            cfg.ub_banks = nbanks;
+            cfg.dma_bytes_per_cycle = 8;    // 1024 bytes = 128 cycles, longer than a matmul
+
+            Inputs in = random_inputs(7788, dim, len, 3);
+            in.ub_at = a_ub;
+            in.ub_bytes.assign(in.host_bytes.begin(), in.host_bytes.end());
+
+            Tpu t(cfg);
+            tpu_setup(in)(t);
+            const TpuResult r = t.run(p.code());
+            REQUIRE(r.halted);
+            return stats::gather(t, r);
+        };
+
+        const stats::Stats many = run_banks(8);
+        const stats::Stats one  = run_banks(1);
+
+        // Eight banks: the drain and the matmuls behind it overlap freely.
+        REQUIRE(many.lost.ub_bank_conflict == 0);
+
+        // One bank: the matmuls are readers too, so they wait for the drain to give
+        // the read port back, and the wait is charged to the right bucket.
+        REQUIRE_MSG(one.lost.ub_bank_conflict > 0,
+                    "    one bank produced no conflicts at all\n");
+        REQUIRE_MSG(one.cycles > many.cycles,
+                    "    1 bank: " + std::to_string(one.cycles) + " cycles, 8 banks: " +
+                        std::to_string(many.cycles) + "\n");
+
+        const uint64_t slower = one.cycles - many.cycles;
+        REQUIRE_MSG(one.lost.ub_bank_conflict >= slower,
+                    "    " + std::to_string(slower) + " cycles slower, " +
+                        std::to_string(one.lost.ub_bank_conflict) + " charged to banks\n");
+
+        // Here it *is* the dominant resource stall, because the program was built to
+        // make it one.
+        REQUIRE_MSG(one.dominant_stall_cause() == stats::Cause::UB_BANK_CONFLICT,
+                    "    largest stall is " + std::string(one.dominant_stall_name()) + "\n");
+
+        // Above one bank the knob is inert: nothing in this machine can ask for a
+        // third stream in either direction, so every shipped workload runs
+        // conflict-free at any bank count above one.
+        for (uint32_t nbanks : {2u, 4u, 8u}) {
+            REQUIRE(run_banks(nbanks).lost.ub_bank_conflict == 0);
+        }
+        for (const wl::Spec& spec : wl::specs()) {
+            Config cfg = spec.cfg;
+            cfg.dim = 16;
+            cfg.ub_bytes = 64 * 1024;
+            cfg.ub_banks = 2;
+            const Measured m = measure(wl::build(spec, cfg), cfg);
+            REQUIRE(m.halted);
+            REQUIRE_MSG(m.stats.lost.ub_bank_conflict == 0,
+                        "    " + spec.name + " conflicted with two banks\n");
+        }
+    }
+
+    // ---- a DMA-bound run is dominated by its transfers ---------------------
+    // Where the plan's stronger claim does hold: starve the DMA far enough and
+    // data movement outweighs everything else, fill and drain included.
+    {
+        for (const wl::Spec& spec : wl::specs()) {
+            Config cfg = spec.cfg;
+            cfg.dim = 16;
+            cfg.ub_bytes = 64 * 1024;
+            cfg.dma_bytes_per_cycle = 1;
+
+            const Measured m = measure(wl::build(spec, cfg), cfg);
+            REQUIRE(m.halted);
+            REQUIRE_MSG(m.stats.dominant_stall_cause() == stats::Cause::DMA_BOUND,
+                        "    " + spec.name + ": largest stall is " +
+                            m.stats.dominant_stall_name() + "\n");
+            REQUIRE_MSG(m.stats.below_ridge(),
+                        "    " + spec.name + ": intensity " +
+                            std::to_string(m.stats.arithmetic_intensity()) + " vs ridge " +
+                            std::to_string(m.stats.ridge_point()) + "\n");
+        }
+    }
+
+    // ---- the report renders ----------------------------------------------
+    {
+        const wl::Workload w = wl::corpus().front();
+        const Measured m = measure(w, w.cfg);
+        const std::string text = m.stats.report(w.name);
+        REQUIRE(text.find(w.name) != std::string::npos);
+        REQUIRE(text.find("dominant cause") != std::string::npos);
+        REQUIRE(text.find("MatMul") != std::string::npos);
+        REQUIRE(text.find("utilization") != std::string::npos);
+        REQUIRE(text.size() > 200);
+    }
+}
+
+// -------------------------------------------------- @section("properties") ---
+
+// Requantization computed from the specification rather than from quant.h: a
+// multiply, a divide by 2^shift rounding halves away from zero, and a saturating
+// narrow to int8. The point of writing it twice is that the timed model and the
+// oracle deliberately *share* quant.h -- a bit-exactness test against the same code
+// they both call would be vacuous -- so the third opinion has to come from here.
+i8 spec_requantize(i32 acc, i32 bias, i32 multiplier, uint32_t shift) {
+    const long long biased  = static_cast<long long>(acc) + bias;
+    const long long product = biased * multiplier;
+
+    long long scaled = product;
+    if (shift != 0) {
+        const long long half = 1LL << (shift - 1);
+        scaled = product >= 0 ? (product + half) >> shift
+                              : -((-product + half) >> shift);
+    }
+
+    if (scaled >  127) return static_cast<i8>(127);
+    if (scaled < -128) return static_cast<i8>(-128);
+    return static_cast<i8>(scaled);
+}
+
+SECTION("properties") {
+    // Invariants that hold without reference to the oracle. Everything else in the
+    // suite says "the two models agree"; these say what the machine actually is, so
+    // a change that moves both models together still has to answer to them.
+
+    // ---- a matmul takes exactly len + 2*dim - 1 cycles ---------------------
+    // The systolic fill and drain, stated as a closed form and checked across every
+    // stream length the ISA permits, on three array sizes.
+    for (const uint32_t dim : {4u, 8u, 16u}) {
+        for (uint32_t len = 1; len <= dim; ++len) {
+            Config cfg = small_cfg(dim, 2);
+            cfg.ub_bytes = 16 * dim * dim;
+            cfg.ddr_tile_latency = 0;      // measure the array, not memory
+
+            const Inputs in = random_inputs(3300 + dim, dim, len, 2);
+
+            // One matmul, timed against the same program without it.
+            tpuasm::Program with, without;
+            with.read_weights(0).matmul(0, len, 0).halt();
+            without.read_weights(0).halt();
+
+            auto cycles_of = [&](const std::vector<RawInst>& code) {
+                Tpu t(cfg);
+                tpu_setup(in)(t);
+                for (uint32_t i = 0; i < len * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+                const TpuResult r = t.run(code);
+                REQUIRE(r.halted);
+                return r.cycles;
+            };
+
+            const uint64_t delta = cycles_of(with.code()) - cycles_of(without.code());
+            REQUIRE_MSG(delta == len + 2ull * dim - 1ull,
+                        "    dim " + std::to_string(dim) + " len " + std::to_string(len) +
+                            ": matmul cost " + std::to_string(delta) + " cycles, want " +
+                            std::to_string(len + 2 * dim - 1) + "\n");
+        }
+    }
+
+    // ---- and that fixes a ceiling on utilization --------------------------
+    // §8.3 expected a full tile to reach >90% array utilization. It cannot, and the
+    // reason is worth stating precisely rather than quietly relaxing the bound.
+    //
+    // Utilization is amortized over the stream: len cycles of work for
+    // len + 2*dim - 1 cycles of occupancy. Long streams would amortize the fill
+    // away, but `len` cannot exceed dim, because a matmul's results land in one
+    // accumulator bank and a bank is dim rows deep. So the best a single matmul can
+    // do is dim / (3*dim - 1), which falls towards one third as the array grows and
+    // is nowhere near 90% at any size.
+    //
+    // This is the headline finding of the characterization: the array is not stalling,
+    // it is draining. Deeper accumulator banks, not more bandwidth, are what would
+    // move it (§10).
+    for (const uint32_t dim : {8u, 32u}) {
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 16 * dim * dim;
+        cfg.ddr_tile_latency = 0;
+
+        const Inputs in = random_inputs(4400 + dim, dim, dim, 2);
+
+        tpuasm::Program p;
+        p.read_weights(0).matmul(0, dim, 0).halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        for (uint32_t i = 0; i < dim * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+
+        const stats::Stats s = stats::gather(t, r);
+        const double best = static_cast<double>(dim) / static_cast<double>(3 * dim - 1);
+
+        REQUIRE(s.stream_cycles == dim);
+        REQUIRE(s.array_busy == dim + 2ull * dim - 1ull);
+        REQUIRE_MSG(std::abs(s.busy_utilization() - best) < 1e-9,
+                    "    dim " + std::to_string(dim) + ": busy utilization " +
+                        std::to_string(s.busy_utilization()) + ", ceiling " +
+                        std::to_string(best) + "\n");
+        REQUIRE(s.busy_utilization() < 0.35);
+        REQUIRE(s.busy_utilization() > 1.0 / 3.0);   // and it does not fall below a third
+    }
+
+    // ---- the activation pipeline is scalar, and that is what binds --------
+    // §6.2 specifies a throughput-1 pipeline emitting one requantized element per
+    // cycle, so an Activate over a full bank costs dim*dim + depth cycles while the
+    // matmul that filled that bank cost only 3*dim - 1. The ratio grows linearly
+    // with dim, so past a small array the machine spends most of its time
+    // requantizing rather than multiplying -- which is exactly what the breakdown
+    // reports for the 32x32 and 256x256 configurations.
+    //
+    // There is no crossover to find: dim*dim + depth exceeds 3*dim - 1 at every
+    // array size, so the pipeline is always the more expensive half and the gap only
+    // widens. Pinning it here means a future dim-wide activation pipeline (§10) has
+    // to come and change this test on purpose.
+    double prev_ratio = 0.0;
+    for (const uint32_t dim : {4u, 8u, 32u}) {
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 16 * dim * dim;
+        cfg.act_pipeline_depth = 4;
+
+        const Inputs in = random_inputs(6600 + dim, dim, dim, 2);
+
+        tpuasm::Program p;
+        p.read_weights(0).matmul(0, dim, 0).activate(0, 0, dim, ActFn::RELU, 1, 8).halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        for (uint32_t i = 0; i < dim * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+
+        const stats::Stats s = stats::gather(t, r);
+        const uint64_t act_cost = s.op_cycles[static_cast<std::size_t>(Op::ACTIVATE)];
+        const uint64_t mm_cost  = s.op_cycles[static_cast<std::size_t>(Op::MATMUL)];
+
+        REQUIRE_MSG(act_cost == static_cast<uint64_t>(dim) * dim + 4,
+                    "    dim " + std::to_string(dim) + ": activate cost " +
+                        std::to_string(act_cost) + "\n");
+        REQUIRE(mm_cost == 3ull * dim - 1ull);
+
+        // Always the expensive half, and increasingly so.
+        const double ratio = static_cast<double>(act_cost) / static_cast<double>(mm_cost);
+        REQUIRE_MSG(ratio > 1.0,
+                    "    dim " + std::to_string(dim) + ": activate/matmul " +
+                        std::to_string(ratio) + "\n");
+        REQUIRE(ratio > prev_ratio);
+        prev_ratio = ratio;
+    }
+    // By dim 32 the pipeline costs an order of magnitude more than the matmul that
+    // fed it, which is why `activation` is the dominant stall at that size.
+    REQUIRE(prev_ratio > 10.0);
+
+    // ---- the weight-load bubble is zero, or exactly dim -------------------
+    {
+        const uint32_t dim = 8, len = 8;
+        const Inputs   in  = random_inputs(5500, dim, len, 2);
+
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, len, 0)
+         .read_weights(dim * dim)
+         .matmul(0, len, 1)
+         .halt();
+
+        auto bubble_of = [&](bool double_buffer) {
+            Config cfg = small_cfg(dim, 2);
+            cfg.ub_bytes = 16 * dim * dim;
+            cfg.double_buffer = double_buffer;
+
+            Tpu t(cfg);
+            tpu_setup(in)(t);
+            for (uint32_t i = 0; i < len * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+            REQUIRE(t.run(p.code()).halted);
+            // The sequencer's tally, not the array's: through the sequencer the
+            // shift is untimed at the array and charged at issue instead.
+            return t.stalls().weight_load_bubble;
+        };
+
+        REQUIRE(bubble_of(true) == 0);
+        REQUIRE(bubble_of(false) == 2ull * dim);   // two loads, dim cycles each
+    }
+
+    // ---- requantization is bit-exact against the specification ------------
+    // Driven through the machine, not through quant.h: accumulator values are
+    // planted in a bank and an Activate is asked to requantize them, so what is
+    // compared is the hardware path's output against an independent computation.
+    {
+        const uint32_t dim = 8;
+        const struct { i32 mult; uint32_t shift; i32 bias; } scales[] = {
+            {1, 0, 0},        // identity, no rounding at all
+            {1, 1, 0},        // every other value is a tie
+            {1, 8, 0},
+            {3, 9, 0},
+            {7, 4, 0},        // large products, saturating both ends
+            {1, 7, 300},      // bias big enough to move the clamp
+            {5, 3, -250},
+            {129, 15, 11},
+        };
+
+        for (const auto& sc : scales) {
+            Config cfg = small_cfg(dim, 1);
+            cfg.ub_bytes = 16 * dim * dim;
+
+            // A dense sweep around zero, where the ties and both clamps live, plus
+            // the extremes of the accumulator range.
+            std::vector<i32> vals(static_cast<std::size_t>(dim) * dim);
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                const int k = static_cast<int>(i) - static_cast<int>(vals.size() / 2);
+                vals[i] = k;
+            }
+            vals[0] = std::numeric_limits<i32>::min() / 256;
+            vals[1] = std::numeric_limits<i32>::max() / 256;
+            vals[2] = 0;
+
+            Inputs in;
+            in.acc_at   = 0;
+            in.acc_vals = vals;
+
+            tpuasm::ActArgs act;
+            act.acc = 0;
+            act.dst = 0;
+            act.len = dim;
+            act.fn   = ActFn::IDENTITY;
+            act.bias = sc.bias;
+            act.multiplier = sc.mult;
+            act.shift = sc.shift;
+
+            tpuasm::Program p;
+            p.activate(act).halt();
+
+            Tpu t(cfg);
+            tpu_setup(in)(t);
+            REQUIRE(t.run(p.code()).halted);
+
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                const i8 want = spec_requantize(vals[i], sc.bias, sc.mult, sc.shift);
+                const i8 got  = t.ub().at(static_cast<UbAddr>(i));
+                REQUIRE_MSG(got == want,
+                            "    mult " + std::to_string(sc.mult) + " shift " +
+                                std::to_string(sc.shift) + " bias " +
+                                std::to_string(sc.bias) + " acc " +
+                                std::to_string(vals[i]) + ": got " +
+                                std::to_string(static_cast<int>(got)) + " want " +
+                                std::to_string(static_cast<int>(want)) + "\n");
+            }
+        }
+
+        // Ties in both signs, explicitly, and both clamps -- the three things §4.4
+        // of the design calls out as bug magnets.
+        REQUIRE(spec_requantize(5, 0, 1, 1) == 3);     //  2.5 -> 3
+        REQUIRE(spec_requantize(-5, 0, 1, 1) == -3);   // -2.5 -> -3
+        REQUIRE(spec_requantize(3, 0, 1, 1) == 2);     //  1.5 -> 2
+        REQUIRE(spec_requantize(-3, 0, 1, 1) == -2);
+        REQUIRE(spec_requantize(1 << 20, 0, 1, 0) == 127);
+        REQUIRE(spec_requantize(-(1 << 20), 0, 1, 0) == -128);
+    }
+
+    // ---- below the ridge, time scales with bytes and not with MACs --------
+    // The roofline claim. Halving the DMA bandwidth of a memory-bound run should
+    // very nearly double it, because the array is already waiting; the same change
+    // to a compute-bound run should barely register.
+    {
+        const wl::Spec spec = wl::specs().front();   // matmul_128
+
+        auto at_bandwidth = [&](uint32_t bw) {
+            Config cfg = spec.cfg;
+            cfg.dim = 16;
+            cfg.ub_bytes = 64 * 1024;
+            cfg.dma_bytes_per_cycle = bw;
+            const Measured m = measure(wl::build(spec, cfg), cfg);
+            REQUIRE(m.halted);
+            return m.stats;
+        };
+
+        const stats::Stats slow   = at_bandwidth(1);
+        const stats::Stats slower = at_bandwidth(1);   // same, as a determinism check
+        REQUIRE(slow.cycles == slower.cycles);
+
+        const stats::Stats half = at_bandwidth(2);
+        REQUIRE(slow.below_ridge());
+        REQUIRE(slow.dominant_stall_cause() == stats::Cause::DMA_BOUND);
+
+        // The same bytes at half the rate: the DMA-bound part of the run doubles.
+        REQUIRE(slow.dma_bytes == half.dma_bytes);
+        REQUIRE_MSG(slow.cycles > half.cycles,
+                    "    1 B/cyc: " + std::to_string(slow.cycles) + ", 2 B/cyc: " +
+                        std::to_string(half.cycles) + "\n");
+        const uint64_t moved_slow = slow.dma_bytes;          // 1 cycle per byte
+        REQUIRE_MSG(slow.lost.dma_bound * 2 >= moved_slow,
+                    "    only " + std::to_string(slow.lost.dma_bound) +
+                        " cycles charged to DMA for " + std::to_string(moved_slow) +
+                        " bytes\n");
+
+        // And a well-fed configuration of the same workload is compute-bound, so the
+        // ridge is telling us something about the configuration and not just about
+        // the shape.
+        const stats::Stats fast = at_bandwidth(64);
+        REQUIRE(!fast.below_ridge());
+        REQUIRE(fast.dominant_stall_cause() != stats::Cause::DMA_BOUND);
+        REQUIRE(fast.cycles < slow.cycles);
+
+        // Bandwidth does not change the arithmetic, only the schedule.
+        REQUIRE(slow.macs_useful == fast.macs_useful);
+    }
+
+    // ---- more banks cannot make port contention worse ---------------------
+    // The monotonicity the bank model has to have: adding ports never adds conflicts.
+    {
+        uint64_t prev = 0;
+        bool     first = true;
+        for (const uint32_t nbanks : {1u, 2u, 4u, 8u}) {
+            Config cfg = wl::specs().front().cfg;
+            cfg.dim = 16;
+            cfg.ub_bytes = 64 * 1024;
+            cfg.ub_banks = nbanks;
+
+            const Measured m = measure(wl::build(wl::specs().front(), cfg), cfg);
+            REQUIRE(m.halted);
+            const uint64_t conflicts = m.stats.lost.ub_bank_conflict;
+            if (!first) REQUIRE(conflicts <= prev);
+            prev  = conflicts;
+            first = false;
+        }
+        REQUIRE(prev == 0);   // eight banks: none left
+    }
+}
+
+// ------------------------------------------------ @section("config_sweep") ---
+SECTION("config_sweep") {
+    // Every workload on all six configurations from §8.2.
+    //
+    // The value of the sweep is that dataflow, skew, interlock and padding bugs are
+    // configuration-dependent in a way arithmetic bugs are not: a skew that is off
+    // by one produces the right answer whenever dim divides the shape and the wrong
+    // one whenever it does not, and a lowering that assumes a full tile is only
+    // wrong on the ragged edge. Running one array size proves very little; running
+    // 8x8 next to 256x256 with the same expected output proves a lot.
+    struct Named {
+        const char* name;
+        Config (*make)(Config);
+    };
+
+    const Named configs[] = {
+        {"default",     [](Config c) { return c; }},
+        {"8x8",         [](Config c) { c.dim = 8;   return c; }},
+        {"256x256",     [](Config c) { c.dim = 256; return c; }},
+        {"1-bank UB",   [](Config c) { c.ub_banks = 1; return c; }},
+        {"1-deep FIFO", [](Config c) {
+             c.weight_fifo_depth = 1;
+             c.ddr_tile_latency  = 200;   // depth is inert unless DDR is slow
+             return c;
+         }},
+        {"slow DMA",    [](Config c) { c.dma_bytes_per_cycle = 1; return c; }},
+    };
+
+    for (const wl::Spec& spec : wl::specs()) {
+        for (const Named& n : configs) {
+            Config cfg = n.make(spec.cfg);
+            // Room for the largest tile any of these array sizes needs.
+            cfg.ub_bytes = std::max<uint32_t>(cfg.ub_bytes, 16 * cfg.dim * cfg.dim);
+
+            const wl::Workload w = wl::build(spec, cfg);
+            const std::string  at = "    " + spec.name + " / " + n.name + ": ";
+
+            const Measured m = measure(w, cfg);
+            REQUIRE_MSG(m.halted, at + "did not halt\n");
+
+            // The answer is the answer, on any array size.
+            REQUIRE_MSG(m.got == w.expect,
+                        at + tensor_mismatch(m.got, w.expect, w.out_rows, w.out_cols));
+
+            // Every instruction accounted for, none dropped or issued twice.
+            REQUIRE_MSG(m.stats.retired == w.code.size(),
+                        at + "retired " + std::to_string(m.stats.retired) + " of " +
+                            std::to_string(w.code.size()) + "\n");
+
+            // And the machine agrees with the oracle on the whole visible state,
+            // not just the output tile: accumulators at each Sync, buffer, host
+            // memory, trap reason, retired count.
+            const std::string diff =
+                diff_tpu(w.code, cfg, ref_setup(tensors_of(w)), tpu_setup(tensors_of(w)),
+                         host_span(w), weight_span(w));
+            REQUIRE_MSG(diff.empty(), at + "\n" + diff);
+
+            // The accounting holds on every configuration, not only the default one.
+            REQUIRE_MSG(m.stats.balances(), at + "statistics do not balance\n");
+        }
     }
 }
 

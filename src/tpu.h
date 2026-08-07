@@ -84,6 +84,7 @@ struct StallStats {
     uint64_t unit_busy         = 0;   // structural: the unit already has work
     uint64_t weight_fifo_full  = 0;
     uint64_t weight_fifo_empty = 0;
+    uint64_t ub_bank_conflict  = 0;   // no free Unified Buffer port this cycle
     uint64_t drain             = 0;   // Sync, Halt, or a trap waiting for quiet
 
     // Cycles the array stood idle for a weight load because there was no shadow
@@ -92,7 +93,45 @@ struct StallStats {
 
     uint64_t total() const {
         return ub_raw + ub_war + ub_waw + accum_hazard + weight_stall + unit_busy +
-               weight_fifo_full + weight_fifo_empty + drain;
+               weight_fifo_full + weight_fifo_empty + ub_bank_conflict + drain;
+    }
+};
+
+// What the array was doing, cycle by cycle, and why it was not doing anything
+// better. src/stats.h turns this into utilization, TOPS and a stall-cause
+// breakdown; keeping the raw tallies here and the arithmetic there means the
+// machine never has to know how a number will be presented.
+//
+// The idle buckets partition `cycles - array_busy` exactly: every cycle the array
+// stands still bumps precisely one of them. That is the property that makes the
+// breakdown a diagnosis instead of a decoration -- if the buckets did not add up,
+// a dominant cause would be an artefact of what got double counted.
+struct RunProfile {
+    uint64_t array_busy    = 0;   // cycles the MXU had a matmul in flight
+    uint64_t stream_cycles = 0;   // of those, cycles spent streaming rows
+    uint64_t matmuls       = 0;
+
+    // MACs the array actually performed, padding included: one per PE per
+    // streaming cycle. The useful subset is a property of the workload, not of
+    // the machine, so the caller supplies it.
+    uint64_t macs_performed = 0;
+
+    uint64_t dma_bytes = 0;
+
+    // Cycles the array was idle, by what the machine was waiting on.
+    uint64_t idle_weights   = 0;   // the weight path: hazard, FIFO, or DDR latency
+    uint64_t idle_bank      = 0;   // no free Unified Buffer port
+    uint64_t idle_accum     = 0;   // an accumulator bank still in use
+    uint64_t idle_dma       = 0;   // data movement in flight
+    uint64_t idle_act       = 0;   // the activation pipeline in flight
+    uint64_t idle_other     = 0;   // drain at the end, and everything unclaimed
+
+    static constexpr std::size_t OPS = 8;
+    uint64_t op_cycles[OPS] = {};   // cycles each opcode occupied its unit
+    uint64_t op_count[OPS]  = {};
+
+    uint64_t idle_total() const {
+        return idle_weights + idle_bank + idle_accum + idle_dma + idle_act + idle_other;
     }
 };
 
@@ -192,6 +231,7 @@ public:
     TpuResult run(const std::vector<RawInst>& prog, const TpuOptions& opts = TpuOptions{});
 
     const StallStats& stalls() const { return stalls_; }
+    const RunProfile& profile() const { return profile_; }
 
     // Whether anything is still in flight. Sync, Halt and traps wait for this.
     bool quiet() const;
@@ -214,6 +254,18 @@ private:
     // stall counter and returns true.
     bool interlocked(const Reservation& r);
 
+    // Is there a free Unified Buffer port for this instruction's stream?
+    //
+    // A bank exposes one read and one write port per cycle, and an instruction
+    // touching the buffer holds the port of its direction for its whole duration
+    // (§4.1, §4.4). So the bank count is a budget on how many transfers in the
+    // same direction can be in flight at once, and the model tracks streams rather
+    // than the individual byte each one reaches in a given cycle: a row of a tile
+    // spans every bank at these sizes, so a byte-exact check would forbid a matmul
+    // and a DMA from ever overlapping. bank_of() remains the byte-exact primitive
+    // for the single-cycle multi-address case.
+    bool ub_port_available(const Reservation& r);
+
     // Read the instruction's inputs and stage its outputs, returning how long it
     // occupies its unit.
     uint64_t execute(const Decoded& d, PendingWrite& pw);
@@ -229,6 +281,14 @@ private:
     void retire_completed(TpuResult& st);
     void reset_pipeline();
 
+    // Read ahead for upcoming Read_Weights and keep their tiles arriving from DDR,
+    // so the FIFO depth decides how much of the latency is hidden.
+    void prefetch_weights(const std::vector<RawInst>& prog);
+
+    // Charge one array-idle cycle to a cause, given the stall counters as they
+    // stood before this cycle's issue attempt.
+    void charge_idle_cycle(const StallStats& before);
+
     Config cfg_;
 
     UnifiedBuffer ub_;
@@ -243,6 +303,10 @@ private:
     uint64_t    cycle_ = 0;
     std::size_t pc_    = 0;
 
+    // How far the weight prefetcher has read ahead. Always at or ahead of pc_.
+    std::size_t prefetch_pc_ = 0;
+
     InFlight   units_[static_cast<std::size_t>(Unit::COUNT)];
     StallStats stalls_;
+    RunProfile profile_;
 };

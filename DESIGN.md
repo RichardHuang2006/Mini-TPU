@@ -302,11 +302,13 @@ Any dataflow, skew, interlock, or requantization bug shows up as a **configurati
 
 Beyond numerical correctness, targeted tests assert:
 
-- A `dim × dim` tile fed `N ≥ dim` columns completes in exactly `N + 2·dim − 1` cycles at >90% utilization.
+- A matmul streaming `len` rows costs exactly `len + 2·dim − 1` cycles, checked for every `len` the ISA permits on three array sizes.
+- Array utilization for a full tile is exactly `dim / (3·dim − 1)`. This started as a ">90% utilization" expectation, which is unreachable: `len ≤ dim` because a bank is `dim` rows deep, so the fill cost can never be amortized past a third ([§9.5](#95-what-the-numbers-say)). Asserting the true ceiling is worth more than relaxing the bound.
 - Back-to-back matmuls on different weight tiles show **zero** weight-load bubble with double buffering, and exactly `dim` cycles of bubble without it.
-- Requantization is bit-exact across an exhaustive sweep of accumulator values and several multiplier/shift pairs, including ties and both saturation clamps.
+- Requantization is bit-exact against an independent reimplementation of the specification — not against `quant.h`, which both models share on purpose — across a dense sweep of accumulator values and eight multiplier/shift/bias combinations, including ties in both signs and both saturation clamps.
 - A workload below the roofline ridge point scales with **bytes moved**, not MACs, and reports `dma_bound` as its dominant stall.
-- A single-bank UB config reports `ub_bank_conflict` as the dominant stall on a workload that a many-bank config runs conflict-free.
+- Adding UB banks never adds conflicts, and two banks are enough to reach zero on every workload. A single-bank UB is a much weaker stress than expected and cannot dominate at this issue width; the mechanism is instead proven on a program built to pressure the read ports ([§9.5](#95-what-the-numbers-say)).
+- Starving a resource shows up in **that resource's bucket**: for each of the weight path and the DMA, the extra cycles a starved configuration takes are accounted for by growth in the matching cause, and no other bucket grows more. This is checked as a delta rather than as a dominant cause, because the largest bucket is usually `activation` or `array_fill_drain` whatever the configuration.
 
 ---
 
@@ -329,22 +331,60 @@ Beyond numerical correctness, targeted tests assert:
 
 ### 9.2 Utilization and TOPS by array size
 
-Populated by `make test` — the table is reproducible from the bundled workloads, not hand-entered.
+Regenerate with `make report`; the same measurements are asserted by the `stats`, `config_sweep` and `properties` test sections, so a number that moves here breaks a test that explains why. Utilization is useful MACs as a fraction of what the array could have done in the same wall-clock cycles — padding, fill, drain and every stall count against it.
 
-| Workload | 8×8 util | 32×32 util | 256×256 util |
-|---|---|---|---|
-| mlp_dense | TBD | TBD | TBD |
-| conv_im2col | TBD | TBD | TBD |
-| matmul_ktiled | TBD | TBD | TBD |
-| lstm_gates | TBD | TBD | TBD |
+| Workload | 8×8 util | 32×32 util | 256×256 util | 32×32 TOPS @ 700 MHz | 32×32 dominant cause |
+|---|---|---|---|---|---|
+| matmul_128 | 33.8% | 10.8% | 0.1% | 0.154 | `activation` |
+| matmul_ragged | 20.7% | 1.0% | 0.0% | 0.014 | `activation` |
+| conv_3x3 | 17.6% | 0.7% | 0.0% | 0.010 | `activation` |
+| mlp_3layer | 29.9% | 3.2% | 0.0% | 0.046 | `activation` |
+
+Utilization *falls* as the array grows, steeply. That is the opposite of the hoped-for result and it is the most useful thing the characterization produced; §9.5 explains it.
 
 ### 9.3 Roofline
 
-The ridge point is where a workload transitions from memory-bound to compute-bound — arithmetic intensity (MACs per byte moved) equal to peak-MACs / DMA-bandwidth. Workloads left of the ridge (small matmuls, low reuse) are DMA-bound and do not benefit from a larger array; workloads right of it (deep dense layers) saturate the MXU. The sweep places each workload on the roofline and confirms the dominant stall cause matches its side of the ridge.
+The ridge point is where a workload transitions from memory-bound to compute-bound — arithmetic intensity (MACs per byte moved) equal to peak-MACs / DMA-bandwidth. Workloads left of the ridge (small matmuls, low reuse) are DMA-bound and do not benefit from a larger array; workloads right of it (deep dense layers) saturate the MXU.
 
-### 9.4 Reported statistics
+At 32×32 with 16 bytes/cycle the ridge sits at 1024/16 = 64 MACs/byte:
+
+| Workload | MACs | bytes moved | intensity (MAC/B) | ridge (MAC/B) | placement |
+|---|---|---|---|---|---|
+| matmul_128 | 2,097,152 | 32,768 | 64.0 | 64.0 | compute-bound (exactly at the ridge) |
+| matmul_ragged | 28,800 | 3,840 | 7.5 | 64.0 | memory-bound |
+| conv_3x3 | 18,432 | 6,144 | 3.0 | 64.0 | memory-bound |
+| mlp_3layer | 163,840 | 9,216 | 17.8 | 64.0 | memory-bound |
+
+A dense 128×128 layer lands exactly on the ridge because each tile of weights is used for one tile of activations and nothing is re-read — reuse in this tiler comes from holding activations across the `N` loop, which is worth a factor of `dim` and no more. Starving the DMA to 1 byte/cycle moves the ridge to 1024 MACs/byte, puts every workload well left of it, and makes `dma_bound` the dominant stall on all four, which is the property the sweep exists to check.
+
+### 9.4 Where the cycles go
 
 Utilization, effective TOPS, per-instruction cycle counts, DMA bytes moved, weight-load bubble cycles, and a **stall-cause breakdown** attributing lost array-cycles to: `weight_fifo_empty`, `ub_bank_conflict`, `accum_hazard`, `dma_bound`, `array_fill_drain`, and `partial_tile_waste`.
+
+The idle buckets **partition** idle time: every cycle the array stands still is charged to exactly one of them, and `array_busy + idle == cycles` is asserted for every workload on every configuration. Without that property a "dominant cause" would only report which bucket was double-counted the most. `partial_tile_waste` sits deliberately outside the partition — it is waste *inside* cycles the array was busy, PEs multiplying padding, so adding it in would double count.
+
+Measured at 32×32, as a percentage of total cycles:
+
+| Workload | cycles | fill/drain | activation | DMA | weights | banks | accum | padding |
+|---|---|---|---|---|---|---|---|---|
+| matmul_128 | 19,013 | 21% | 61% | 7% | 0% | 0% | 0% | 0% |
+| matmul_ragged | 2,905 | 9% | 80% | 8% | 0% | 0% | 0% | 2% |
+| conv_3x3 | 2,697 | 9% | 76% | 10% | 0% | 0% | 0% | 4% |
+| mlp_3layer | 4,977 | 9% | 78% | 9% | 0% | 0% | 0% | 1% |
+
+### 9.5 What the numbers say
+
+Four findings, in decreasing order of how much they cost:
+
+**The activation pipeline is the bottleneck, not the array.** [§6.2](#62-activation-pipeline) specifies a throughput-1 pipeline emitting one requantized element per cycle, so an `Activate` over a full accumulator bank costs `dim² + depth` cycles while the `MatMul` that filled that bank cost `3·dim − 1`. At `dim = 32` that is 1028 cycles against 95 — the requantization of a tile is eleven times more expensive than computing it, and the ratio grows linearly with `dim`. This is why utilization collapses at 256×256: the array gets 64× wider while the pipeline draining it does not. Making the pipeline `dim`-wide (one row per cycle) is the single highest-value change available and would cost one line of the timing model.
+
+**Utilization is capped near ⅓ regardless.** A matmul streams `len` rows in `len + 2·dim − 1` cycles, and `len` cannot exceed `dim` because its results land in one accumulator bank and a bank is `dim` rows deep. So a single matmul's best case is `dim / (3·dim − 1)` — 34.8% at `dim = 8`, 33.7% at `dim = 32`, falling towards ⅓. The 8×8 column of [§9.2](#92-utilization-and-tops-by-array-size) is at that ceiling, which says the small-array configuration is limited by the systolic pipeline itself and by nothing else. TPUv1 avoided this with 4 MiB of accumulators — thousands of rows deep — so a single matmul could stream far past the fill cost. Deeper accumulator banks, not more bandwidth, are what would move this.
+
+**Weight FIFO depth is inert unless DDR is slow.** The FIFO prefetches ahead of the instruction stream, so a 1-deep FIFO still starts the next fetch while the array works. At the default 8-cycle tile latency that wait hides completely behind a single matmul and depth 1 measures *identically* to depth 4. Depth only buys anything once the DDR latency exceeds the compute available to cover it: at a 200-cycle latency, a 1-deep FIFO costs 6.7%.
+
+**Unified Buffer banking is inert above one bank.** A bank carries one read and one write per cycle, and at most one instruction per unit is in flight, so the only same-direction pairs that can exist are a matmul and a `Write_Host` reading, or a `Read_Host` and an `Activate` writing — two streams per direction, whatever the workload and whatever the bank count. One bank therefore serializes at most one pair at a time, worth tens of cycles on the shipped workloads and never dominant; two banks are already enough for zero conflicts. Making bank count a real design variable would take more concurrency than this sequencer has, not more banks.
+
+Of the six configurations in [§8.2](#82-configuration-sweep), only DMA bandwidth and array size move the headline numbers much. That is worth stating plainly: four of the knobs are provisioned past the point where they matter, and the two structural limits — activation width and accumulator depth — are not knobs at all.
 
 ---
 
@@ -359,6 +399,10 @@ Utilization, effective TOPS, per-instruction cycle counts, DMA bytes moved, weig
 
 ### Post-v1 directions
 
+The first two come straight out of [§9.5](#95-what-the-numbers-say) and are the only changes measured to be worth much:
+
+- **A `dim`-wide activation pipeline** — one requantized *row* per cycle instead of one element, turning `dim² + depth` into `dim + depth`. Worth 61–80% of current run time and the reason utilization collapses on large arrays.
+- **Deeper accumulator banks** — decoupling a matmul's stream length from `dim` so the `2·dim − 1` fill cost amortizes over a long stream instead of over `dim` rows. Lifts the ⅓ utilization ceiling that no amount of bandwidth can touch.
 - **bf16 MXU** — a floating-point datapath to compare accuracy and utilization against the int8 baseline.
 - **Output-stationary / row-stationary dataflow** — the same array with a different mapping, to measure the reuse trade-off the weight-stationary choice makes.
 - **A real tiling compiler** — replace the hand-written tiler with a cost-model-driven one that chooses tile shapes from a layer spec.

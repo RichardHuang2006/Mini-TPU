@@ -26,11 +26,11 @@ bool write_program(const wl::Workload& w, const std::string& dir) {
 
     out << "# " << w.name << " -- " << w.note << "\n";
     out << "# " << w.code.size() << " instructions, " << ISA_WORDS << " words each\n";
-    out << "# run: minitpu --prog examples/" << w.name << ".hex"
+    out << "# run: minitpu --run --prog examples/" << w.name << ".hex"
         << " --acts examples/" << w.name << ".acts.mtpu"
         << " --weights examples/" << w.name << ".weights.mtpu"
         << " --dim " << w.cfg.dim << " --ub " << w.cfg.ub_bytes << " --acc-banks "
-        << w.cfg.acc_banks << "\n";
+        << w.cfg.acc_banks << " --macs " << w.macs << "\n";
     out << "# expect examples/" << w.name << ".expect.mtpu (" << w.out_rows << "x"
         << w.out_cols << " int8) at host 0x" << std::hex << w.y_host << std::dec << "\n";
 

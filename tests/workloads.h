@@ -669,49 +669,82 @@ inline Config example_config() {
     return c;
 }
 
-inline std::vector<Workload> corpus() {
-    std::vector<Workload> out;
+// What a workload *is*, separately from the array it was lowered for. The
+// configuration sweep needs this: running the same layer on an 8x8 and a 256x256
+// array means lowering it twice, not replaying instructions that assume a
+// different tile size.
+struct Spec {
+    enum class Kind : uint8_t { DENSE, CONV, MLP };
+
+    std::string name;
+    std::string note;
+    Kind        kind = Kind::DENSE;
+    uint32_t    seed = 0;
+
+    Layer layer;   // DENSE
+    Conv  conv;    // CONV
+    Mlp   mlp;     // MLP
+
+    Config cfg;    // the configuration this workload ships with
+};
+
+inline Workload build(const Spec& s, const Config& cfg) {
+    switch (s.kind) {
+        case Spec::Kind::DENSE: return dense_workload(s.name, s.note, s.layer, cfg, s.seed);
+        case Spec::Kind::CONV:  return conv_workload(s.name, s.note, s.conv, cfg, s.seed);
+        case Spec::Kind::MLP:   return mlp_workload(s.name, s.note, s.mlp, cfg, s.seed);
+    }
+    return Workload{};
+}
+
+inline std::vector<Spec> specs() {
+    std::vector<Spec> out;
 
     // Dense, tiled four ways in each of M, N and K on a 32x32 array: the headline
     // shape from the plan.
     {
-        Config cfg;
-        cfg.dim = 32;
-        Layer l;
-        l.M = 128; l.K = 128; l.N = 128;
-        l.multiplier = 1; l.shift = 10; l.fn = ActFn::RELU;
-        out.push_back(dense_workload("matmul_128", "128x128 * 128x128 dense layer, relu",
-                                     l, cfg, 9001));
+        Spec s;
+        s.name = "matmul_128";
+        s.note = "128x128 * 128x128 dense layer, relu";
+        s.kind = Spec::Kind::DENSE;
+        s.seed = 9001;
+        s.layer.M = 128; s.layer.K = 128; s.layer.N = 128;
+        s.layer.multiplier = 1; s.layer.shift = 10; s.layer.fn = ActFn::RELU;
+        s.cfg.dim = 32;
+        out.push_back(s);
     }
 
     // A ragged dense layer, where none of M, N or K divides the array.
     {
-        Config cfg = example_config();
-        Layer l;
-        l.M = 40; l.K = 20; l.N = 36;
-        l.bias = 250; l.multiplier = 3; l.shift = 9; l.fn = ActFn::RELU6;
-        out.push_back(dense_workload("matmul_ragged",
-                                     "40x20 * 20x36, none of M/N/K a multiple of dim",
-                                     l, cfg, 9101));
+        Spec s;
+        s.name = "matmul_ragged";
+        s.note = "40x20 * 20x36, none of M/N/K a multiple of dim";
+        s.kind = Spec::Kind::DENSE;
+        s.seed = 9101;
+        s.layer.M = 40; s.layer.K = 20; s.layer.N = 36;
+        s.layer.bias = 250; s.layer.multiplier = 3; s.layer.shift = 9;
+        s.layer.fn = ActFn::RELU6;
+        s.cfg = example_config();
+        out.push_back(s);
     }
 
     // A padded, strided convolution through im2col.
     {
-        Config cfg = example_config();
-        Conv c;
-        c.H = 8; c.W = 8; c.Cin = 4;
-        c.R = 3; c.S = 3; c.Cout = 8;
-        c.stride = 1; c.pad = 1;
-        c.multiplier = 1; c.shift = 8; c.fn = ActFn::RELU;
-        out.push_back(conv_workload("conv_3x3", "8x8x4 * 3x3x8 conv, stride 1, pad 1",
-                                    c, cfg, 9201));
+        Spec s;
+        s.name = "conv_3x3";
+        s.note = "8x8x4 * 3x3x8 conv, stride 1, pad 1";
+        s.kind = Spec::Kind::CONV;
+        s.seed = 9201;
+        s.conv.H = 8; s.conv.W = 8; s.conv.Cin = 4;
+        s.conv.R = 3; s.conv.S = 3; s.conv.Cout = 8;
+        s.conv.stride = 1; s.conv.pad = 1;
+        s.conv.multiplier = 1; s.conv.shift = 8; s.conv.fn = ActFn::RELU;
+        s.cfg = example_config();
+        out.push_back(s);
     }
 
-    // Three dense layers back to back, chained through host memory with no
-    // repacking between them.
+    // Three dense layers back to back, chained with no repacking between them.
     {
-        Config cfg = example_config();
-
         auto make = [](uint32_t M, uint32_t K, uint32_t N, uint32_t shift, ActFn fn) {
             Layer l;
             l.M = M; l.K = K; l.N = N;
@@ -719,14 +752,24 @@ inline std::vector<Workload> corpus() {
             return l;
         };
 
-        Mlp net;
-        net.layers.push_back(make(32, 64, 48, 9, ActFn::RELU));
-        net.layers.push_back(make(32, 48, 32, 8, ActFn::RELU));
-        net.layers.push_back(make(32, 32, 16, 7, ActFn::IDENTITY));
-        out.push_back(mlp_workload("mlp_3layer", "64 -> 48 -> 32 -> 16, batch 32",
-                                   net, cfg, 9301));
+        Spec s;
+        s.name = "mlp_3layer";
+        s.note = "64 -> 48 -> 32 -> 16, batch 32";
+        s.kind = Spec::Kind::MLP;
+        s.seed = 9301;
+        s.mlp.layers.push_back(make(32, 64, 48, 9, ActFn::RELU));
+        s.mlp.layers.push_back(make(32, 48, 32, 8, ActFn::RELU));
+        s.mlp.layers.push_back(make(32, 32, 16, 7, ActFn::IDENTITY));
+        s.cfg = example_config();
+        out.push_back(s);
     }
 
+    return out;
+}
+
+inline std::vector<Workload> corpus() {
+    std::vector<Workload> out;
+    for (const Spec& s : specs()) out.push_back(build(s, s.cfg));
     return out;
 }
 

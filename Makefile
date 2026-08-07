@@ -22,13 +22,14 @@ DBG_OBJ = $(patsubst src/%.cpp,$(DBGDIR)/%.o,$(TPU_SRC))
 
 TEST_SRC   = tests/test_main.cpp
 TOOLS_SRC  = tools/gen_examples.cpp
+REPORT_SRC = tools/report.cpp
 HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 
 # The tests reuse every src/*.cpp but main.cpp, whose main() they replace by
 # #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(TPU_SRC))
 
-.PHONY: all debug test examples clean help
+.PHONY: all debug test examples report clean help
 .DEFAULT_GOAL := all
 
 # ---------------------------------------------------------------- release ---
@@ -67,6 +68,14 @@ examples:
 	else \
 	  echo "examples: skipped, no $(TOOLS_SRC)"; \
 	fi
+
+# The performance tables in DESIGN.md §9, regenerated from the model. Checked-in
+# numbers that cannot be reproduced are just decoration.
+$(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
+	$(CXX) $(CXXFLAGS_REL) $(REPORT_SRC) $(LIB_SRC) -o $@
+
+report: $(BUILD)/report
+	@./$(BUILD)/report
 
 # ------------------------------------------------------------------ test ---
 # One translation unit that pulls in nearly every header, so it is rebuilt on

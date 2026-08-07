@@ -264,10 +264,12 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
             return std::max<uint64_t>(1, dma_.transfer_cycles(d.bytes));
 
         case Op::READ_WEIGHTS:
-            // The DDR fetch, then shifting the tile into a plane. With a shadow
-            // plane the shift hides under whatever the array is doing, so it costs
-            // nothing here; without one it is dim exposed cycles.
-            return static_cast<uint64_t>(fifo_.latency()) + mxu_.load_bubble();
+            // Only the shift into a plane. The DDR fetch is not here because the
+            // FIFO already paid for it in the background -- that is what the FIFO is
+            // for, and charging the latency again would make its depth irrelevant.
+            // With a shadow plane the shift hides under whatever the array is doing,
+            // so it costs nothing; without one it is dim exposed cycles.
+            return mxu_.load_bubble();
 
         case Op::MATMUL:
             // Set by the array itself at issue, from its own timing model.
@@ -290,6 +292,27 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
             return 1;
     }
     return 1;
+}
+
+bool Tpu::ub_port_available(const Reservation& r) {
+    const bool wants_read  = !r.ub_read.empty();
+    const bool wants_write = !r.ub_write.empty();
+    if (!wants_read && !wants_write) return true;
+
+    uint32_t readers = 0, writers = 0;
+    for (const InFlight& f : units_) {
+        if (!f.active) continue;
+        if (!f.res.ub_read.empty())  ++readers;
+        if (!f.res.ub_write.empty()) ++writers;
+    }
+
+    if ((wants_read && readers >= cfg_.ub_banks) ||
+        (wants_write && writers >= cfg_.ub_banks)) {
+        ub_.note_bank_conflict();
+        ++stalls_.ub_bank_conflict;
+        return false;
+    }
+    return true;
 }
 
 bool Tpu::interlocked(const Reservation& r) {
@@ -364,21 +387,12 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
             break;
         }
 
-        case Op::READ_WEIGHTS: {
-            // Request the tile now; it is shifted into the plane when the
-            // instruction retires, which is when it has actually arrived.
-            WeightTile t;
-            t.ddr_addr = d.ddr_addr;
-            t.tile     = d.tile;
-            t.rows     = dim;
-            t.cols     = dim;
-            const std::size_t need = static_cast<std::size_t>(dim) * dim;
-            t.data.assign(weight_mem_.begin() + d.ddr_addr,
-                          weight_mem_.begin() + d.ddr_addr + static_cast<std::ptrdiff_t>(need));
-            fifo_.push_refill(t, cycle_);
+        case Op::READ_WEIGHTS:
+            // The tile is already in the FIFO -- the prefetcher put it there, and
+            // issue only proceeded because it had arrived. All that is left is the
+            // shift into the plane, which happens at retire.
             stalls_.weight_load_bubble += mxu_.load_bubble();
             break;
-        }
 
         case Op::MATMUL: {
             // The array's own timing model decides how long this takes, so the
@@ -555,12 +569,16 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     const Unit u = unit_of(d.op);
     if (slot(u).active) { ++stalls_.unit_busy; return; }
 
-    if (d.op == Op::READ_WEIGHTS && fifo_.full()) {
-        ++stalls_.weight_fifo_full;
+    // The tile has to have arrived from DDR. With a deep enough FIFO the
+    // prefetcher is far enough ahead that it always has; with a shallow one this is
+    // where the array waits on memory.
+    if (d.op == Op::READ_WEIGHTS && fifo_.empty()) {
+        ++stalls_.weight_fifo_empty;
         return;
     }
 
     if (interlocked(res)) return;
+    if (!ub_port_available(res)) return;
 
     if (opts.trace && opts.trace_out) {
         std::fprintf(opts.trace_out, "%8llu  issue %4zu: %s\n",
@@ -570,6 +588,20 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     PendingWrite pw;
     uint64_t     duration = execute(d, pw);
     if (duration == 0) duration = 1;
+
+    const std::size_t slot_i = static_cast<std::size_t>(d.op);
+    if (slot_i < RunProfile::OPS) {
+        profile_.op_cycles[slot_i] += duration;
+        ++profile_.op_count[slot_i];
+    }
+    if (d.op == Op::READ_HOST || d.op == Op::WRITE_HOST) profile_.dma_bytes += d.bytes;
+    if (d.op == Op::MATMUL) {
+        ++profile_.matmuls;
+        // The steady-state part of the matmul: one row admitted per cycle, every
+        // PE multiplying. The rest of its duration is fill and drain.
+        profile_.stream_cycles  += d.len;
+        profile_.macs_performed += static_cast<uint64_t>(d.len) * cfg_.dim * cfg_.dim;
+    }
 
     ++st.pc;
 
@@ -601,9 +633,74 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     }
 }
 
+// Keep the weight FIFO as full as it will go, reading ahead in the instruction
+// stream for the tiles upcoming Read_Weights will ask for.
+//
+// This is what the FIFO is for. A Read_Weights that both requested its tile and
+// consumed it would pay the DDR latency in full every time and the depth would
+// change nothing; running the fetches ahead of the instructions that need them is
+// how the latency gets hidden, and the depth is how far ahead it can get.
+//
+// Reading ahead is safe because nothing in the ISA writes weight memory, so a tile
+// fetched early cannot be stale. An out-of-range address is left alone rather than
+// skipped past, so the instruction still traps when it issues.
+void Tpu::prefetch_weights(const std::vector<RawInst>& prog) {
+    const uint32_t    dim  = cfg_.dim;
+    const std::size_t need = static_cast<std::size_t>(dim) * dim;
+
+    while (!fifo_.full() && prefetch_pc_ < prog.size()) {
+        const Decoded d = decode(prog[prefetch_pc_]);
+        if (d.trap) break;              // the sequencer will stop here anyway
+        if (d.op != Op::READ_WEIGHTS) { ++prefetch_pc_; continue; }
+
+        if (!range_ok(d.ddr_addr, need, weight_mem_.size())) break;
+
+        WeightTile t;
+        t.ddr_addr = d.ddr_addr;
+        t.tile     = d.tile;
+        t.rows     = dim;
+        t.cols     = dim;
+        t.data.assign(weight_mem_.begin() + d.ddr_addr,
+                      weight_mem_.begin() + d.ddr_addr + static_cast<std::ptrdiff_t>(need));
+        if (!fifo_.push_refill(t, cycle_)) break;
+        ++prefetch_pc_;
+    }
+}
+
 void Tpu::reset_pipeline() {
     for (InFlight& f : units_) f = InFlight{};
-    stalls_ = StallStats{};
+    stalls_      = StallStats{};
+    profile_     = RunProfile{};
+    prefetch_pc_ = 0;
+}
+
+// Charge one cycle in which the array stood still to whatever the machine was
+// waiting on, given which stall counter moved during this cycle's issue attempt.
+//
+// The order of the tests is the attribution policy. The weight path, the buffer
+// ports and the accumulators are named causes and claim their own stalls first.
+// Anything else that coincides with a transfer in flight is charged to data
+// movement, which is what makes a starved DMA read as dma_bound rather than
+// hiding behind the read-after-write it happens to trigger.
+//
+// Note that the unit slots are enough to decide this: whichever in-flight
+// instruction the scoreboard blocked on is by definition still in flight now, since
+// nothing retires between issue and here.
+void Tpu::charge_idle_cycle(const StallStats& before) {
+    const StallStats& n = stalls_;
+
+    const bool weights = n.weight_stall != before.weight_stall ||
+                         n.weight_fifo_full != before.weight_fifo_full ||
+                         n.weight_fifo_empty != before.weight_fifo_empty;
+    if (weights) { ++profile_.idle_weights; return; }
+
+    if (n.ub_bank_conflict != before.ub_bank_conflict) { ++profile_.idle_bank; return; }
+    if (n.accum_hazard != before.accum_hazard)         { ++profile_.idle_accum; return; }
+
+    if (slot(Unit::DMA).active) { ++profile_.idle_dma; return; }
+    if (slot(Unit::ACT).active) { ++profile_.idle_act; return; }
+
+    ++profile_.idle_other;
 }
 
 TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
@@ -620,7 +717,18 @@ TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
         retire_completed(st);
         if (st.done()) break;
 
+        prefetch_weights(prog);
+
+        const StallStats before = stalls_;
         issue_step(prog, st, opts);
+
+        // Sampled after issue, so the cycle a matmul starts on counts as busy and
+        // the cycle it retires on does not. Sampling first would undercount every
+        // matmul by exactly one cycle and leave array_busy one short of the duration
+        // the array charged for it.
+        if (slot(Unit::MXU).active) ++profile_.array_busy;
+        else                        charge_idle_cycle(before);
+
         if (st.done()) break;
 
         ++cycle_;

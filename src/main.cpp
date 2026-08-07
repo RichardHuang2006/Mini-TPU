@@ -4,11 +4,11 @@
 // parse_args / print_help / disasm directly. Everything else is inline or
 // file-static, so including it twice does not violate ODR.
 //
-// Execution arrives with the reference model; for now the driver loads a
-// program and its tensors, checks them, and disassembles on request. That is
-// enough to pin the loaders and the CLI surface before there is a machine to
-// run anything on.
+// The driver loads a program and its tensors, checks them, disassembles on
+// request, and runs them on the timed model, reporting utilization, effective
+// TOPS, the stall-cause breakdown and where the run lands on the roofline.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +21,8 @@
 #include "decoder.h"
 #include "isa.h"
 #include "loader.h"
+#include "stats.h"
+#include "tpu.h"
 #include "types.h"
 
 // ============================================================================
@@ -34,8 +36,14 @@ struct CliOpts {
     std::string acts_path;
 
     bool dump      = false;   // disassemble the program and summarize tensors
-    bool trace     = false;   // per-instruction trace once there is a machine
+    bool trace     = false;   // per-instruction issue trace
+    bool run       = false;   // execute on the timed model
     bool show_help = false;
+
+    // MACs the workload actually needs, padding excluded. Only the tiler knows it,
+    // so utilization is reported against the array's own MAC count unless it is
+    // given here.
+    uint32_t macs = 0;
 
     Config cfg;
 };
@@ -100,7 +108,18 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
 
         if (flag == "--help" || flag == "-h") { opts.show_help = true; return 0; }
         if (flag == "--dump")  { opts.dump  = true; continue; }
-        if (flag == "--trace") { opts.trace = true; continue; }
+        if (flag == "--trace") { opts.trace = true; opts.run = true; continue; }
+        if (flag == "--run")   { opts.run   = true; continue; }
+
+        if (flag == "--macs") {
+            std::string v;
+            if (!take_value(v)) return 1;
+            if (!parse_uint(v, opts.macs)) {
+                std::fprintf(stderr, "minitpu: bad --macs '%s'\n", v.c_str());
+                return 1;
+            }
+            continue;
+        }
 
         if (flag == "--double-buffer")    { opts.cfg.double_buffer = true;  continue; }
         if (flag == "--no-double-buffer") { opts.cfg.double_buffer = false; continue; }
@@ -144,7 +163,9 @@ inline void print_help() {
     std::printf("  --acts PATH       activation tensor\n");
     std::printf("\nGeneral:\n");
     std::printf("  --dump            disassemble the program and summarize the tensors\n");
-    std::printf("  --trace           per-instruction trace (needs the reference model)\n");
+    std::printf("  --run             execute on the timed model and report statistics\n");
+    std::printf("  --trace           per-instruction issue trace (implies --run)\n");
+    std::printf("  --macs N          useful MACs in the workload, for utilization\n");
     std::printf("  --help, -h        this message\n");
     std::printf("\nMachine knobs:\n");
     for (const auto& k : KNOBS) {
@@ -212,6 +233,87 @@ inline void print_program(const std::vector<RawInst>& prog) {
         const Decoded d = decode(prog[i]);
         std::printf("  %4zu  %s\n", i, disasm(d).c_str());
     }
+}
+
+// How much host and weight memory the program actually reaches. Taking it from
+// the instruction stream rather than from a flag means a bundled example runs with
+// no sizing arguments at all, and a program that addresses past the end still
+// traps at the instruction that does it rather than being quietly given room.
+struct MemNeed {
+    std::size_t host   = 0;
+    std::size_t weight = 0;
+};
+
+inline MemNeed memory_needed(const std::vector<RawInst>& prog, const Config& cfg) {
+    MemNeed need;
+    const std::size_t tile = static_cast<std::size_t>(cfg.dim) * cfg.dim;
+
+    for (const RawInst& inst : prog) {
+        const Decoded d = decode(inst);
+        if (d.trap) continue;
+        switch (d.op) {
+            case Op::READ_HOST:
+            case Op::WRITE_HOST:
+                need.host = std::max<std::size_t>(need.host, d.host_addr + d.bytes);
+                break;
+            case Op::READ_WEIGHTS:
+                need.weight = std::max<std::size_t>(need.weight, d.ddr_addr + tile);
+                break;
+            default:
+                break;
+        }
+    }
+    return need;
+}
+
+// Run the program and report what the run cost. Returns a process exit status.
+inline int run_program(const CliOpts& opts, const std::vector<RawInst>& prog,
+                       const TensorBlob& acts, const TensorBlob& weights) {
+    const MemNeed need = memory_needed(prog, opts.cfg);
+
+    const std::size_t host_bytes =
+        std::max<std::size_t>({std::size_t{1} << 12, need.host, acts.count()}) + 64;
+    const std::size_t weight_bytes =
+        std::max<std::size_t>({std::size_t{1} << 12, need.weight, weights.count()}) + 64;
+
+    Tpu t(opts.cfg, host_bytes, weight_bytes);
+
+    // Activations start at host address 0 and weights at DDR address 0, which is
+    // where the tiler places them by default.
+    for (std::size_t i = 0; i < acts.count() && i < host_bytes; ++i) {
+        t.host()[i] = static_cast<uint8_t>(acts.wide ? static_cast<i8>(acts.i32v[i])
+                                                    : acts.i8v[i]);
+    }
+    for (std::size_t i = 0; i < weights.count() && i < weight_bytes; ++i) {
+        t.weight_mem()[i] = weights.wide ? static_cast<i8>(weights.i32v[i]) : weights.i8v[i];
+    }
+
+    TpuOptions run_opts;
+    run_opts.trace     = opts.trace;
+    run_opts.trace_out = stderr;
+
+    const TpuResult r = t.run(prog, run_opts);
+
+    const stats::Stats s = stats::gather(t, r, opts.macs, opts.macs != 0);
+    std::printf("\n%s", s.report("run:").c_str());
+
+    if (r.trapped) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "minitpu: trapped at pc %zu: %s\n", r.pc, r.trap_reason.c_str());
+        return 1;
+    }
+    if (r.budget) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "minitpu: cycle budget exhausted after %llu cycles\n",
+                     static_cast<unsigned long long>(r.cycles));
+        return 1;
+    }
+    if (!r.halted) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "minitpu: program did not halt\n");
+        return 1;
+    }
+    return r.exit_code == 0 ? 0 : 1;
 }
 
 inline void print_tensor(const char* label, const TensorBlob& t) {
@@ -315,9 +417,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (opts.trace) {
-        std::fprintf(stderr, "minitpu: --trace has no effect until the model can run\n");
-    }
+    if (opts.run) return run_program(opts, prog, acts, weights);
     return 0;
 }
 #endif

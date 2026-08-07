@@ -31,6 +31,9 @@ component is validated by differential testing against it.
   pooling.
 - **Fully configurable** — array size, buffer size and banking, FIFO depth, DMA bandwidth, and
   latencies are all `Config` fields, swept by the test suite.
+- **Characterization that diagnoses** — utilization, effective TOPS, roofline placement, and a
+  stall-cause breakdown that exactly partitions every idle array-cycle, so starving a resource
+  shows up in that resource's bucket and nowhere else.
 
 ---
 
@@ -41,36 +44,63 @@ make                       # build build/minitpu (-O2, warnings on)
 ./build/minitpu --help     # list every configuration knob
 make test                  # regenerate examples/ and run the differential suite
 make debug                 # build + run the suite under ASan + UBSan
+make report                # regenerate the performance tables in DESIGN.md §9
 ```
 
-Run a bundled workload and dump the output tensor plus statistics:
+Every bundled workload carries its own run command in a comment at the top of its
+`.hex` file, so running one takes no arguments of your own:
 
 ```bash
-./build/minitpu --prog examples/mlp.prog --weights examples/mlp.w \
-                --acts examples/mlp.x --dump --dim 32
+make examples
+eval $(grep '^# run:' examples/mlp_3layer.hex | sed 's|^# run: minitpu|./build/minitpu|')
 ```
 
 ---
 
 ## What you get
 
-The simulator reports utilization and a stall-cause breakdown, not just a result:
+The simulator reports where the cycles went, not just a result. Real output, from
+the command above:
 
 ```text
-workload: mlp_dense   config: default (32x32)
-  cycles            12480
-  MACs              10.4 M
-  array util         86.3 %
-  effective TOPS      ...
-  DMA bytes           192 KiB
-  stall causes:
-    array_fill_drain   7.1 %
-    weight_fifo_empty  2.4 %
-    ub_bank_conflict   1.9 %
-    accum_hazard       1.2 %
-    dma_bound          1.1 %
-    partial_tile_waste 0.0 %
+run:
+  array 16x16  UB 32768 B / 8 banks  acc 4  FIFO 4  DMA 16 B/cyc  double-buffered
+  4273 cycles, 123 instructions retired, 7680 DMA bytes
+  163840 useful MACs of 163840 performed  (15.0% of array-cycles offered)
+  utilization 15.0% overall, 34.0% while busy   effective 0.054 TOPS @ 700 MHz
+  arithmetic intensity 21.3 MAC/B  ridge 16.0  -> compute-bound
+  lost array-cycles:
+    array_fill_drain         1240   29.0%
+    weight_fifo_empty           0    0.0%
+    ub_bank_conflict            0    0.0%
+    accum_hazard                0    0.0%
+    dma_bound                 370    8.7%
+    activation               2022   47.3%
+    other                       1    0.0%
+    partial_tile_waste          0    0.0%  (inside busy cycles)
+  dominant cause: activation   (largest resource stall: activation)
+  per instruction:
+    Read_Host_Memory       18 x       288 cycles  (16.0 avg)
+    Read_Weights           40 x        40 cycles  (1.0 avg)
+    MatMul                 40 x      1880 cycles  (47.0 avg)
+    Activate               12 x      3120 cycles  (260.0 avg)
+    Write_Host_Memory      12 x       192 cycles  (16.0 avg)
+    Halt                    1 x         1 cycles  (1.0 avg)
 ```
+
+The idle buckets **partition** idle time — every cycle the array stands still is
+charged to exactly one of them, and `busy + idle == cycles` is asserted for every
+workload on every configuration. That is what makes the breakdown a diagnosis
+rather than a decoration.
+
+And it diagnoses something real. An `Activate` costs 260 cycles here against a
+`MatMul`'s 47, because [§6.2](./DESIGN.md#62-activation-pipeline) specifies a
+throughput-1 pipeline emitting one element per cycle while the array produces
+`dim²` MACs per cycle: requantizing a tile is more expensive than computing it, at
+every array size, by a factor that grows linearly with `dim`. Read
+[§9.5](./DESIGN.md#95-what-the-numbers-say) for the other three findings, including
+why utilization is capped near ⅓ and why four of the six configuration knobs turn
+out not to matter.
 
 ---
 
@@ -81,9 +111,9 @@ Mini-TPU/
 ├── DESIGN.md        architecture and rationale
 ├── PLAN.md          34-step build roadmap
 ├── Makefile
-├── src/             simulator sources (array, memory, sequencer, activation)
-├── tests/           in-tree program builder, eager reference model, differential suite
-└── tools/           example / workload generator (tiler)
+├── src/             simulator sources (array, memory, sequencer, activation, statistics)
+├── tests/           in-tree program builder, eager reference model, tiler, differential suite
+└── tools/           example generator, performance-table generator, mutation harness
 ```
 
 ---
@@ -99,10 +129,19 @@ Mini-TPU/
 
 ## Status
 
-Documentation-first. `DESIGN.md` and `PLAN.md` are complete; implementation follows the plan
-phase by phase. The plan is designed so the repo is buildable and green at the end of every
-step, with the first end-to-end differential pass at [Step 3.3](./PLAN.md#phase-3--systolic-array)
-and a working end-to-end accelerator at [Step 5.5](./PLAN.md#phase-5--sequencer--overlap).
+All nine phases of [PLAN.md](./PLAN.md) are implemented. 34 test sections pass clean under
+ASan + UBSan; `make test` takes about 12 seconds and `make debug` about 50.
+
+Every workload runs on six configurations — 8×8 through 256×256, single-bank buffer,
+shallow FIFO, starved DMA — and each is checked against the eager reference model on the
+output tensor, the accumulator contents at every `Sync`, and the retired-instruction count.
+The tiler is checked separately against plain nested-loop golden implementations, since the
+reference model and the timed model execute the *same* generated program and so cannot catch
+a bug in generating it.
+
+`tools/mutate.sh` breaks the model 20 different ways — rounding modes, interlocks, skew,
+port contention, FIFO depth, every statistics counter — and asserts the suite catches each
+one. It currently does.
 
 ---
 
