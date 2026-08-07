@@ -60,25 +60,23 @@ public:
     // bank port for the duration.
     UbAddr ub_endpoint() const { return ub_; }
 
-    bool start(const DmaRequest& r, uint64_t now, std::vector<uint8_t>& host,
-               UnifiedBuffer& ub) {
+    // Reserve the engine and account for the transfer without moving any bytes.
+    // The sequencer uses this one: it reads the source at issue and commits the
+    // destination when the instruction retires, so that a consumer which issued
+    // too early sees the old bytes rather than the new ones. That is what makes a
+    // missing interlock show up as a wrong answer instead of only a wrong
+    // schedule.
+    bool begin(const DmaRequest& r, uint64_t now, std::size_t host_bytes,
+               const UnifiedBuffer& ub) {
         now_ = now;
         if (busy()) {
             ++stats_.rejects;
             return false;
         }
-        const bool host_ok = r.host <= host.size() && r.bytes <= host.size() - r.host;
+        const bool host_ok = r.host <= host_bytes && r.bytes <= host_bytes - r.host;
         if (!host_ok || !ub.in_range(r.ub, r.bytes)) {
             ++stats_.rejects;
             return false;
-        }
-
-        for (uint32_t i = 0; i < r.bytes; ++i) {
-            if (r.dir == DmaDir::HOST_TO_UB) {
-                ub.at(r.ub + i) = static_cast<i8>(host[r.host + i]);
-            } else {
-                host[r.host + i] = static_cast<uint8_t>(ub.at(r.ub + i));
-            }
         }
 
         const uint64_t cycles = transfer_cycles(r.bytes);
@@ -89,6 +87,22 @@ public:
         ++stats_.transfers;
         stats_.bytes_moved += r.bytes;
         stats_.busy_cycles += cycles;
+        return true;
+    }
+
+    // Reserve the engine and move the bytes immediately, for a caller driving the
+    // machine by hand with nothing else in flight to observe the difference.
+    bool start(const DmaRequest& r, uint64_t now, std::vector<uint8_t>& host,
+               UnifiedBuffer& ub) {
+        if (!begin(r, now, host.size(), ub)) return false;
+
+        for (uint32_t i = 0; i < r.bytes; ++i) {
+            if (r.dir == DmaDir::HOST_TO_UB) {
+                ub.at(r.ub + i) = static_cast<i8>(host[r.host + i]);
+            } else {
+                host[r.host + i] = static_cast<uint8_t>(ub.at(r.ub + i));
+            }
+        }
         return true;
     }
 

@@ -95,10 +95,27 @@ public:
     uint32_t plane_rows(uint32_t plane) const { return rows_[plane]; }
     uint32_t plane_cols(uint32_t plane) const { return cols_[plane]; }
 
-    // Load a weight tile. A tile smaller than the array is zero-padded, which is
-    // what makes an undersized matmul produce the right answer rather than a
-    // plausible one: the padded MACs contribute exactly zero.
+    // Load a weight tile and charge the array the load bubble.
     void load_weights(const ConstI8View& w) {
+        load_weights_untimed(w);
+
+        const uint32_t bubble = load_bubble();
+        cycle_ += bubble;
+        stats_.weight_load_bubble += bubble;
+        stats_.cycles = cycle_;
+    }
+
+    // Load a weight tile without touching the clock.
+    //
+    // The sequencer uses this one: a Read_Weights has to pay the DDR latency as
+    // well as the load, so it folds both into the instruction's duration and lets
+    // the array charge neither. Having the array also charge its own bubble would
+    // count it twice.
+    //
+    // A tile smaller than the array is zero-padded, which is what makes an
+    // undersized matmul produce the right answer rather than a plausible one: the
+    // padded MACs contribute exactly zero.
+    void load_weights_untimed(const ConstI8View& w) {
         assert(w.rows() <= cfg_.dim && w.cols() <= cfg_.dim);
         const uint32_t plane = load_plane();
 
@@ -113,11 +130,6 @@ public:
 
         // A load into the shadow plane only takes effect at the next matmul.
         pending_ = (plane != active_);
-
-        const uint32_t bubble = load_bubble();
-        cycle_ += bubble;
-        stats_.weight_load_bubble += bubble;
-        stats_.cycles = cycle_;
         ++stats_.weight_loads;
     }
 

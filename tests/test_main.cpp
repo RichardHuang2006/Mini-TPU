@@ -100,6 +100,19 @@ Config small_cfg(uint32_t dim = 4, uint32_t banks = 2) {
     return c;
 }
 
+// A deterministic byte source. Taking the top bits of an LCG gives a spread over
+// the whole int8 range, -128 included, which matters because -128 has no positive
+// counterpart and is where a sloppy negation would show up.
+struct Lcg {
+    uint32_t s;
+    explicit Lcg(uint32_t seed) : s(seed) {}
+    uint32_t next() {
+        s = s * 1664525u + 1013904223u;
+        return s;
+    }
+    i8 byte() { return static_cast<i8>(next() >> 24); }
+};
+
 std::string show(const std::vector<int>& v) {
     std::ostringstream os;
     os << "[";
@@ -179,10 +192,59 @@ std::size_t first_diff(const std::vector<T>& a, const std::vector<T>& b) {
     return n;   // a common prefix; the sizes are what differ
 }
 
+// Everything a run is compared on, lifted out of whichever model produced it so
+// one comparison serves both. Phase 2 pointed this at two reference runs; from
+// Phase 5 one side is the timed machine.
+struct RunView {
+    bool     halted    = false;
+    bool     trapped   = false;
+    bool     budget    = false;
+    uint32_t exit_code = 0;
+    uint64_t retired   = 0;
+
+    std::string trap_reason;
+
+    std::vector<std::vector<i32>> syncs;   // accumulators at each barrier
+    std::vector<i32>              acc;     // final accumulators
+    std::vector<i8>               ub;
+    std::vector<uint8_t>          host;
+};
+
+RunView view_of(const ref::Machine& m, const ref::Result& r) {
+    RunView v;
+    v.halted      = r.halted;
+    v.trapped     = r.trapped;
+    v.budget      = r.budget;
+    v.exit_code   = r.exit_code;
+    v.retired     = r.retired;
+    v.trap_reason = r.trap_reason;
+    for (const ref::Snapshot& s : r.syncs) v.syncs.push_back(s.acc);
+    v.acc  = m.acc;
+    v.ub   = m.ub;
+    v.host = m.host;
+    return v;
+}
+
+RunView view_of(Tpu& t, const TpuResult& r) {
+    RunView v;
+    v.halted      = r.halted;
+    v.trapped     = r.trapped;
+    v.budget      = r.budget;
+    v.exit_code   = r.exit_code;
+    v.retired     = r.retired;
+    v.trap_reason = r.trap_reason;
+    for (const TpuSnapshot& s : r.syncs) v.syncs.push_back(s.acc);
+    v.acc = t.acc().raw();
+    v.ub.reserve(t.ub().bytes());
+    for (uint32_t i = 0; i < t.ub().bytes(); ++i) v.ub.push_back(t.ub().at(i));
+    v.host = t.host();
+    return v;
+}
+
 // Every comparand from DESIGN 8.1: output bytes, accumulators at each Sync, and
 // the retired count. Returns "" when the two runs agree.
-std::string compare_runs(const char* a_name, const ref::Machine& ma, const ref::Result& ra,
-                         const char* b_name, const ref::Machine& mb, const ref::Result& rb) {
+std::string compare_runs(const char* a_name, const RunView& ra,
+                         const char* b_name, const RunView& rb) {
     std::ostringstream os;
     auto note = [&](const char* what, const std::string& av, const std::string& bv) {
         os << "    " << what << ": " << a_name << "=" << av << "  " << b_name << "=" << bv << "\n";
@@ -202,8 +264,8 @@ std::string compare_runs(const char* a_name, const ref::Machine& ma, const ref::
         note("sync count", num(ra.syncs.size()), num(rb.syncs.size()));
     } else {
         for (std::size_t s = 0; s < ra.syncs.size(); ++s) {
-            const auto& av = ra.syncs[s].acc;
-            const auto& bv = rb.syncs[s].acc;
+            const auto& av = ra.syncs[s];
+            const auto& bv = rb.syncs[s];
             if (av == bv) continue;
             const std::size_t i = first_diff(av, bv);
             os << "    sync " << s << " accumulator[" << i << "]: " << a_name << "="
@@ -212,52 +274,106 @@ std::string compare_runs(const char* a_name, const ref::Machine& ma, const ref::
         }
     }
 
-    if (ma.acc != mb.acc) {
-        const std::size_t i = first_diff(ma.acc, mb.acc);
+    if (ra.acc != rb.acc) {
+        const std::size_t i = first_diff(ra.acc, rb.acc);
         note(("final accumulator[" + num(i) + "]").c_str(),
-             num(static_cast<uint64_t>(ma.acc[i])), num(static_cast<uint64_t>(mb.acc[i])));
+             num(static_cast<uint64_t>(ra.acc[i])), num(static_cast<uint64_t>(rb.acc[i])));
     }
-    if (ma.ub != mb.ub) {
-        const std::size_t i = first_diff(ma.ub, mb.ub);
+    if (ra.ub != rb.ub) {
+        const std::size_t i = first_diff(ra.ub, rb.ub);
         note(("unified buffer[" + num(i) + "]").c_str(),
-             num(static_cast<uint64_t>(ma.ub[i])), num(static_cast<uint64_t>(mb.ub[i])));
+             num(static_cast<uint64_t>(ra.ub[i])), num(static_cast<uint64_t>(rb.ub[i])));
     }
-    if (ma.host != mb.host) {
-        const std::size_t i = first_diff(ma.host, mb.host);
-        note(("host memory[" + num(i) + "]").c_str(),
-             num(ma.host[i]), num(mb.host[i]));
+    if (ra.host != rb.host) {
+        const std::size_t i = first_diff(ra.host, rb.host);
+        note(("host memory[" + num(i) + "]").c_str(), num(ra.host[i]), num(rb.host[i]));
     }
     return os.str();
 }
 
 using Setup = std::function<void(ref::Machine&)>;
 
-// Run a program down both paths and compare. Both sides are the reference model
-// until `Tpu` arrives in Phase 3, at which point one side is swapped for it and
-// every existing caller becomes a real differential test.
+// The same initial state, applied to the timed machine. Kept separate from Setup
+// so a test writes its inputs once and both models see them.
+using TpuSetup = std::function<void(Tpu&)>;
+
+// Two reference runs of the same program. This is what proved the comparison
+// itself works before there was a second implementation to point it at.
 std::string diff_run(const std::vector<RawInst>& prog, const Config& cfg,
                      const Setup& setup = {}) {
     ref::Machine ma(cfg), mb(cfg);
     if (setup) { setup(ma); setup(mb); }
     const ref::Result ra = ref::run(ma, prog);
     const ref::Result rb = ref::run(mb, prog);
-    return compare_runs("ref", ma, ra, "ref-again", mb, rb);
+    return compare_runs("ref", view_of(ma, ra), "ref-again", view_of(mb, rb));
+}
+
+// The real thing: the cycle-accurate machine against the oracle. Returns "" when
+// they agree on every comparand.
+std::string diff_tpu(const std::vector<RawInst>& prog, const Config& cfg,
+                     const Setup& rsetup = {}, const TpuSetup& tsetup = {}) {
+    ref::Machine m(cfg);
+    Tpu          t(cfg);
+    if (rsetup) rsetup(m);
+    if (tsetup) tsetup(t);
+
+    const ref::Result rr = ref::run(m, prog);
+    const TpuResult   tr = t.run(prog);
+    return compare_runs("ref", view_of(m, rr), "tpu", view_of(t, tr));
+}
+
+// Copy a byte image into host memory and weight memory on both models, so the
+// two setups cannot drift apart.
+struct Inputs {
+    HostAddr        host_at = 0;
+    std::vector<i8> host_bytes;
+    uint32_t        ddr_at = 0;
+    std::vector<i8> weights;
+    UbAddr          ub_at = 0;
+    std::vector<i8> ub_bytes;
+};
+
+Setup ref_setup(const Inputs& in) {
+    return [in](ref::Machine& m) {
+        for (std::size_t i = 0; i < in.host_bytes.size(); ++i) {
+            m.host[in.host_at + i] = static_cast<uint8_t>(in.host_bytes[i]);
+        }
+        for (std::size_t i = 0; i < in.weights.size(); ++i) {
+            m.weight_mem[in.ddr_at + i] = in.weights[i];
+        }
+        for (std::size_t i = 0; i < in.ub_bytes.size(); ++i) {
+            m.ub[in.ub_at + i] = in.ub_bytes[i];
+        }
+    };
+}
+
+TpuSetup tpu_setup(const Inputs& in) {
+    return [in](Tpu& t) {
+        for (std::size_t i = 0; i < in.host_bytes.size(); ++i) {
+            t.host()[in.host_at + i] = static_cast<uint8_t>(in.host_bytes[i]);
+        }
+        for (std::size_t i = 0; i < in.weights.size(); ++i) {
+            t.weight_mem()[in.ddr_at + i] = in.weights[i];
+        }
+        for (std::size_t i = 0; i < in.ub_bytes.size(); ++i) {
+            t.ub().at(static_cast<UbAddr>(in.ub_at + i)) = in.ub_bytes[i];
+        }
+    };
+}
+
+// Pseudo-random int8 payloads for a differential workload.
+Inputs random_inputs(uint32_t seed, uint32_t dim, uint32_t len, std::size_t tiles = 1) {
+    Lcg rng(seed);
+    Inputs in;
+    in.host_at = 0x100;
+    in.host_bytes.resize(static_cast<std::size_t>(len) * dim);
+    for (i8& v : in.host_bytes) v = rng.byte();
+    in.weights.resize(static_cast<std::size_t>(dim) * dim * tiles);
+    for (i8& v : in.weights) v = rng.byte();
+    return in;
 }
 
 // ---- systolic array helpers ----------------------------------------------
-
-// A deterministic byte source. Taking the top bits of an LCG gives a spread over
-// the whole int8 range, -128 included, which matters because -128 has no
-// positive counterpart and is where a sloppy negation would show up.
-struct Lcg {
-    uint32_t s;
-    explicit Lcg(uint32_t seed) : s(seed) {}
-    uint32_t next() {
-        s = s * 1664525u + 1013904223u;
-        return s;
-    }
-    i8 byte() { return static_cast<i8>(next() >> 24); }
-};
 
 // The oracle's answer, obtained by actually running Read_Weights + MatMul
 // through ref.h rather than by reimplementing the matmul here.
@@ -2426,6 +2542,565 @@ SECTION("tpu_units") {
     }
 }
 
+// --------------------------------------------------- @section("sequencer") ---
+SECTION("sequencer") {
+    const uint32_t dim = 4, len = 4;
+    Config cfg = small_cfg(dim, 2);
+    cfg.ub_bytes = 1024;
+    cfg.dma_bytes_per_cycle = 8;
+    cfg.ddr_tile_latency = 5;
+
+    const Inputs in = random_inputs(555, dim, len);
+
+    tpuasm::UbAlloc ua(0);
+    const tpuasm::Region acts = ua.tile(dim, dim);
+    const tpuasm::Region out  = ua.tile(dim, dim);
+
+    tpuasm::Program p;
+    p.read_host(in.host_at, acts, len * dim)
+     .read_weights(0)
+     .matmul(acts, len, 0)
+     .activate(0, out, len, ActFn::RELU, 1, 3)
+     .write_host(out, 0x400, len * dim)
+     .halt(5);
+
+    // A straight-line program runs to Halt and agrees with the oracle on every
+    // comparand. This is the first time the timed machine is checked against it.
+    const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+    REQUIRE_MSG(diff.empty(), diff);
+
+    // The retired count equals the instruction count, and the exit code comes
+    // back from Halt.
+    {
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        REQUIRE(!r.trapped);
+        REQUIRE(!r.budget);
+        REQUIRE(r.retired == p.code().size());
+        REQUIRE(r.exit_code == 5);
+        REQUIRE(r.pc == p.code().size());
+        REQUIRE(t.quiet());
+        REQUIRE(r.cycles > 0);
+    }
+
+    // Nothing but Halt.
+    {
+        Tpu t(cfg);
+        tpuasm::Program h;
+        h.halt(9);
+        const TpuResult r = t.run(h.code());
+        REQUIRE(r.halted);
+        REQUIRE(r.exit_code == 9);
+        REQUIRE(r.retired == 1);
+    }
+
+    // One issue per cycle: a run of NOPs costs a cycle each.
+    {
+        Tpu t(cfg);
+        tpuasm::Program n;
+        for (int i = 0; i < 10; ++i) n.nop();
+        n.halt();
+        const TpuResult r = t.run(n.code());
+        REQUIRE(r.halted);
+        REQUIRE(r.retired == 11);
+        REQUIRE(r.cycles == 11);
+    }
+
+    // ---- traps agree with the oracle, reason included ---------------------
+    {
+        struct Case {
+            const char* name;
+            std::vector<RawInst> code;
+        };
+        std::vector<Case> cases;
+        {
+            tpuasm::Program q;
+            q.matmul(0, dim + 1, 0).halt();
+            cases.push_back({"len exceeds bank", q.code()});
+        }
+        {
+            tpuasm::Program q;
+            q.matmul(0, len, cfg.acc_banks).halt();
+            cases.push_back({"bank out of range", q.code()});
+        }
+        {
+            tpuasm::Program q;
+            q.activate(cfg.acc_banks, 0, len, ActFn::RELU).halt();
+            cases.push_back({"activate bank", q.code()});
+        }
+        {
+            tpuasm::Program q;
+            q.read_host(0xFFFF0000, 0, 64).halt();
+            cases.push_back({"host range", q.code()});
+        }
+        {
+            tpuasm::Program q;
+            q.nop();
+            cases.push_back({"ran off the end", q.code()});
+        }
+        {
+            RawInst bad;
+            bad.word[0] = 0xFFu;
+            tpuasm::Program q;
+            q.raw(bad);
+            cases.push_back({"illegal opcode", q.code()});
+        }
+
+        for (const Case& c : cases) {
+            ref::Machine m(cfg);
+            Tpu t(cfg);
+            const ref::Result rr = ref::run(m, c.code);
+            const TpuResult   tr = t.run(c.code);
+            REQUIRE(rr.trapped);
+            REQUIRE_MSG(tr.trapped, std::string("    ") + c.name + " did not trap\n");
+            REQUIRE_MSG(tr.trap_reason == rr.trap_reason,
+                        std::string("    ") + c.name + ": tpu=\"" + tr.trap_reason +
+                            "\" ref=\"" + rr.trap_reason + "\"\n");
+            REQUIRE(tr.retired == rr.retired);
+        }
+    }
+
+    // A runaway program hits the cycle budget instead of spinning forever.
+    {
+        Tpu t(cfg);
+        tpuasm::Program q;
+        for (int i = 0; i < 100; ++i) q.nop();
+        q.halt();
+        TpuOptions opts;
+        opts.max_cycles = 10;
+        const TpuResult r = t.run(q.code(), opts);
+        REQUIRE(r.budget);
+        REQUIRE(!r.halted);
+        REQUIRE(!r.trapped);
+    }
+}
+
+// -------------------------------------------------- @section("scoreboard") ---
+SECTION("scoreboard") {
+    const uint32_t dim = 4, len = 4;
+    Config cfg = small_cfg(dim, 2);
+    cfg.ub_bytes = 1024;
+    cfg.dma_bytes_per_cycle = 1;      // slow, so the DMA is unmistakably long
+    cfg.ddr_tile_latency = 4;
+
+    const Inputs in = random_inputs(777, dim, len);
+    const uint32_t bytes = len * dim;
+
+    // ---- a MatMul reading a region a DMA is still filling must wait --------
+    {
+        tpuasm::Program p;
+        p.read_host(in.host_at, 0, bytes)     // 16 bytes at 1/cycle = 16 cycles
+         .read_weights(0)
+         .matmul(0, len, 0)                   // reads exactly what the DMA writes
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+
+        // The MatMul could not have issued before the DMA retired, so the RAW
+        // counter has to have fired.
+        REQUIRE(t.stalls().ub_raw > 0);
+
+        // And the answer is right, which is the point of the interlock.
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+
+    // A MatMul reading a region the DMA is *not* filling does not wait on it.
+    {
+        tpuasm::Program p;
+        p.read_host(in.host_at, 512, bytes)   // lands somewhere else entirely
+         .read_weights(0)
+         .matmul(0, len, 0)
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        REQUIRE(t.stalls().ub_raw == 0);
+    }
+
+    // ---- an Activate reading an accumulator waits for its MatMul -----------
+    {
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, len, 0)
+         .activate(0, 512, len, ActFn::RELU, 1, 0)
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        REQUIRE(t.stalls().accum_hazard > 0);
+
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+
+    // An Activate on a different bank has nothing to wait for.
+    {
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, len, 0)
+         .activate(1, 512, len, ActFn::RELU, 1, 0)
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.stalls().accum_hazard == 0);
+    }
+
+    // ---- write-after-read: a DMA must not overwrite what a MatMul is still
+    // streaming out of the buffer.
+    //
+    // This one can only ever be a timing property. An instruction reads its inputs
+    // at issue, so by the time a later writer could commit, the reader already has
+    // what it needed and no answer can change. A real array streams activations
+    // over many cycles and would be corrupted, so the stall belongs in the model --
+    // but the stall counter is the only thing that can witness it.
+    {
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, len, 0)
+         .read_host(in.host_at, 0, bytes)     // same region the MatMul reads
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.stalls().ub_war > 0);
+    }
+
+    // Two DMAs to one region cannot overlap, though the single engine would have
+    // serialized them regardless of the region.
+    {
+        tpuasm::Program p;
+        p.read_host(in.host_at, 0, bytes)
+         .read_host(in.host_at, 0, bytes)
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.stalls().unit_busy > 0 || t.stalls().ub_waw > 0);
+    }
+
+    // ---- write-after-write across two different units -----------------------
+    // This is the case that needs the WAW check on its own merits: an Activate and
+    // a DMA live in different units, so nothing structural stops them overlapping.
+    // The Activate is the slower of the two, so if they were allowed to overlap the
+    // DMA would commit first and the Activate would then overwrite it -- leaving
+    // the region holding whichever finished last instead of what the program said.
+    {
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, len, 0)
+         .activate(0, 512, len, ActFn::RELU, 1, 0)   // writes [512, 528)
+         .read_host(in.host_at, 512, bytes)          // same region, and later
+         .halt();
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.stalls().ub_waw > 0);
+
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+
+    // Accumulating into a bank waits for the matmul already producing into it,
+    // and the K-tiled result still matches the oracle.
+    {
+        const Inputs two = random_inputs(31, dim, len, 2);
+        tpuasm::Program p;
+        p.read_weights(0).matmul(0, len, 0)
+         .read_weights(static_cast<uint32_t>(dim) * dim).matmul(0, len, 0, /*accumulate=*/true)
+         .halt();
+
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(two), tpu_setup(two));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+}
+
+// ----------------------------------------------------- @section("overlap") ---
+SECTION("overlap") {
+    // Independent work in different units runs concurrently; a dependent chain
+    // does not. Same instructions in both programs, so the only difference is
+    // whether the operands collide.
+    const uint32_t dim = 4, len = 4;
+    Config cfg = small_cfg(dim, 4);
+    cfg.ub_bytes = 2048;
+    cfg.dma_bytes_per_cycle = 1;      // 16-byte transfer = 16 cycles
+    cfg.ddr_tile_latency = 4;
+    cfg.act_pipeline_depth = 4;
+    cfg.double_buffer = true;
+
+    const uint32_t bytes   = len * dim;
+    const uint64_t dma_dur = bytes;                       // 16
+    const uint64_t mm_dur  = len + 2ull * dim - 1ull;     // 11
+    const uint64_t act_dur = static_cast<uint64_t>(len) * dim + cfg.act_pipeline_depth;  // 20
+
+    const Inputs in = random_inputs(999, dim, len);
+
+    // Independent: the DMA writes a region nobody reads, the MatMul reads a
+    // different region into bank 0, the Activate reads bank 1.
+    tpuasm::Program indep;
+    indep.read_weights(0)
+         .matmul(0, len, 0)             // reads UB [0, 16)
+         .read_host(in.host_at, 1024, bytes)
+         .activate(1, 512, len, ActFn::RELU, 1, 0)
+         .halt();
+
+    // Dependent: the DMA fills what the MatMul reads, and the Activate reads the
+    // bank the MatMul writes.
+    tpuasm::Program dep;
+    dep.read_weights(0)
+       .read_host(in.host_at, 0, bytes)
+       .matmul(0, len, 0)
+       .activate(0, 512, len, ActFn::RELU, 1, 0)
+       .halt();
+
+    Tpu ti(cfg), td(cfg);
+    tpu_setup(in)(ti);
+    tpu_setup(in)(td);
+    const TpuResult ri = ti.run(indep.code());
+    const TpuResult rd = td.run(dep.code());
+    REQUIRE(ri.halted);
+    REQUIRE(rd.halted);
+
+    // The dependent chain pays the sum of its stages; the independent one pays
+    // roughly the longest.
+    const uint64_t sum = dma_dur + mm_dur + act_dur;
+    REQUIRE(ri.cycles < sum);
+    REQUIRE(rd.cycles >= sum);
+    REQUIRE(ri.cycles < rd.cycles);
+
+    // More precisely: the independent version finishes within a few issue slots
+    // of its longest stage, since the three run side by side.
+    const uint64_t longest = std::max(dma_dur, std::max(mm_dur, act_dur));
+    REQUIRE(ri.cycles <= longest + cfg.ddr_tile_latency + indep.code().size());
+
+    // The stall counters say which one was which.
+    REQUIRE(ti.stalls().ub_raw == 0);
+    REQUIRE(ti.stalls().accum_hazard == 0);
+    REQUIRE(td.stalls().ub_raw > 0);
+    REQUIRE(td.stalls().accum_hazard > 0);
+
+    // Overlapping must not change the answer: both programs match the oracle.
+    {
+        const std::string di = diff_tpu(indep.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(di.empty(), di);
+        const std::string dd = diff_tpu(dep.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(dd.empty(), dd);
+    }
+
+    // Two DMAs cannot overlap however independent their regions, because there is
+    // one engine: a structural limit, not a data one.
+    {
+        tpuasm::Program p;
+        p.read_host(in.host_at, 0, bytes)
+         .read_host(in.host_at, 1024, bytes)
+         .halt();
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        REQUIRE(t.stalls().unit_busy > 0);
+        REQUIRE(r.cycles >= 2 * dma_dur);
+    }
+}
+
+// ---------------------------------------------- @section("weight_overlap") ---
+SECTION("weight_overlap") {
+    // Step 3.5's property, now through the full sequencer: the second tile's
+    // weight load hides under the first tile's matmul when there is a shadow
+    // plane, and is fully exposed when there is not.
+    const uint32_t dim = 4, len = 4;
+    const uint32_t latency = 6;
+
+    const Inputs in = random_inputs(2024, dim, len, 2);
+    const uint32_t tile_bytes = dim * dim;
+
+    tpuasm::Program p;
+    p.read_weights(0)
+     .matmul(0, len, 0)
+     .read_weights(tile_bytes)
+     .matmul(0, len, 1)
+     .halt();
+
+    auto measure = [&](bool double_buffer) {
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 1024;
+        cfg.ddr_tile_latency = latency;
+        cfg.double_buffer = double_buffer;
+
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        // Activations come from the buffer directly, so the timing is only about
+        // weights and compute.
+        for (uint32_t i = 0; i < len * dim; ++i) {
+            t.ub().at(i) = in.host_bytes[i];
+        }
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        return std::make_pair(r.cycles, t.stalls());
+    };
+
+    const auto db   = measure(true);
+    const auto nodb = measure(false);
+
+    const uint64_t mm  = len + 2ull * dim - 1ull;   // 11
+
+    // With a shadow plane no cycle is spent shifting weights into the array.
+    REQUIRE(db.second.weight_load_bubble == 0);
+    // Without one, each of the two loads costs dim exposed cycles.
+    REQUIRE(nodb.second.weight_load_bubble == 2ull * dim);
+
+    // The second weight load overlaps the first matmul when double buffered, so
+    // only one DDR latency is ever exposed: the first, which has nothing to hide
+    // behind.
+    REQUIRE(db.first == latency + 2 * mm + 1);
+
+    // Without double buffering the loads serialize behind the matmuls entirely.
+    REQUIRE(nodb.first == 2 * (latency + dim) + 2 * mm + 1);
+    REQUIRE(nodb.first > db.first);
+
+    // The array itself confirms it: with a shadow plane it switches planes on
+    // every matmul, and it never stood idle for a load.
+    {
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 1024;
+        cfg.ddr_tile_latency = latency;
+        cfg.double_buffer = true;
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        for (uint32_t i = 0; i < len * dim; ++i) t.ub().at(i) = in.host_bytes[i];
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.mxu().stats().plane_switches == 2);
+        REQUIRE(t.mxu().stats().weight_load_bubble == 0);
+        REQUIRE(t.stalls().weight_stall > 0);      // the matmuls did wait for tiles
+    }
+
+    // Faster must still mean identical: both configurations agree with the oracle.
+    for (const bool db_on : {true, false}) {
+        Config cfg = small_cfg(dim, 2);
+        cfg.ub_bytes = 1024;
+        cfg.ddr_tile_latency = latency;
+        cfg.double_buffer = db_on;
+
+        Inputs seeded = in;
+        seeded.ub_at = 0;
+        seeded.ub_bytes.assign(in.host_bytes.begin(), in.host_bytes.end());
+
+        const std::string diff =
+            diff_tpu(p.code(), cfg, ref_setup(seeded), tpu_setup(seeded));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+}
+
+// -------------------------------------------------------- @section("sync") ---
+SECTION("sync") {
+    const uint32_t dim = 4, len = 4;
+    Config cfg = small_cfg(dim, 2);
+    cfg.ub_bytes = 1024;
+    cfg.dma_bytes_per_cycle = 2;
+    cfg.ddr_tile_latency = 5;
+
+    const Inputs in = random_inputs(4242, dim, len, 2);
+    const uint32_t tile_bytes = dim * dim;
+
+    // A barrier between two K-tiles: the snapshot at each Sync must match the
+    // oracle, which is what makes a timing bug bisectable to the interval between
+    // two barriers rather than merely visible at Halt.
+    tpuasm::Program p;
+    p.read_host(in.host_at, 0, len * dim)
+     .read_weights(0)
+     .matmul(0, len, 0)
+     .sync()
+     .read_weights(tile_bytes)
+     .matmul(0, len, 0, /*accumulate=*/true)
+     .sync()
+     .activate(0, 512, len, ActFn::RELU, 1, 2)
+     .write_host(512, 0x400, len * dim)
+     .sync()
+     .halt(2);
+
+    const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+    REQUIRE_MSG(diff.empty(), diff);
+
+    {
+        Tpu t(cfg);
+        tpu_setup(in)(t);
+        const TpuResult r = t.run(p.code());
+        REQUIRE(r.halted);
+        REQUIRE(r.syncs.size() == 3);
+        REQUIRE(r.retired == p.code().size());
+
+        // A barrier only issues once the machine is quiet, so it has to have
+        // waited for the work in front of it.
+        REQUIRE(t.stalls().drain > 0);
+
+        // The snapshots are distinct: the second K-tile really did add to the
+        // first, so the barriers are observing progress rather than a static
+        // bank.
+        REQUIRE(r.syncs[0].acc != r.syncs[1].acc);
+
+        // Activate does not touch the accumulators, so the last two agree.
+        REQUIRE(r.syncs[1].acc == r.syncs[2].acc);
+    }
+
+    // Every Phase-2 workload shape, with and without barriers, and under
+    // configurations that change the schedule but must not change the result.
+    {
+        tpuasm::Program bare;
+        bare.read_host(in.host_at, 0, len * dim)
+            .read_weights(0)
+            .matmul(0, len, 0)
+            .read_weights(tile_bytes)
+            .matmul(0, len, 0, true)
+            .activate(0, 512, len, ActFn::RELU, 1, 2)
+            .write_host(512, 0x400, len * dim)
+            .halt(2);
+
+        for (const uint32_t bw : {1u, 4u, 64u}) {
+            for (const bool db : {true, false}) {
+                for (const uint32_t lat : {0u, 3u, 9u}) {
+                    Config c = cfg;
+                    c.dma_bytes_per_cycle = bw;
+                    c.double_buffer = db;
+                    c.ddr_tile_latency = lat;
+
+                    const std::string d1 = diff_tpu(p.code(), c, ref_setup(in), tpu_setup(in));
+                    REQUIRE_MSG(d1.empty(), d1);
+                    const std::string d2 =
+                        diff_tpu(bare.code(), c, ref_setup(in), tpu_setup(in));
+                    REQUIRE_MSG(d2.empty(), d2);
+                }
+            }
+        }
+    }
+
+    // A Sync with nothing in flight still snapshots, and back-to-back barriers
+    // agree with each other.
+    {
+        Tpu t(cfg);
+        tpuasm::Program q;
+        q.sync().sync().halt();
+        const TpuResult r = t.run(q.code());
+        REQUIRE(r.halted);
+        REQUIRE(r.syncs.size() == 2);
+        REQUIRE(r.syncs[0].acc == r.syncs[1].acc);
+        REQUIRE(r.retired == 3);
+    }
+}
+
 // ------------------------------------------------ @section("diff_scaffold") ---
 SECTION("diff_scaffold") {
     const Config cfg = small_cfg();
@@ -2482,7 +3157,7 @@ SECTION("diff_scaffold") {
         sb(mb);
         const ref::Result ra = ref::run(ma, pa);
         const ref::Result rb = ref::run(mb, pb);
-        return compare_runs("a", ma, ra, "b", mb, rb);
+        return compare_runs("a", view_of(ma, ra), "b", view_of(mb, rb));
     };
 
     // exit code

@@ -1,6 +1,9 @@
 #include "tpu.h"
 
 #include <algorithm>
+#include <vector>
+
+#include "quant.h"
 
 Tpu::Tpu(const Config& cfg, std::size_t host_bytes, std::size_t weight_bytes)
     : cfg_(cfg), ub_(cfg), acc_(cfg), fifo_(cfg), dma_(cfg), mxu_(cfg),
@@ -90,4 +93,524 @@ bool Tpu::matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate) {
     dma_.tick(cycle_);
     fifo_.tick(cycle_);
     return true;
+}
+
+// ===========================================================================
+// The sequencer
+//
+// In-order issue, one instruction per cycle, overlapped execution, gated by a
+// scoreboard. Nothing is speculative, so nothing is ever squashed: correctness
+// reduces to whether each instruction computes the right tensor and whether the
+// interlock ever lets a consumer read a region before its producer finished.
+//
+// An instruction's data effect lands when it issues, not spread over its
+// duration. That is sound precisely because of the scoreboard -- no other
+// instruction that could observe the difference is allowed to issue until this
+// one retires -- and it keeps the data path obviously correct, leaving the
+// schedule as the only thing the timing model has to get right. Read_Weights is
+// the one exception: its tile is popped from the FIFO and shifted into the plane
+// when it retires, since that is when the tile has actually arrived from DDR.
+// ===========================================================================
+
+Unit Tpu::unit_of(Op op) {
+    switch (op) {
+        case Op::READ_HOST:
+        case Op::WRITE_HOST:    return Unit::DMA;
+        case Op::READ_WEIGHTS:  return Unit::WEIGHT;
+        case Op::MATMUL:        return Unit::MXU;
+        case Op::ACTIVATE:      return Unit::ACT;
+        case Op::SYNC:
+        case Op::NOP:
+        case Op::HALT:          return Unit::SEQ;
+    }
+    return Unit::SEQ;
+}
+
+bool Tpu::quiet() const {
+    for (const InFlight& f : units_) {
+        if (f.active) return false;
+    }
+    return true;
+}
+
+namespace {
+
+// Output shape of an Activate, after any pooling. Floor semantics: a window that
+// does not divide the input evenly drops the ragged edge.
+void act_out_shape(const Decoded& d, uint32_t dim, uint32_t& rows, uint32_t& cols) {
+    if (d.pool == Pool::NONE) {
+        rows = d.len;
+        cols = dim;
+        return;
+    }
+    rows = (d.len - d.pool_window) / d.pool_stride + 1;
+    cols = (dim - d.pool_window) / d.pool_stride + 1;
+}
+
+bool range_ok(std::size_t off, std::size_t len, std::size_t size) {
+    return off <= size && len <= size - off;
+}
+
+}  // namespace
+
+bool Tpu::validate(const Decoded& d, Reservation& res, std::string& why) const {
+    const uint32_t dim = cfg_.dim;
+    res = Reservation{};
+
+    switch (d.op) {
+        case Op::READ_HOST:
+            if (!range_ok(d.host_addr, d.bytes, host_.size())) {
+                why = "Read_Host_Memory: host range";
+                return false;
+            }
+            if (!range_ok(d.ub_addr, d.bytes, ub_.bytes())) {
+                why = "Read_Host_Memory: ub range";
+                return false;
+            }
+            res.ub_write = UbRegion{d.ub_addr, d.ub_addr + d.bytes};
+            return true;
+
+        case Op::WRITE_HOST:
+            if (!range_ok(d.ub_addr, d.bytes, ub_.bytes())) {
+                why = "Write_Host_Memory: ub range";
+                return false;
+            }
+            if (!range_ok(d.host_addr, d.bytes, host_.size())) {
+                why = "Write_Host_Memory: host range";
+                return false;
+            }
+            res.ub_read = UbRegion{d.ub_addr, d.ub_addr + d.bytes};
+            return true;
+
+        case Op::READ_WEIGHTS: {
+            const std::size_t need = static_cast<std::size_t>(dim) * dim;
+            if (!range_ok(d.ddr_addr, need, weight_mem_.size())) {
+                why = "Read_Weights: ddr range";
+                return false;
+            }
+            res.writes_weights = true;
+            return true;
+        }
+
+        case Op::MATMUL: {
+            // The order of these checks matches the oracle's, so a program with
+            // more than one thing wrong reports the same reason on both sides.
+            if (d.acc_bank >= cfg_.acc_banks) {
+                why = "MatMul: bank out of range";
+                return false;
+            }
+            if (d.len > dim) {
+                why = "MatMul: len exceeds accumulator rows";
+                return false;
+            }
+            const std::size_t need = static_cast<std::size_t>(d.len) * dim;
+            if (!range_ok(d.ub_addr, need, ub_.bytes())) {
+                why = "MatMul: activation range";
+                return false;
+            }
+            res.ub_read       = UbRegion{d.ub_addr, static_cast<UbAddr>(d.ub_addr + need)};
+            res.acc_write     = d.acc_bank;
+            res.reads_weights = true;
+            // Accumulating in place reads the bank as well as writing it, so it
+            // has to wait for whatever is still producing into it.
+            if (d.accumulate) res.acc_read = d.acc_bank;
+            return true;
+        }
+
+        case Op::ACTIVATE: {
+            if (d.acc_bank >= cfg_.acc_banks) {
+                why = "Activate: bank out of range";
+                return false;
+            }
+            if (d.len > dim) {
+                why = "Activate: len exceeds accumulator rows";
+                return false;
+            }
+            if (d.pool != Pool::NONE) {
+                if (d.pool_window == 0 || d.pool_stride == 0) {
+                    why = "Activate: zero pool window or stride";
+                    return false;
+                }
+                if (d.pool_window > d.len || d.pool_window > dim) {
+                    why = "Activate: pool window larger than input";
+                    return false;
+                }
+            }
+            uint32_t rows = 0, cols = 0;
+            act_out_shape(d, dim, rows, cols);
+            const std::size_t need = static_cast<std::size_t>(rows) * cols;
+            if (!range_ok(d.ub_addr, need, ub_.bytes())) {
+                why = "Activate: output range";
+                return false;
+            }
+            res.acc_read  = d.acc_bank;
+            res.ub_write  = UbRegion{d.ub_addr, static_cast<UbAddr>(d.ub_addr + need)};
+            return true;
+        }
+
+        case Op::SYNC:
+        case Op::NOP:
+        case Op::HALT:
+            return true;
+    }
+    why = "illegal opcode";
+    return false;
+}
+
+uint64_t Tpu::duration_of(const Decoded& d) const {
+    switch (d.op) {
+        case Op::READ_HOST:
+        case Op::WRITE_HOST:
+            return std::max<uint64_t>(1, dma_.transfer_cycles(d.bytes));
+
+        case Op::READ_WEIGHTS:
+            // The DDR fetch, then shifting the tile into a plane. With a shadow
+            // plane the shift hides under whatever the array is doing, so it costs
+            // nothing here; without one it is dim exposed cycles.
+            return static_cast<uint64_t>(fifo_.latency()) + mxu_.load_bubble();
+
+        case Op::MATMUL:
+            // Set by the array itself at issue, from its own timing model.
+            return 0;
+
+        case Op::ACTIVATE:
+            // Throughput-1 after fill: one element per cycle plus the pipeline
+            // depth. Phase 6 characterizes this properly.
+            return static_cast<uint64_t>(d.len) * cfg_.dim + cfg_.act_pipeline_depth;
+
+        case Op::SYNC:
+        case Op::NOP:
+        case Op::HALT:
+            return 1;
+    }
+    return 1;
+}
+
+bool Tpu::interlocked(const Reservation& r) {
+    for (const InFlight& f : units_) {
+        if (!f.active) continue;
+
+        // A reader waits for the writer of its region; a writer waits for both
+        // readers and writers. WAR matters even though effects land at issue: the
+        // array streams its activations out of the buffer over many cycles, so a
+        // DMA overwriting that region early would corrupt a real machine. Being
+        // conservative here can cost overlap but never correctness.
+        if (r.ub_read.overlaps(f.res.ub_write))  { ++stalls_.ub_raw; return true; }
+        if (r.ub_write.overlaps(f.res.ub_read))  { ++stalls_.ub_war; return true; }
+        if (r.ub_write.overlaps(f.res.ub_write)) { ++stalls_.ub_waw; return true; }
+
+        const bool acc_conflict =
+            (r.acc_read != INVALID_BANK && r.acc_read == f.res.acc_write) ||
+            (r.acc_write != INVALID_BANK && (r.acc_write == f.res.acc_write ||
+                                             r.acc_write == f.res.acc_read));
+        if (acc_conflict) { ++stalls_.accum_hazard; return true; }
+
+        // A MatMul needs the tile its Read_Weights was fetching.
+        if (r.reads_weights && f.res.writes_weights) { ++stalls_.weight_stall; return true; }
+
+        // And a Read_Weights must not overwrite the tile a running MatMul is
+        // still multiplying by -- unless there is a shadow plane to put it in,
+        // which is exactly what double buffering buys. The whole benefit falls out
+        // of this one condition rather than being a special case elsewhere.
+        if (r.writes_weights && f.res.reads_weights && !cfg_.double_buffer) {
+            ++stalls_.weight_stall;
+            return true;
+        }
+        if (r.writes_weights && f.res.writes_weights) { ++stalls_.weight_stall; return true; }
+    }
+    return false;
+}
+
+uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
+    const uint32_t dim = cfg_.dim;
+    uint64_t duration  = duration_of(d);
+
+    switch (d.op) {
+        case Op::READ_HOST: {
+            DmaRequest r;
+            r.dir   = DmaDir::HOST_TO_UB;
+            r.host  = d.host_addr;
+            r.ub    = d.ub_addr;
+            r.bytes = d.bytes;
+            dma_.begin(r, cycle_, host_.size(), ub_);
+
+            pw.ub_at = d.ub_addr;
+            pw.ub_data.resize(d.bytes);
+            for (uint32_t i = 0; i < d.bytes; ++i) {
+                pw.ub_data[i] = static_cast<i8>(host_[d.host_addr + i]);
+            }
+            break;
+        }
+
+        case Op::WRITE_HOST: {
+            DmaRequest r;
+            r.dir   = DmaDir::UB_TO_HOST;
+            r.host  = d.host_addr;
+            r.ub    = d.ub_addr;
+            r.bytes = d.bytes;
+            dma_.begin(r, cycle_, host_.size(), ub_);
+
+            pw.host_at = d.host_addr;
+            pw.host_data.resize(d.bytes);
+            for (uint32_t i = 0; i < d.bytes; ++i) {
+                pw.host_data[i] = static_cast<uint8_t>(ub_.at(d.ub_addr + i));
+            }
+            break;
+        }
+
+        case Op::READ_WEIGHTS: {
+            // Request the tile now; it is shifted into the plane when the
+            // instruction retires, which is when it has actually arrived.
+            WeightTile t;
+            t.ddr_addr = d.ddr_addr;
+            t.tile     = d.tile;
+            t.rows     = dim;
+            t.cols     = dim;
+            const std::size_t need = static_cast<std::size_t>(dim) * dim;
+            t.data.assign(weight_mem_.begin() + d.ddr_addr,
+                          weight_mem_.begin() + d.ddr_addr + static_cast<std::ptrdiff_t>(need));
+            fifo_.push_refill(t, cycle_);
+            stalls_.weight_load_bubble += mxu_.load_bubble();
+            break;
+        }
+
+        case Op::MATMUL: {
+            // The array's own timing model decides how long this takes, so the
+            // sequencer does not carry a second copy of the fill/drain formula.
+            mxu_.idle_until(cycle_);
+
+            pw.bank     = d.acc_bank;
+            pw.acc_rows = d.len;
+            pw.acc_data.assign(static_cast<std::size_t>(d.len) * dim, 0);
+            const I32View out(pw.acc_data.data(), d.len, dim);
+
+            // Accumulating in place starts from what the bank holds now, so the
+            // read of the bank happens at issue like every other input.
+            if (d.accumulate) out.copy_from(acc_.bank(d.acc_bank).tile(0, 0, d.len, dim));
+
+            const ConstI8View acts = ub_.view(d.ub_addr, d.len, dim, dim);
+            const MxuTiming   t    = mxu_.matmul(acts, out, d.accumulate);
+            duration               = t.cycles;
+            break;
+        }
+
+        case Op::ACTIVATE: {
+            const ConstI32View bank = acc_.bank(d.acc_bank);
+
+            std::vector<i8> tile(static_cast<std::size_t>(d.len) * dim, 0);
+            for (uint32_t r = 0; r < d.len; ++r) {
+                for (uint32_t c = 0; c < dim; ++c) {
+                    const i8 q = quant::requantize_biased(bank.at(r, c), d.bias,
+                                                          d.multiplier, d.shift);
+                    i8 v = q;
+                    switch (d.act) {
+                        case ActFn::IDENTITY: break;
+                        case ActFn::RELU:     v = q < 0 ? i8{0} : q; break;
+                        case ActFn::RELU6:    v = q < 0 ? i8{0} : (q > 6 ? i8{6} : q); break;
+                    }
+                    tile[static_cast<std::size_t>(r) * dim + c] = v;
+                }
+            }
+
+            uint32_t rows = 0, cols = 0;
+            act_out_shape(d, dim, rows, cols);
+
+            pw.ub_at = d.ub_addr;
+            if (d.pool == Pool::NONE) {
+                pw.ub_data = std::move(tile);
+            } else {
+                const uint32_t w = d.pool_window;
+                const uint32_t s = d.pool_stride;
+                pw.ub_data.assign(static_cast<std::size_t>(rows) * cols, 0);
+                for (uint32_t orow = 0; orow < rows; ++orow) {
+                    for (uint32_t ocol = 0; ocol < cols; ++ocol) {
+                        int64_t sum  = 0;
+                        i8      best = tile[static_cast<std::size_t>(orow * s) * dim + ocol * s];
+                        for (uint32_t dr = 0; dr < w; ++dr) {
+                            for (uint32_t dc = 0; dc < w; ++dc) {
+                                const i8 v = tile[static_cast<std::size_t>(orow * s + dr) * dim +
+                                                  (ocol * s + dc)];
+                                sum += v;
+                                if (v > best) best = v;
+                            }
+                        }
+                        pw.ub_data[static_cast<std::size_t>(orow) * cols + ocol] =
+                            d.pool == Pool::MAX
+                              ? best
+                              : quant::saturate(
+                                    quant::round_div(sum, static_cast<int64_t>(w) * w));
+                    }
+                }
+            }
+            break;
+        }
+
+        case Op::SYNC:
+        case Op::NOP:
+        case Op::HALT:
+            break;
+    }
+    return duration;
+}
+
+void Tpu::finish(InFlight& f) {
+    // Commit the staged outputs. Until this moment a consumer that issued too
+    // early would have read the state this instruction is replacing.
+    const PendingWrite& pw = f.pending;
+    for (std::size_t i = 0; i < pw.ub_data.size(); ++i) {
+        ub_.at(static_cast<UbAddr>(pw.ub_at + i)) = pw.ub_data[i];
+    }
+    for (std::size_t i = 0; i < pw.host_data.size(); ++i) {
+        host_[pw.host_at + i] = pw.host_data[i];
+    }
+    if (pw.bank != INVALID_BANK) {
+        acc_.bank(pw.bank)
+            .tile(0, 0, pw.acc_rows, cfg_.dim)
+            .copy_from(ConstI32View(pw.acc_data.data(), pw.acc_rows, cfg_.dim));
+    }
+
+    if (f.op == Op::READ_WEIGHTS) {
+        // The tile has arrived; shift it into the load plane. The clock is not
+        // charged here, because the load bubble was already folded into this
+        // instruction's duration.
+        WeightTile t;
+        if (fifo_.pop(t)) {
+            mxu_.load_weights_untimed(t.view());
+        } else {
+            // Unreachable: the duration covers the DDR latency, so the tile is
+            // always ready by now. Counted rather than ignored so that a change
+            // which breaks the assumption shows up instead of silently loading
+            // stale weights.
+            ++stalls_.weight_fifo_empty;
+        }
+    }
+    f.active = false;
+}
+
+void Tpu::retire_completed(TpuResult& st) {
+    // Reverse pipeline order: writeback before issue, so a unit freed this cycle
+    // can take new work in the same cycle rather than leaving a dead cycle behind
+    // every instruction.
+    for (InFlight& f : units_) {
+        if (f.active && cycle_ >= f.done_cycle) {
+            finish(f);
+            ++st.retired;
+        }
+    }
+}
+
+void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
+                     const TpuOptions& opts) {
+    if (st.pc >= prog.size()) {
+        // A well-formed program ends in Halt. Wait for the machine to go quiet
+        // first so the retired count and final state are exactly what the oracle
+        // reports for the same program.
+        if (!quiet()) { ++stalls_.drain; return; }
+        st.trapped     = true;
+        st.trap_reason = "ran past the end of the program";
+        return;
+    }
+
+    const Decoded d = decode(prog[st.pc]);
+
+    Reservation res;
+    std::string why;
+    const bool  ok = !d.trap && validate(d, res, why);
+    if (d.trap) why = "illegal opcode";
+
+    if (!ok) {
+        // Everything before this instruction must retire before the trap is
+        // reported, for the same reason as above.
+        if (!quiet()) { ++stalls_.drain; return; }
+        st.trapped     = true;
+        st.trap_reason = why;
+        ++st.retired;
+        return;
+    }
+
+    // A barrier and a halt both need the machine quiet.
+    if (d.op == Op::SYNC || d.op == Op::HALT) {
+        if (!quiet()) { ++stalls_.drain; return; }
+    }
+
+    const Unit u = unit_of(d.op);
+    if (slot(u).active) { ++stalls_.unit_busy; return; }
+
+    if (d.op == Op::READ_WEIGHTS && fifo_.full()) {
+        ++stalls_.weight_fifo_full;
+        return;
+    }
+
+    if (interlocked(res)) return;
+
+    if (opts.trace && opts.trace_out) {
+        std::fprintf(opts.trace_out, "%8llu  issue %4zu: %s\n",
+                     static_cast<unsigned long long>(cycle_), st.pc, op_name(d.op));
+    }
+
+    PendingWrite pw;
+    uint64_t     duration = execute(d, pw);
+    if (duration == 0) duration = 1;
+
+    ++st.pc;
+
+    // Halt stops the machine here rather than occupying a unit: it only issued
+    // because everything was quiet, so there is nothing left for it to wait on.
+    // It still spends its issue cycle, like every other instruction.
+    if (d.op == Op::HALT) {
+        st.halted    = true;
+        st.exit_code = d.code;
+        ++st.retired;
+        ++cycle_;
+        return;
+    }
+
+    InFlight& f   = slot(u);
+    f.active      = true;
+    f.op          = d.op;
+    f.res         = res;
+    f.pending     = std::move(pw);
+    f.issue_cycle = cycle_;
+    f.done_cycle  = cycle_ + duration;
+
+    // A barrier also only issues when the machine is quiet, so the accumulators
+    // it snapshots are final for every instruction before it.
+    if (d.op == Op::SYNC) {
+        TpuSnapshot s;
+        s.acc = acc_.raw();
+        st.syncs.push_back(std::move(s));
+    }
+}
+
+void Tpu::reset_pipeline() {
+    for (InFlight& f : units_) f = InFlight{};
+    stalls_ = StallStats{};
+}
+
+TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
+    TpuResult st;
+    reset_pipeline();
+
+    const uint64_t start = cycle_;
+    while (!st.done()) {
+        if (cycle_ - start >= opts.max_cycles) {
+            st.budget = true;
+            break;
+        }
+
+        retire_completed(st);
+        if (st.done()) break;
+
+        issue_step(prog, st, opts);
+        if (st.done()) break;
+
+        ++cycle_;
+        dma_.tick(cycle_);
+        fifo_.tick(cycle_);
+        mxu_.idle_until(cycle_);
+    }
+
+    st.cycles = cycle_ - start;
+    pc_       = st.pc;
+    return st;
 }
