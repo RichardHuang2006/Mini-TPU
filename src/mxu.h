@@ -129,6 +129,17 @@ public:
         for (Pe& p : pe_) p.clear_pipeline();
     }
 
+    // Idle the array forward, for when the machine's clock has moved on without
+    // it -- waiting on a DMA, say, or on a weight tile that has not arrived.
+    // Those cycles are counted, so time the array spent with nothing to do shows
+    // up as lost utilization instead of vanishing. Never moves time backwards.
+    void idle_until(uint64_t when) {
+        if (when > cycle_) {
+            cycle_        = when;
+            stats_.cycles = cycle_;
+        }
+    }
+
     // Fraction of MAC slots that did useful work, counting every cycle the array
     // was occupied, fill and drain included. This is the number that makes the
     // case for streaming many rows through one weight load.
