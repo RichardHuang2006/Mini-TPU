@@ -331,6 +331,13 @@ struct Inputs {
     std::vector<i8> weights;
     UbAddr          ub_at = 0;
     std::vector<i8> ub_bytes;
+
+    // Accumulator contents, row-major into one bank. Planting these lets a test
+    // choose the exact int32 values the activation pipeline will see, instead of
+    // taking whatever a matmul happens to produce -- which is the only way to sweep
+    // densely across a clamp boundary.
+    BankId           acc_at = 0;
+    std::vector<i32> acc_vals;
 };
 
 Setup ref_setup(const Inputs& in) {
@@ -343,6 +350,10 @@ Setup ref_setup(const Inputs& in) {
         }
         for (std::size_t i = 0; i < in.ub_bytes.size(); ++i) {
             m.ub[in.ub_at + i] = in.ub_bytes[i];
+        }
+        const std::size_t per = static_cast<std::size_t>(m.cfg.dim) * m.cfg.dim;
+        for (std::size_t i = 0; i < in.acc_vals.size(); ++i) {
+            m.acc[in.acc_at * per + i] = in.acc_vals[i];
         }
     };
 }
@@ -357,6 +368,14 @@ TpuSetup tpu_setup(const Inputs& in) {
         }
         for (std::size_t i = 0; i < in.ub_bytes.size(); ++i) {
             t.ub().at(static_cast<UbAddr>(in.ub_at + i)) = in.ub_bytes[i];
+        }
+        if (!in.acc_vals.empty()) {
+            const I32View bank = t.acc().bank(in.acc_at);
+            const uint32_t dim = bank.cols();
+            for (std::size_t i = 0; i < in.acc_vals.size(); ++i) {
+                bank.at(static_cast<uint32_t>(i / dim), static_cast<uint32_t>(i % dim)) =
+                    in.acc_vals[i];
+            }
         }
     };
 }
@@ -3098,6 +3117,497 @@ SECTION("sync") {
         REQUIRE(r.syncs.size() == 2);
         REQUIRE(r.syncs[0].acc == r.syncs[1].acc);
         REQUIRE(r.retired == 3);
+    }
+}
+
+// ---------------------------------------------------- @section("activate") ---
+SECTION("activate") {
+    // A matmul-then-activate layer, byte-for-byte against the oracle, across every
+    // activation function and a spread of requantization scales. The arithmetic
+    // itself was pinned exhaustively in the quant section; what is under test here
+    // is that the machine feeds it the right accumulator and puts the result in the
+    // right place.
+    const uint32_t dim = 4, len = 4;
+
+    Config cfg = small_cfg(dim, 2);
+    cfg.ub_bytes = 1024;
+    cfg.dma_bytes_per_cycle = 4;
+    cfg.ddr_tile_latency = 3;
+
+    const Inputs in = random_inputs(6001, dim, len);
+
+    struct Scale {
+        i32      bias;
+        i32      multiplier;
+        uint32_t shift;
+    };
+    // Shift 0 saturates hard, large shifts crush everything toward zero, and the
+    // middle ones land on ties. A negative bias pushes values through the ReLU
+    // boundary rather than leaving every element on one side of it.
+    const std::vector<Scale> scales = {
+        {0, 1, 0}, {0, 1, 4}, {0, 1, 8}, {0, 3, 7}, {0, 127, 14},
+        {100, 1, 6}, {-100, 1, 6}, {0, 1, 31}, {2000000, 1000000, 20},
+    };
+    const std::vector<ActFn> fns = {ActFn::IDENTITY, ActFn::RELU, ActFn::RELU6};
+
+    int checked = 0;
+    for (const ActFn fn : fns) {
+        for (const Scale& s : scales) {
+            tpuasm::ActArgs a;
+            a.acc        = 0;
+            a.dst        = 512;
+            a.len        = len;
+            a.fn         = fn;
+            a.bias       = s.bias;
+            a.multiplier = s.multiplier;
+            a.shift      = s.shift;
+
+            tpuasm::Program p;
+            p.read_host(in.host_at, 0, len * dim)
+             .read_weights(0)
+             .matmul(0, len, 0)
+             .activate(a)
+             .write_host(512, 0x400, len * dim)
+             .halt();
+
+            const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+            REQUIRE_MSG(diff.empty(), diff);
+            ++checked;
+        }
+    }
+    REQUIRE(checked == static_cast<int>(fns.size() * scales.size()));
+
+    // The three functions do not all produce the same bytes, so the sweep above is
+    // actually discriminating between them.
+    {
+        auto run_with = [&](ActFn fn) {
+            Tpu t(cfg);
+            tpu_setup(in)(t);
+            tpuasm::Program p;
+            p.read_host(in.host_at, 0, len * dim)
+             .read_weights(0)
+             .matmul(0, len, 0)
+             .activate(0, 512, len, fn, 1, 6)
+             .halt();
+            REQUIRE(t.run(p.code()).halted);
+            std::vector<int> out;
+            for (uint32_t i = 0; i < len * dim; ++i) out.push_back(t.ub().at(512 + i));
+            return out;
+        };
+        const std::vector<int> ident = run_with(ActFn::IDENTITY);
+        const std::vector<int> relu  = run_with(ActFn::RELU);
+        const std::vector<int> relu6 = run_with(ActFn::RELU6);
+        REQUIRE(ident != relu);
+        REQUIRE(relu != relu6);
+
+        // ReLU never emits a negative, ReLU6 never exceeds 6, and identity did
+        // produce something out of both ranges or the comparison above was luck.
+        bool relu_nonneg = true, relu6_bounded = true, ident_negative = false;
+        for (std::size_t i = 0; i < ident.size(); ++i) {
+            if (relu[i] < 0) relu_nonneg = false;
+            if (relu6[i] < 0 || relu6[i] > 6) relu6_bounded = false;
+            if (ident[i] < 0) ident_negative = true;
+        }
+        REQUIRE(relu_nonneg);
+        REQUIRE(relu6_bounded);
+        REQUIRE(ident_negative);
+    }
+
+    // ---- the clamp boundaries, one requantized value at a time --------------
+    // Random matmul products land on small integers too rarely to pin down where
+    // each function turns over: a ReLU that clamped everything below 2 rather than
+    // below 0 passed the sweep above, because nothing in it ever requantized to
+    // exactly 1. So plant the accumulator directly and walk it across the interesting
+    // range, where multiplier 1 / shift 0 makes the requantized value the planted
+    // one and every boundary gets hit exactly.
+    {
+        Inputs planted;
+        planted.acc_at = 0;
+        planted.acc_vals.resize(static_cast<std::size_t>(dim) * dim);
+
+        // Enough windows to carry -8..8 plus the int8 limits past every clamp.
+        const std::vector<i32> corners = {
+            -129, -128, -127, -8, -7, -6, -3, -2, -1, 0, 1, 2, 3,
+            5, 6, 7, 8, 126, 127, 128, 1000, -1000,
+        };
+        for (std::size_t base = 0; base < corners.size(); base += dim * dim) {
+            for (std::size_t i = 0; i < planted.acc_vals.size(); ++i) {
+                planted.acc_vals[i] = corners[(base + i) % corners.size()];
+            }
+            for (const ActFn fn : fns) {
+                tpuasm::Program p;
+                p.activate(0, 512, len, fn, /*multiplier=*/1, /*shift=*/0)
+                 .write_host(512, 0x400, len * dim)
+                 .halt();
+                const std::string diff =
+                    diff_tpu(p.code(), cfg, ref_setup(planted), tpu_setup(planted));
+                REQUIRE_MSG(diff.empty(), diff);
+            }
+        }
+
+        // Spot-check the turnover points directly, so the sweep is anchored to
+        // stated values and not only to the oracle agreeing with itself.
+        for (std::size_t i = 0; i < planted.acc_vals.size(); ++i) {
+            planted.acc_vals[i] = static_cast<i32>(i) - 4;   // -4 .. dim*dim-5
+        }
+        auto emit = [&](ActFn fn) {
+            Tpu t(cfg);
+            tpu_setup(planted)(t);
+            tpuasm::Program p;
+            p.activate(0, 512, len, fn, 1, 0).halt();
+            REQUIRE(t.run(p.code()).halted);
+            std::vector<int> out;
+            for (uint32_t i = 0; i < len * dim; ++i) out.push_back(t.ub().at(512 + i));
+            return out;
+        };
+        const std::vector<int> id = emit(ActFn::IDENTITY);
+        const std::vector<int> rl = emit(ActFn::RELU);
+        const std::vector<int> r6 = emit(ActFn::RELU6);
+        for (std::size_t i = 0; i < id.size(); ++i) {
+            const int v = static_cast<int>(i) - 4;
+            REQUIRE(id[i] == v);
+            REQUIRE(rl[i] == (v < 0 ? 0 : v));
+            REQUIRE(r6[i] == (v < 0 ? 0 : (v > 6 ? 6 : v)));
+        }
+        // The three differ at 1 and at 7, which is exactly what the sweep missed.
+        REQUIRE(id[3] == -1 && rl[3] == 0);
+        REQUIRE(id[5] == 1 && rl[5] == 1 && r6[5] == 1);
+        REQUIRE(id[11] == 7 && r6[11] == 6);
+    }
+
+    // Activating a bank a K-tiled sequence built up, so the pipeline reads a sum
+    // rather than a single matmul's output.
+    {
+        const Inputs two = random_inputs(6002, dim, len, 2);
+        tpuasm::Program p;
+        p.read_host(two.host_at, 0, len * dim)
+         .read_weights(0).matmul(0, len, 0)
+         .read_weights(dim * dim).matmul(0, len, 0, /*accumulate=*/true)
+         .activate(0, 512, len, ActFn::RELU, 1, 5)
+         .write_host(512, 0x400, len * dim)
+         .halt();
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(two), tpu_setup(two));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+
+    // Fewer rows than the array: the pipeline must read `len` rows and leave the
+    // rest of the bank alone.
+    for (uint32_t rows = 1; rows <= dim; ++rows) {
+        tpuasm::Program p;
+        p.read_host(in.host_at, 0, len * dim)
+         .read_weights(0)
+         .matmul(0, len, 0)
+         .activate(0, 512, rows, ActFn::RELU, 1, 5)
+         .halt();
+        const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+        REQUIRE_MSG(diff.empty(), diff);
+    }
+}
+
+// -------------------------------------------------------- @section("pool") ---
+SECTION("pool") {
+    // Pooling on the requantized stream, against the oracle, over every window and
+    // stride that fits -- including the ones that do not divide the input evenly and
+    // so drop a ragged edge.
+    const uint32_t dim = 6;
+
+    Config cfg = small_cfg(dim, 2);
+    cfg.ub_bytes = 1024;
+    cfg.dma_bytes_per_cycle = 8;
+    cfg.ddr_tile_latency = 3;
+
+    const Inputs in = random_inputs(6100, dim, dim);
+
+    int shapes = 0, uneven = 0;
+    for (const Pool mode : {Pool::MAX, Pool::AVG}) {
+        for (uint32_t len = 1; len <= dim; ++len) {
+            for (uint32_t w = 1; w <= len; ++w) {
+                for (uint32_t s = 1; s <= 3; ++s) {
+                    if (w > dim) continue;
+
+                    tpuasm::ActArgs a;
+                    a.acc         = 0;
+                    a.dst         = 512;
+                    a.len         = len;
+                    a.fn          = ActFn::RELU;
+                    a.multiplier  = 1;
+                    a.shift       = 5;
+                    a.pool        = mode;
+                    a.pool_window = w;
+                    a.pool_stride = s;
+
+                    tpuasm::Program p;
+                    p.read_host(in.host_at, 0, dim * dim)
+                     .read_weights(0)
+                     .matmul(0, dim, 0)
+                     .activate(a)
+                     .halt();
+
+                    const std::string diff =
+                        diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
+                    REQUIRE_MSG(diff.empty(),
+                                "    mode " + std::string(mode == Pool::MAX ? "max" : "avg") +
+                                    " len " + std::to_string(len) + " window " +
+                                    std::to_string(w) + " stride " + std::to_string(s) + "\n" +
+                                    diff);
+                    ++shapes;
+                    if ((len - w) % s != 0 || (dim - w) % s != 0) ++uneven;
+                }
+            }
+        }
+    }
+    REQUIRE(shapes > 50);
+    REQUIRE(uneven > 0);        // the ragged-edge cases really were exercised
+
+    // Pooling changes the output, so the sweep is not comparing two identical
+    // things, and max is not the same as average.
+    {
+        auto run_pool = [&](Pool mode, uint32_t w, uint32_t s) {
+            Tpu t(cfg);
+            tpu_setup(in)(t);
+            tpuasm::ActArgs a;
+            a.acc = 0; a.dst = 512; a.len = dim;
+            a.fn = ActFn::IDENTITY; a.multiplier = 1; a.shift = 5;
+            a.pool = mode; a.pool_window = w; a.pool_stride = s;
+            tpuasm::Program p;
+            p.read_host(in.host_at, 0, dim * dim)
+             .read_weights(0).matmul(0, dim, 0).activate(a).halt();
+            REQUIRE(t.run(p.code()).halted);
+            const uint32_t rows = mode == Pool::NONE ? dim : (dim - w) / s + 1;
+            std::vector<int> out;
+            for (uint32_t i = 0; i < rows * rows; ++i) out.push_back(t.ub().at(512 + i));
+            return out;
+        };
+        const std::vector<int> mx = run_pool(Pool::MAX, 2, 2);
+        const std::vector<int> av = run_pool(Pool::AVG, 2, 2);
+        REQUIRE(mx.size() == 9);              // a 6x6 tile pooled 2x2 stride 2
+        REQUIRE(av.size() == 9);
+        REQUIRE(mx != av);
+        // A maximum is never below the average of the same window.
+        bool max_ge_avg = true;
+        for (std::size_t i = 0; i < mx.size(); ++i) {
+            if (mx[i] < av[i]) max_ge_avg = false;
+        }
+        REQUIRE(max_ge_avg);
+
+        // Overlapping windows produce more outputs than disjoint ones.
+        REQUIRE(run_pool(Pool::MAX, 2, 1).size() == 25);
+    }
+
+    // A window of 1 is a no-op reduction: the result is the unpooled tile.
+    {
+        Tpu pooled(cfg), plain(cfg);
+        tpu_setup(in)(pooled);
+        tpu_setup(in)(plain);
+
+        tpuasm::ActArgs a;
+        a.acc = 0; a.dst = 512; a.len = dim;
+        a.fn = ActFn::RELU; a.multiplier = 1; a.shift = 5;
+        a.pool = Pool::MAX; a.pool_window = 1; a.pool_stride = 1;
+
+        tpuasm::Program pp;
+        pp.read_host(in.host_at, 0, dim * dim).read_weights(0).matmul(0, dim, 0)
+          .activate(a).halt();
+        tpuasm::Program qq;
+        qq.read_host(in.host_at, 0, dim * dim).read_weights(0).matmul(0, dim, 0)
+          .activate(0, 512, dim, ActFn::RELU, 1, 5).halt();
+
+        REQUIRE(pooled.run(pp.code()).halted);
+        REQUIRE(plain.run(qq.code()).halted);
+        bool same = true;
+        for (uint32_t i = 0; i < dim * dim; ++i) {
+            if (pooled.ub().at(512 + i) != plain.ub().at(512 + i)) same = false;
+        }
+        REQUIRE(same);
+    }
+
+    // Malformed pooling traps, with the oracle's wording.
+    {
+        for (const auto& bad : std::vector<std::pair<uint32_t, uint32_t>>{{dim + 1, 1}, {0, 1}, {2, 0}}) {
+            tpuasm::ActArgs a;
+            a.acc = 0; a.dst = 512; a.len = dim;
+            a.fn = ActFn::RELU; a.multiplier = 1; a.shift = 0;
+            a.pool = Pool::MAX;
+            a.pool_window = bad.first;
+            a.pool_stride = bad.second;
+
+            tpuasm::Program p;
+            p.activate(a).halt();
+
+            ref::Machine m(cfg);
+            Tpu t(cfg);
+            const ref::Result rr = ref::run(m, p.code());
+            const TpuResult   tr = t.run(p.code());
+            REQUIRE(rr.trapped);
+            REQUIRE(tr.trapped);
+            REQUIRE(tr.trap_reason == rr.trap_reason);
+        }
+    }
+}
+
+// --------------------------------------------- @section("activate_timing") ---
+SECTION("activate_timing") {
+    const uint32_t dim = 4;
+
+    // ---- M + act_pipeline_depth, over several shapes and depths ------------
+    for (const uint32_t depth : {0u, 1u, 4u, 16u}) {
+        Config cfg = small_cfg(dim, 4);
+        cfg.ub_bytes = 1024;
+        cfg.act_pipeline_depth = depth;
+
+        for (uint32_t len = 1; len <= dim; ++len) {
+            Tpu t(cfg);
+            tpuasm::Program p;
+            p.activate(0, 512, len, ActFn::RELU, 1, 0).halt();
+            const TpuResult r = t.run(p.code());
+            REQUIRE(r.halted);
+
+            // The Activate issues at cycle 0 and occupies its unit for
+            // len*dim + depth cycles; Halt waits for it and spends one more.
+            const uint64_t expect = static_cast<uint64_t>(len) * dim + depth + 1;
+            REQUIRE_MSG(r.cycles == expect,
+                        "    depth " + std::to_string(depth) + " len " + std::to_string(len) +
+                            ": got " + std::to_string(r.cycles) + " want " +
+                            std::to_string(expect) + "\n");
+        }
+    }
+
+    // Pooling does not make an Activate cheaper: the cost is one cycle per
+    // accumulator element read, and every element is still read before the window
+    // reduction sees it.
+    {
+        Config cfg = small_cfg(dim, 4);
+        cfg.ub_bytes = 1024;
+        cfg.act_pipeline_depth = 4;
+
+        auto time_it = [&](Pool mode) {
+            Tpu t(cfg);
+            tpuasm::ActArgs a;
+            a.acc = 0; a.dst = 512; a.len = dim;
+            a.fn = ActFn::IDENTITY; a.multiplier = 1; a.shift = 0;
+            a.pool = mode; a.pool_window = 2; a.pool_stride = 2;
+            tpuasm::Program p;
+            p.activate(a).halt();
+            const TpuResult r = t.run(p.code());
+            REQUIRE(r.halted);
+            return r.cycles;
+        };
+        REQUIRE(time_it(Pool::NONE) == time_it(Pool::MAX));
+        REQUIRE(time_it(Pool::NONE) == dim * dim + 4 + 1);
+    }
+
+    // ---- an Activate overlaps a following MatMul on an independent bank -----
+    {
+        Config cfg = small_cfg(dim, 4);
+        cfg.ub_bytes = 2048;
+        cfg.dma_bytes_per_cycle = 16;
+        cfg.ddr_tile_latency = 2;
+        cfg.act_pipeline_depth = 8;
+        cfg.double_buffer = true;
+
+        const uint32_t len     = dim;
+        const uint64_t act_dur = static_cast<uint64_t>(len) * dim + cfg.act_pipeline_depth;
+        const uint64_t mm_dur  = len + 2ull * dim - 1ull;
+
+        // The premise of the comparison: the activation is the longer of the two, so
+        // an overlapping matmul has room to finish inside it.
+        REQUIRE(act_dur > mm_dur);
+
+        const Inputs in = random_inputs(6200, dim, len);
+
+        // Independent: the Activate drains bank 0 while the next matmul fills
+        // bank 1 from a different buffer region.
+        tpuasm::Program indep;
+        indep.read_weights(0)
+             .matmul(0, len, 0)
+             .activate(0, 512, len, ActFn::RELU, 1, 4)   // reads bank 0, writes [512,528)
+             .matmul(256, len, 1)                        // reads [256,272), writes bank 1
+             .halt();
+
+        // Serializing: the second matmul accumulates into the very bank the
+        // Activate is draining.
+        tpuasm::Program serial;
+        serial.read_weights(0)
+              .matmul(0, len, 0)
+              .activate(0, 512, len, ActFn::RELU, 1, 4)
+              .matmul(256, len, 0, /*accumulate=*/true)
+              .halt();
+
+        // The same program with the second matmul removed, as the baseline the
+        // overlapped run is measured against.
+        tpuasm::Program alone;
+        alone.read_weights(0)
+             .matmul(0, len, 0)
+             .activate(0, 512, len, ActFn::RELU, 1, 4)
+             .halt();
+
+        // Both matmuls read a buffer region, so seed the UB directly rather than
+        // spending DMA cycles that would blur the comparison.
+        // Both matmuls read a region, at 0 and at 256.
+        Inputs seeded = in;
+        seeded.ub_at = 0;
+        seeded.ub_bytes.assign(256 + len * dim, 0);
+        for (uint32_t i = 0; i < len * dim; ++i) {
+            seeded.ub_bytes[i]       = static_cast<i8>(in.host_bytes[i]);
+            seeded.ub_bytes[256 + i] = static_cast<i8>(in.host_bytes[i]);
+        }
+
+        auto run_prog = [&](const std::vector<RawInst>& code, Tpu& t) {
+            tpu_setup(seeded)(t);
+            const TpuResult r = t.run(code);
+            REQUIRE(r.halted);
+            return r;
+        };
+
+        Tpu ti(cfg), ts(cfg), ta(cfg);
+        const TpuResult ri = run_prog(indep.code(), ti);
+        const TpuResult rs = run_prog(serial.code(), ts);
+        const TpuResult ra = run_prog(alone.code(), ta);
+
+        // Overlapped, the extra matmul is free: it hides entirely inside the
+        // activation, and even the cycle it spends issuing was one the machine would
+        // have spent waiting at the Halt anyway.
+        REQUIRE_MSG(ri.cycles == ra.cycles,
+                    "    alone " + std::to_string(ra.cycles) + " indep " +
+                        std::to_string(ri.cycles) + " serial " + std::to_string(rs.cycles) +
+                        " mm_dur " + std::to_string(mm_dur) + "\n");
+
+        // Serialized, it cannot start until the activation retires, so it costs its
+        // whole duration on top.
+        REQUIRE(rs.cycles == ra.cycles + mm_dur);
+        REQUIRE(rs.cycles > ri.cycles);
+
+        // Both programs stall on the accumulator, because the Activate waits for the
+        // matmul feeding it either way -- but only the serializing one stalls twice.
+        REQUIRE(ti.stalls().accum_hazard > 0);
+        REQUIRE(ts.stalls().accum_hazard > ti.stalls().accum_hazard);
+
+        // And overlapping did not change either answer.
+        const std::string d1 = diff_tpu(indep.code(), cfg, ref_setup(seeded), tpu_setup(seeded));
+        REQUIRE_MSG(d1.empty(), d1);
+        const std::string d2 = diff_tpu(serial.code(), cfg, ref_setup(seeded), tpu_setup(seeded));
+        REQUIRE_MSG(d2.empty(), d2);
+    }
+
+    // An Activate whose output a following MatMul reads must serialize, since the
+    // buffer region is the dependence.
+    {
+        Config cfg = small_cfg(dim, 4);
+        cfg.ub_bytes = 2048;
+        cfg.act_pipeline_depth = 4;
+
+        tpuasm::Program p;
+        p.read_weights(0)
+         .matmul(0, dim, 0)
+         .activate(0, 256, dim, ActFn::RELU, 1, 4)   // writes [256, 272)
+         .matmul(256, dim, 1)                        // reads exactly that
+         .halt();
+
+        Tpu t(cfg);
+        const Inputs in = random_inputs(6201, dim, dim);
+        tpu_setup(in)(t);
+        REQUIRE(t.run(p.code()).halted);
+        REQUIRE(t.stalls().ub_raw > 0);
     }
 }
 

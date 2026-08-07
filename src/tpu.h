@@ -218,6 +218,10 @@ private:
     // occupies its unit.
     uint64_t execute(const Decoded& d, PendingWrite& pw);
 
+    // The activation pipeline: bias, requantize, activation function, optional
+    // pool. Reads the accumulator bank and stages the int8 tile it produces.
+    void stage_activate(const Decoded& d, PendingWrite& pw);
+
     // Commit the staged outputs.
     void finish(InFlight& f);
 

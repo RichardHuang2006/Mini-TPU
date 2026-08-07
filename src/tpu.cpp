@@ -274,8 +274,14 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
             return 0;
 
         case Op::ACTIVATE:
-            // Throughput-1 after fill: one element per cycle plus the pipeline
-            // depth. Phase 6 characterizes this properly.
+            // Throughput-1 after fill: one accumulator element per cycle, plus the
+            // pipeline depth to fill it.
+            //
+            // The count is over *input* elements, not output ones, so pooling does
+            // not make an Activate cheaper: every accumulator element still has to
+            // be read and requantized before the window reduction can see it. A
+            // model charging for outputs instead would make a 2x2 pool look four
+            // times faster than it is.
             return static_cast<uint64_t>(d.len) * cfg_.dim + cfg_.act_pipeline_depth;
 
         case Op::SYNC:
@@ -394,56 +400,9 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
             break;
         }
 
-        case Op::ACTIVATE: {
-            const ConstI32View bank = acc_.bank(d.acc_bank);
-
-            std::vector<i8> tile(static_cast<std::size_t>(d.len) * dim, 0);
-            for (uint32_t r = 0; r < d.len; ++r) {
-                for (uint32_t c = 0; c < dim; ++c) {
-                    const i8 q = quant::requantize_biased(bank.at(r, c), d.bias,
-                                                          d.multiplier, d.shift);
-                    i8 v = q;
-                    switch (d.act) {
-                        case ActFn::IDENTITY: break;
-                        case ActFn::RELU:     v = q < 0 ? i8{0} : q; break;
-                        case ActFn::RELU6:    v = q < 0 ? i8{0} : (q > 6 ? i8{6} : q); break;
-                    }
-                    tile[static_cast<std::size_t>(r) * dim + c] = v;
-                }
-            }
-
-            uint32_t rows = 0, cols = 0;
-            act_out_shape(d, dim, rows, cols);
-
-            pw.ub_at = d.ub_addr;
-            if (d.pool == Pool::NONE) {
-                pw.ub_data = std::move(tile);
-            } else {
-                const uint32_t w = d.pool_window;
-                const uint32_t s = d.pool_stride;
-                pw.ub_data.assign(static_cast<std::size_t>(rows) * cols, 0);
-                for (uint32_t orow = 0; orow < rows; ++orow) {
-                    for (uint32_t ocol = 0; ocol < cols; ++ocol) {
-                        int64_t sum  = 0;
-                        i8      best = tile[static_cast<std::size_t>(orow * s) * dim + ocol * s];
-                        for (uint32_t dr = 0; dr < w; ++dr) {
-                            for (uint32_t dc = 0; dc < w; ++dc) {
-                                const i8 v = tile[static_cast<std::size_t>(orow * s + dr) * dim +
-                                                  (ocol * s + dc)];
-                                sum += v;
-                                if (v > best) best = v;
-                            }
-                        }
-                        pw.ub_data[static_cast<std::size_t>(orow) * cols + ocol] =
-                            d.pool == Pool::MAX
-                              ? best
-                              : quant::saturate(
-                                    quant::round_div(sum, static_cast<int64_t>(w) * w));
-                    }
-                }
-            }
+        case Op::ACTIVATE:
+            stage_activate(d, pw);
             break;
-        }
 
         case Op::SYNC:
         case Op::NOP:
@@ -451,6 +410,66 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
             break;
     }
     return duration;
+}
+
+// Bias add, requantize, activation function, then an optional window reduction.
+// The pooling stage sees the requantized int8 stream rather than the int32
+// accumulators, so a pooled Activate and an unpooled one requantize identically
+// and only differ in what happens afterwards.
+void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
+    const uint32_t     dim  = cfg_.dim;
+    const ConstI32View bank = acc_.bank(d.acc_bank);
+
+    std::vector<i8> tile(static_cast<std::size_t>(d.len) * dim, 0);
+    for (uint32_t r = 0; r < d.len; ++r) {
+        for (uint32_t c = 0; c < dim; ++c) {
+            const i8 q =
+                quant::requantize_biased(bank.at(r, c), d.bias, d.multiplier, d.shift);
+            // Clamped in the output's own quantized units, so ReLU6's bound is the
+            // int8 value 6 and not 6.0 in some notional real scale.
+            i8 v = q;
+            switch (d.act) {
+                case ActFn::IDENTITY: break;
+                case ActFn::RELU:     v = q < 0 ? i8{0} : q; break;
+                case ActFn::RELU6:    v = q < 0 ? i8{0} : (q > 6 ? i8{6} : q); break;
+            }
+            tile[static_cast<std::size_t>(r) * dim + c] = v;
+        }
+    }
+
+    uint32_t rows = 0, cols = 0;
+    act_out_shape(d, dim, rows, cols);
+    pw.ub_at = d.ub_addr;
+
+    if (d.pool == Pool::NONE) {
+        pw.ub_data = std::move(tile);
+        return;
+    }
+
+    const uint32_t w = d.pool_window;
+    const uint32_t s = d.pool_stride;
+    pw.ub_data.assign(static_cast<std::size_t>(rows) * cols, 0);
+
+    for (uint32_t orow = 0; orow < rows; ++orow) {
+        for (uint32_t ocol = 0; ocol < cols; ++ocol) {
+            int64_t sum  = 0;
+            i8      best = tile[static_cast<std::size_t>(orow * s) * dim + ocol * s];
+            for (uint32_t dr = 0; dr < w; ++dr) {
+                for (uint32_t dc = 0; dc < w; ++dc) {
+                    const i8 v =
+                        tile[static_cast<std::size_t>(orow * s + dr) * dim + (ocol * s + dc)];
+                    sum += v;
+                    if (v > best) best = v;
+                }
+            }
+            // Average pooling rounds the way requantization does, through the same
+            // helper, so the two cannot drift apart on a tie.
+            pw.ub_data[static_cast<std::size_t>(orow) * cols + ocol] =
+                d.pool == Pool::MAX
+                  ? best
+                  : quant::saturate(quant::round_div(sum, static_cast<int64_t>(w) * w));
+        }
+    }
 }
 
 void Tpu::finish(InFlight& f) {
