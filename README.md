@@ -1,153 +1,102 @@
-<div align="center">
-
 # Mini-TPU
 
-**A from-scratch, cycle-accurate TPUv1-style int8 inference accelerator**
+A cycle-accurate C++17 simulator of a TPUv1-style int8 inference accelerator: a
+weight-stationary systolic array with an explicitly managed memory hierarchy and
+a CISC-style instruction sequencer that overlaps long-running matmul,
+activation, and DMA instructions. The datapath is integer-only — int8
+activations and weights, int32 accumulation, fixed-point requantization back to
+int8 — and every structural parameter (array size, buffer size and banking,
+FIFO depth, DMA bandwidth, latencies) is a runtime `Config` field.
 
-`C++17` · `Systolic array` · `Cycle-accurate`
+## Architecture
 
-</div>
+### Simulator (`src/`)
 
-Mini-TPU is a single-chip microarchitectural simulator of a weight-stationary systolic
-matrix unit with a unified on-chip buffer, int32 accumulator banks, a weight FIFO, host DMA,
-and a CISC instruction sequencer that overlaps long-running matmul, activation, and DMA
-instructions. It is the accelerator sibling of [Mini-CPU](../Mini-CPU) and shares its
-philosophy: an obviously-correct eager reference model is the oracle, and every cycle-accurate
-component is validated by differential testing against it.
+- `types.h` — fixed-width datapath types (`i8`, `i32`) and identifier aliases.
+- `config.h` — the machine configuration: one field per structural knob, read at
+  runtime so a configuration sweep needs no recompilation.
+- `tensor.h` — row-major 2-D views with an explicit stride, so a tile is a
+  window into a larger buffer rather than a copy.
+- `quant.h` — fixed-point requantization: multiply, arithmetic shift with
+  round-half-away-from-zero, saturating int8 clamp.
+- `pe.h` — one processing element: a stationary weight, an int8×int8→int32 MAC,
+  and registered pass-throughs for the activation (left to right) and the
+  partial sum (top to bottom). Two weight planes per PE support double
+  buffering.
+- `mxu.h` — the matrix unit: a `dim × dim` grid of PEs clocked one cycle at a
+  time, with activation skew, `2·dim − 1` fill/drain, plane switching, and
+  weight-load bubble accounting.
+- `unified_buffer.h` — the Unified Buffer: a banked, byte-addressable int8
+  scratchpad for activations and intermediate results.
+- `accumulators.h` — int32 accumulator banks; a MatMul either overwrites a bank
+  or accumulates in place, which is what K-tiling uses.
+- `weight_fifo.h` — the weight FIFO: tiles staged from weight memory (DDR)
+  arrive after a configurable refill latency, and the FIFO depth decides how
+  much of that latency can be hidden.
+- `dma.h` — the host DMA engine: byte ranges moved between host memory and the
+  Unified Buffer at a configurable bandwidth.
+- `isa.h` / `decoder.h` / `decoder.cpp` — the fixed-width instruction set
+  (Read/Write_Host_Memory, Read_Weights, MatMul, Activate, Sync, Nop, Halt) and
+  its decoder; an illegal opcode decodes to a trapping Halt.
+- `tpu.h` / `tpu.cpp` — the machine itself: the units above plus the sequencer.
+  In-order issue, one instruction per cycle, with a scoreboard interlock over
+  Unified Buffer regions, accumulator banks, and the resident weights; issued
+  instructions overlap across units, and a weight prefetcher keeps upcoming
+  tiles arriving from DDR. Also implements the activation pipeline (bias,
+  requantize, identity/ReLU/ReLU6, optional max/average pooling) and per-cycle
+  stall accounting.
+- `stats.h` — derived statistics for one run: utilization, effective TOPS,
+  roofline placement, per-instruction cycle counts, and a stall-cause breakdown
+  that attributes every idle array-cycle to exactly one cause.
+- `loader.h` — file formats: hex and raw binary program images, and the
+  self-describing MTPU tensor container.
+- `main.cpp` — the CLI driver: loads a program and its tensors, disassembles on
+  request, runs the timed model, and prints the statistics report.
 
----
+### Tests (`tests/`)
 
-## Features
+The suite (`test_main.cpp`, 34 sections) is differential at its core: the timed
+machine is checked against an eager reference model on output bytes,
+accumulator snapshots at every Sync, and the retired-instruction count, across
+workloads and configuration sweeps. Microarchitectural properties (overlap,
+interlocks, fill/drain timing, stall attribution) are asserted directly on top
+of that.
 
-- **Weight-stationary systolic array** — a configurable `dim × dim` grid of int8×int8→int32
-  MAC cells with activation skew, `2·dim − 1` fill/drain, and double-buffered weight planes.
-- **Integer-only datapath** — int8 activations and weights, int32 accumulation, fixed-point
-  requantization with round-half-away-from-zero and saturating int8 clamp.
-- **Explicitly-managed memory** — a banked Unified Buffer scratchpad, int32 accumulator banks
-  with accumulate-in-place K-tiling, a weight FIFO, and a fixed-bandwidth host DMA.
-- **CISC sequencer with overlap** — eight instructions, in-order issue, and an interlock
-  scoreboard that overlaps independent instructions across units without any speculation.
-- **Activation pipeline** — bias, requantize, identity / ReLU / ReLU6, and max / average
-  pooling.
-- **Fully configurable** — array size, buffer size and banking, FIFO depth, DMA bandwidth, and
-  latencies are all `Config` fields, swept by the test suite.
-- **Characterization that diagnoses** — utilization, effective TOPS, roofline placement, and a
-  stall-cause breakdown that exactly partitions every idle array-cycle, so starving a resource
-  shows up in that resource's bucket and nowhere else.
+- `ref.h` — the oracle: an eager tensor model with no array, no FIFO, and no
+  timing. Its arithmetic deliberately does not share code with the timed model,
+  except for requantization, where bit-exactness is a contract.
+- `tpuasm.h` — a header-only program builder, so tests read like short programs
+  instead of hand-computed byte offsets.
+- `workloads.h` — the tiler: lowers dense, conv, and MLP layer specs into
+  Mini-TPU programs, plus plain nested-loop golden functions that validate the
+  tiler itself, since the reference model and the timed model execute the same
+  generated program and cannot catch a bug in generating it.
 
----
+### Tools (`tools/`)
 
-## Quickstart
+- `gen_examples.cpp` — writes the bundled workloads to `examples/`, from the
+  same definitions the test suite verifies.
+- `report.cpp` — regenerates the performance tables (`make report`); the same
+  measurements are asserted by the test suite.
+- `mutate.sh` — mutation harness: breaks the model one edit at a time (rounding,
+  interlocks, skew, port contention, counters) and checks the suite notices.
+
+## Building and running
+
+Requires a C++17 compiler and make.
 
 ```bash
-make                       # build build/minitpu (-O2, warnings on)
-./build/minitpu --help     # list every configuration knob
-make test                  # regenerate examples/ and run the differential suite
-make debug                 # build + run the suite under ASan + UBSan
-make report                # regenerate the performance tables in DESIGN.md §9
+make            # build build/minitpu (release, -O2)
+make test       # regenerate examples/ and run the test suite
+make debug      # build and run the test suite under ASan + UBSan
+make examples   # write the bundled workloads to examples/
+make report     # print the performance tables
+make clean      # remove build/ and examples/
+make help       # list the targets
 ```
 
-Every bundled workload carries its own run command in a comment at the top of its
-`.hex` file, so running one takes no arguments of your own:
-
-```bash
-make examples
-eval $(grep '^# run:' examples/mlp_3layer.hex | sed 's|^# run: minitpu|./build/minitpu|')
-```
-
----
-
-## What you get
-
-The simulator reports where the cycles went, not just a result. Real output, from
-the command above:
-
-```text
-run:
-  array 16x16  UB 32768 B / 8 banks  acc 4  FIFO 4  DMA 16 B/cyc  double-buffered
-  4273 cycles, 123 instructions retired, 7680 DMA bytes
-  163840 useful MACs of 163840 performed  (15.0% of array-cycles offered)
-  utilization 15.0% overall, 34.0% while busy   effective 0.054 TOPS @ 700 MHz
-  arithmetic intensity 21.3 MAC/B  ridge 16.0  -> compute-bound
-  lost array-cycles:
-    array_fill_drain         1240   29.0%
-    weight_fifo_empty           0    0.0%
-    ub_bank_conflict            0    0.0%
-    accum_hazard                0    0.0%
-    dma_bound                 370    8.7%
-    activation               2022   47.3%
-    other                       1    0.0%
-    partial_tile_waste          0    0.0%  (inside busy cycles)
-  dominant cause: activation   (largest resource stall: activation)
-  per instruction:
-    Read_Host_Memory       18 x       288 cycles  (16.0 avg)
-    Read_Weights           40 x        40 cycles  (1.0 avg)
-    MatMul                 40 x      1880 cycles  (47.0 avg)
-    Activate               12 x      3120 cycles  (260.0 avg)
-    Write_Host_Memory      12 x       192 cycles  (16.0 avg)
-    Halt                    1 x         1 cycles  (1.0 avg)
-```
-
-The idle buckets **partition** idle time — every cycle the array stands still is
-charged to exactly one of them, and `busy + idle == cycles` is asserted for every
-workload on every configuration. That is what makes the breakdown a diagnosis
-rather than a decoration.
-
-And it diagnoses something real. An `Activate` costs 260 cycles here against a
-`MatMul`'s 47, because [§6.2](./DESIGN.md#62-activation-pipeline) specifies a
-throughput-1 pipeline emitting one element per cycle while the array produces
-`dim²` MACs per cycle: requantizing a tile is more expensive than computing it, at
-every array size, by a factor that grows linearly with `dim`. Read
-[§9.5](./DESIGN.md#95-what-the-numbers-say) for the other three findings, including
-why utilization is capped near ⅓ and why four of the six configuration knobs turn
-out not to matter.
-
----
-
-## Repo layout
-
-```text
-Mini-TPU/
-├── DESIGN.md        architecture and rationale
-├── PLAN.md          34-step build roadmap
-├── Makefile
-├── src/             simulator sources (array, memory, sequencer, activation, statistics)
-├── tests/           in-tree program builder, eager reference model, tiler, differential suite
-└── tools/           example generator, performance-table generator, mutation harness
-```
-
----
-
-## Documentation
-
-- [DESIGN.md](./DESIGN.md) — the architecture: goals, systolic array, memory subsystem, CISC
-  instruction set, activation pipeline, testing strategy, and performance characterization.
-- [PLAN.md](./PLAN.md) — the build roadmap: 34 steps across 9 phases, one source file and one
-  test section per step, built around the reference-model oracle.
-
----
-
-## Status
-
-All nine phases of [PLAN.md](./PLAN.md) are implemented. 34 test sections pass clean under
-ASan + UBSan; `make test` takes about 12 seconds and `make debug` about 50.
-
-Every workload runs on six configurations — 8×8 through 256×256, single-bank buffer,
-shallow FIFO, starved DMA — and each is checked against the eager reference model on the
-output tensor, the accumulator contents at every `Sync`, and the retired-instruction count.
-The tiler is checked separately against plain nested-loop golden implementations, since the
-reference model and the timed model execute the *same* generated program and so cannot catch
-a bug in generating it.
-
-`tools/mutate.sh` breaks the model 20 different ways — rounding modes, interlocks, skew,
-port contention, FIFO depth, every statistics counter — and asserts the suite catches each
-one. It currently does.
-
----
-
-## References
-
-- N. P. Jouppi et al., *In-Datacenter Performance Analysis of a Tensor Processing Unit*,
-  ISCA 2017 — the TPUv1 architecture this model is patterned on.
-- B. Jacob et al., *gemmlowp: a small self-contained low-precision GEMM library* — the
-  fixed-point requantization (multiplier + shift, round, saturate) reference.
+The CLI loads a program (`--prog` hex or `--prog-raw` binary) with optional
+MTPU tensors (`--weights`, `--acts`), and can disassemble (`--dump`), execute
+(`--run`), or trace (`--trace`) it; every machine knob has a flag. See
+`./build/minitpu --help` for the full list. Each generated example carries its
+own run command in a `# run:` comment at the top of its `.hex` file.

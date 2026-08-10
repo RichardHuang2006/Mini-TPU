@@ -38,7 +38,7 @@ public:
     i8  act_out() const { return act_; }
     i32 psum_out() const { return psum_; }
 
-    // Phase 1: multiply-accumulate into the pending half of the registers.
+    // Multiply-accumulate into the pending half of the registers.
     //
     // The accumulation is int32 because that is the width the hardware carries
     // down a column. One column of a dim-deep array sums dim products of
@@ -50,7 +50,7 @@ public:
         psum_next_ = psum_in + static_cast<i32>(act_in) * static_cast<i32>(w_[plane]);
     }
 
-    // Phase 2: latch what tick() computed.
+    // Latch what tick() computed.
     void commit() {
         act_  = act_next_;
         psum_ = psum_next_;

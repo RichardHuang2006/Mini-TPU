@@ -26,7 +26,7 @@ struct DmaRequest {
 //
 // The bytes are copied at start() while the *timing* is accounted separately. A
 // reader that peeked at the buffer mid-transfer would therefore see finished
-// data, which is only sound because the interlock added in Phase 5 stalls any
+// data, which is only sound because the scoreboard interlock stalls any
 // consumer until the DMA retires. Splitting the two this way keeps the data path
 // obviously correct and leaves the schedule as the only thing the timing model
 // has to get right.

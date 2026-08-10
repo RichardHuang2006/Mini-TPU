@@ -189,8 +189,7 @@ std::size_t first_diff(const std::vector<T>& a, const std::vector<T>& b) {
 }
 
 // Everything a run is compared on, lifted out of whichever model produced it so
-// one comparison serves both. Phase 2 pointed this at two reference runs; from
-// Phase 5 one side is the timed machine.
+// one comparison serves both the reference model and the timed machine.
 struct RunView {
     bool     halted    = false;
     bool     trapped   = false;
@@ -1830,7 +1829,7 @@ SECTION("mxu_double_buffer") {
     REQUIRE_MSG(db_r0 == nodb_r0, diff_vec("first matmul", db_r0, nodb_r0));
     REQUIRE_MSG(db_r1 == nodb_r1, diff_vec("second matmul", db_r1, nodb_r1));
 
-    // And both agree with the oracle, so the plane switch really did make the
+    // And both agree with the oracle, so switching planes really did make the
     // second tile resident instead of leaving the first one in place.
     {
         Config cfg = small_cfg(dim, 2);
@@ -2455,8 +2454,8 @@ SECTION("tpu_units") {
     // Tpu::matmul and load_weights_from_fifo each idle the array up to the
     // machine clock before using it, which the current API cannot actually
     // violate -- tick() keeps the two in step. The guards are there because
-    // Phase 5's sequencer will advance the clock while the array waits on a
-    // hazard, and this assertion is what will catch it if that stops holding.
+    // the sequencer advances the clock while the array waits on a hazard, and
+    // this assertion is what will catch it if that stops holding.
     {
         Tpu t(cfg);
         REQUIRE(t.mxu().cycle() == t.cycle());
@@ -2936,9 +2935,9 @@ SECTION("overlap") {
 
 // ---------------------------------------------- @section("weight_overlap") ---
 SECTION("weight_overlap") {
-    // Step 3.5's property, now through the full sequencer: the second tile's
-    // weight load hides under the first tile's matmul when there is a shadow
-    // plane, and is fully exposed when there is not.
+    // Through the full sequencer: the second tile's weight load hides under the
+    // first tile's matmul when there is a shadow plane, and is fully exposed
+    // when there is not.
     const uint32_t dim = 4, len = 4;
     const uint32_t latency = 6;
 
@@ -2990,7 +2989,7 @@ SECTION("weight_overlap") {
 
     // Without a shadow plane each load also costs dim exposed cycles shifting into
     // the array, and the second cannot start until the first matmul has finished
-    // with the plane it is about to overwrite.
+    // with the weight plane it is about to overwrite.
     REQUIRE_MSG(nodb.first == latency + 2 * dim + 2 * mm + 1,
                 "    single-plane:    " + std::to_string(nodb.first) + " cycles, want " +
                     std::to_string(latency + 2 * dim + 2 * mm + 1) + "\n");
@@ -3013,7 +3012,7 @@ SECTION("weight_overlap") {
         REQUIRE(t.run(p.code()).halted);
         REQUIRE(t.mxu().stats().plane_switches == 2);
         REQUIRE(t.mxu().stats().weight_load_bubble == 0);
-        // The wait is on DDR, not on the plane: with a shadow plane to load into,
+        // The wait is on DDR, not on the weight plane: with a shadow plane to load into,
         // nothing ever blocks on the resident tile itself.
         REQUIRE(t.stalls().weight_fifo_empty > 0);
         REQUIRE(t.stalls().weight_stall == 0);
@@ -3302,8 +3301,8 @@ SECTION("activate") {
     // each function turns over: a ReLU that clamped everything below 2 rather than
     // below 0 passed the sweep above, because nothing in it ever requantized to
     // exactly 1. So plant the accumulator directly and walk it across the interesting
-    // range, where multiplier 1 / shift 0 makes the requantized value the planted
-    // one and every boundary gets hit exactly.
+    // range, where multiplier 1 / shift 0 requantizes each planted value to
+    // itself and every boundary gets hit exactly.
     {
         Inputs planted;
         planted.acc_at = 0;
@@ -4760,8 +4759,8 @@ SECTION("stats") {
     }
 
     // ---- Unified Buffer port contention -----------------------------------
-    // A single-bank UB is a much weaker stress than the plan expected, and it is
-    // worth being precise about why rather than reporting a number that only looks
+    // A single-bank UB is a much weaker stress than it looks, and it is worth
+    // being precise about why rather than reporting a number that only looks
     // like a diagnosis.
     //
     // A bank carries one read and one write per cycle, so the bank count limits how
@@ -4851,8 +4850,8 @@ SECTION("stats") {
     }
 
     // ---- a DMA-bound run is dominated by its transfers ---------------------
-    // Where the plan's stronger claim does hold: starve the DMA far enough and
-    // data movement outweighs everything else, fill and drain included.
+    // Starve the DMA far enough and data movement outweighs everything else,
+    // fill and drain included.
     {
         for (const wl::Spec& spec : wl::specs()) {
             Config cfg = spec.cfg;
@@ -4947,8 +4946,8 @@ SECTION("properties") {
     }
 
     // ---- and that fixes a ceiling on utilization --------------------------
-    // §8.3 expected a full tile to reach >90% array utilization. It cannot, and the
-    // reason is worth stating precisely rather than quietly relaxing the bound.
+    // A full tile might be expected to reach >90% array utilization. It cannot,
+    // and the reason is worth stating precisely.
     //
     // Utilization is amortized over the stream: len cycles of work for
     // len + 2*dim - 1 cycles of occupancy. Long streams would amortize the fill
@@ -4959,7 +4958,7 @@ SECTION("properties") {
     //
     // This is the headline finding of the characterization: the array is not stalling,
     // it is draining. Deeper accumulator banks, not more bandwidth, are what would
-    // move it (§10).
+    // move it.
     for (const uint32_t dim : {8u, 32u}) {
         Config cfg = small_cfg(dim, 2);
         cfg.ub_bytes = 16 * dim * dim;
@@ -4990,8 +4989,8 @@ SECTION("properties") {
     }
 
     // ---- the activation pipeline is scalar, and that is what binds --------
-    // §6.2 specifies a throughput-1 pipeline emitting one requantized element per
-    // cycle, so an Activate over a full bank costs dim*dim + depth cycles while the
+    // The throughput-1 pipeline emits one requantized element per cycle, so an
+    // Activate over a full bank costs dim*dim + depth cycles while the
     // matmul that filled that bank cost only 3*dim - 1. The ratio grows linearly
     // with dim, so past a small array the machine spends most of its time
     // requantizing rather than multiplying -- which is exactly what the breakdown
@@ -4999,8 +4998,8 @@ SECTION("properties") {
     //
     // There is no crossover to find: dim*dim + depth exceeds 3*dim - 1 at every
     // array size, so the pipeline is always the more expensive half and the gap only
-    // widens. Pinning it here means a future dim-wide activation pipeline (§10) has
-    // to come and change this test on purpose.
+    // widens. Pinning it here means a future dim-wide activation pipeline has to
+    // come and change this test on purpose.
     double prev_ratio = 0.0;
     for (const uint32_t dim : {4u, 8u, 32u}) {
         Config cfg = small_cfg(dim, 2);
@@ -5134,8 +5133,8 @@ SECTION("properties") {
             }
         }
 
-        // Ties in both signs, explicitly, and both clamps -- the three things §4.4
-        // of the design calls out as bug magnets.
+        // Ties in both signs, explicitly, and both clamps -- the classic
+        // requantization bug magnets.
         REQUIRE(spec_requantize(5, 0, 1, 1) == 3);     //  2.5 -> 3
         REQUIRE(spec_requantize(-5, 0, 1, 1) == -3);   // -2.5 -> -3
         REQUIRE(spec_requantize(3, 0, 1, 1) == 2);     //  1.5 -> 2
@@ -5216,7 +5215,7 @@ SECTION("properties") {
 
 // ------------------------------------------------ @section("config_sweep") ---
 SECTION("config_sweep") {
-    // Every workload on all six configurations from §8.2.
+    // Every workload on all six reference configurations.
     //
     // The value of the sweep is that dataflow, skew, interlock and padding bugs are
     // configuration-dependent in a way arithmetic bugs are not: a skew that is off

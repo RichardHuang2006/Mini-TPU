@@ -700,8 +700,7 @@ inline Workload build(const Spec& s, const Config& cfg) {
 inline std::vector<Spec> specs() {
     std::vector<Spec> out;
 
-    // Dense, tiled four ways in each of M, N and K on a 32x32 array: the headline
-    // shape from the plan.
+    // Dense, tiled four ways in each of M, N and K on a 32x32 array.
     {
         Spec s;
         s.name = "matmul_128";

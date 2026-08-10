@@ -14,10 +14,7 @@ void Tpu::tick() {
 
     // Reverse pipeline order: writeback before compute before issue before fetch,
     // so a stage reads what its producer had at the end of the previous cycle
-    // rather than something produced earlier in this one. Only the time-based
-    // units have anything to do while the machine is driven by hand; Phase 5
-    // inserts the sequencer stages between them, and the order they go in is
-    // fixed here so that is a matter of filling in bodies.
+    // rather than something produced earlier in this one.
     dma_.tick(cycle_);       // writeback / DMA completion
     mxu_.idle_until(cycle_); // compute
     fifo_.tick(cycle_);      // weight staging
@@ -80,7 +77,7 @@ bool Tpu::matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate) {
     // The array writes straight into the bank, so the bank is locked for the
     // duration: a consumer that read it now would see a partial result. Driven by
     // hand the matmul completes within the call, so the lock is released
-    // immediately; in Phase 5 it is held until the matmul actually retires.
+    // immediately; under the sequencer it is held until the matmul retires.
     acc_.lock(bank);
     mxu_.idle_until(cycle_);
     const ConstI8View acts = ub_.view(ub_addr, len, cfg_.dim, cfg_.dim);
@@ -108,8 +105,9 @@ bool Tpu::matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate) {
 // instruction that could observe the difference is allowed to issue until this
 // one retires -- and it keeps the data path obviously correct, leaving the
 // schedule as the only thing the timing model has to get right. Read_Weights is
-// the one exception: its tile is popped from the FIFO and shifted into the plane
-// when it retires, since that is when the tile has actually arrived from DDR.
+// the one exception: its tile is popped from the FIFO and shifted into the
+// weight plane when it retires, since that is when the tile has actually
+// arrived from DDR.
 // ===========================================================================
 
 Unit Tpu::unit_of(Op op) {
@@ -390,7 +388,7 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
         case Op::READ_WEIGHTS:
             // The tile is already in the FIFO -- the prefetcher put it there, and
             // issue only proceeded because it had arrived. All that is left is the
-            // shift into the plane, which happens at retire.
+            // shift into the weight plane, which happens at retire.
             stalls_.weight_load_bubble += mxu_.load_bubble();
             break;
 

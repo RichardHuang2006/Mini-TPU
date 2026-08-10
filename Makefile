@@ -69,8 +69,8 @@ examples:
 	  echo "examples: skipped, no $(TOOLS_SRC)"; \
 	fi
 
-# The performance tables in DESIGN.md §9, regenerated from the model. Checked-in
-# numbers that cannot be reproduced are just decoration.
+# Performance tables regenerated from the model. Checked-in numbers that cannot
+# be reproduced are just decoration.
 $(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(REPORT_SRC) $(LIB_SRC) -o $@
 

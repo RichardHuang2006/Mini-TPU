@@ -1,4 +1,4 @@
-// Generates the performance tables in DESIGN.md §9.
+// Generates the performance tables for the reference workloads.
 //
 // The tables are checked in, so they need to be reproducible rather than
 // hand-entered: `make report` prints markdown that can be pasted back, and the same

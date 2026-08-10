@@ -72,8 +72,8 @@ struct InFlight {
     uint64_t     done_cycle  = 0;
 };
 
-// Why issue could not proceed, per cycle. This is the breakdown Phase 8 reports:
-// a slow program is slow for one of these reasons and the counters say which.
+// Why issue could not proceed, per cycle: a slow program is slow for one of
+// these reasons and the counters say which.
 struct StallStats {
     uint64_t ub_raw       = 0;   // reader waiting on the writer of its region
     uint64_t ub_war       = 0;   // writer waiting on a reader of its region
@@ -165,10 +165,9 @@ struct TpuOptions {
 // The machine: the MXU, the Unified Buffer, the accumulator banks, the weight
 // FIFO, the DMA engine, host and weight memory, and a program counter.
 //
-// In this phase the units are driven by hand, one call per operation, and tick()
-// only advances time. The sequencer that turns a decoded instruction stream into
-// these same calls arrives in Phase 5; keeping the units independently drivable
-// is what lets that be an addition rather than a rewrite.
+// The units are independently drivable, one call per operation, with tick()
+// advancing time; run() layers the sequencer on top, turning a decoded
+// instruction stream into these same calls.
 class Tpu {
 public:
     explicit Tpu(const Config& cfg, std::size_t host_bytes = 1u << 16,
@@ -207,8 +206,8 @@ public:
     }
 
     // ---- hand-driven operations ------------------------------------------
-    // Each is one decoded instruction's worth of work. Phase 5 calls these from
-    // the sequencer instead of from a test.
+    // Each is one decoded instruction's worth of work. The sequencer calls
+    // these; tests can also drive them directly.
 
     bool dma_to_ub(HostAddr host_addr, UbAddr ub_addr, uint32_t bytes);
     bool dma_to_host(UbAddr ub_addr, HostAddr host_addr, uint32_t bytes);
@@ -257,8 +256,8 @@ private:
     // Is there a free Unified Buffer port for this instruction's stream?
     //
     // A bank exposes one read and one write port per cycle, and an instruction
-    // touching the buffer holds the port of its direction for its whole duration
-    // (§4.1, §4.4). So the bank count is a budget on how many transfers in the
+    // touching the buffer holds the port of its direction for its whole duration.
+    // So the bank count is a budget on how many transfers in the
     // same direction can be in flight at once, and the model tracks streams rather
     // than the individual byte each one reaches in a given cycle: a row of a tile
     // spans every bank at these sizes, so a byte-exact check would forbid a matmul

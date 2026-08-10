@@ -58,8 +58,8 @@ inline const char* cause_name(Cause c) {
     return "?";
 }
 
-// Lost array-cycles by cause. The names are §9.4's, which describe the array's
-// point of view; a few cover more than one of the machine's issue-point counters:
+// Lost array-cycles by cause, named from the array's point of view; a few
+// cover more than one of the machine's issue-point counters:
 //
 //   weight_fifo_empty  every cycle the array had no tile to multiply by, whether
 //                      the sequencer was waiting on DDR latency, on FIFO space, or

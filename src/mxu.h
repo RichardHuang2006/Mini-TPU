@@ -205,7 +205,7 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
     t.row_valid.assign(len, 0);
 
     for (uint64_t s = 0; s < t.cycles; ++s) {
-        // Phase 1: every PE reads its neighbours as of the start of the cycle.
+        // First, every PE reads its neighbours as of the start of the cycle.
         for (uint32_t k = 0; k < dim; ++k) {
             // Row k is fed input row s - k. That skew is what makes all dim
             // products contributing to one output element meet the descending
@@ -222,7 +222,7 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
             }
         }
 
-        // Phase 2: latch the whole array at once.
+        // Then latch the whole array at once.
         for (Pe& p : pe_) p.commit();
 
         // De-skew the bottom edge. An activation reaching PE[k][c] has taken k
