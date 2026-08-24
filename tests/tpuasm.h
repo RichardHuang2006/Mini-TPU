@@ -3,9 +3,8 @@
 // Header-only builder for Mini-TPU programs, so the tests need no external
 // tooling to produce an instruction stream.
 //
-// Operands are named regions rather than bare byte offsets. That is the whole
-// point: a test should read like a short program, and nobody should be
-// hand-computing a Unified Buffer offset in an assertion.
+// Operands are named regions rather than bare byte offsets, so a test reads like a
+// short program instead of a hand-computed set of Unified Buffer offsets.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,8 +24,8 @@ struct Region {
     operator UbAddr() const { return addr; }
 };
 
-// Bump allocator over the Unified Buffer. A test asks for the regions it needs
-// and never computes an offset by hand.
+// Bump allocator over the Unified Buffer, so a test asks for the regions it needs
+// rather than computing offsets.
 class UbAlloc {
 public:
     explicit UbAlloc(UbAddr base = 0, uint32_t align = 4) : next_(base), align_(align) {}
@@ -51,8 +50,7 @@ private:
     uint32_t align_;
 };
 
-// Every operand of Activate, so the call site names what it means instead of
-// relying on the reader to count positions.
+// Every operand of Activate, named at the call site rather than positional.
 struct ActArgs {
     BankId   acc         = 0;
     UbAddr   dst         = 0;

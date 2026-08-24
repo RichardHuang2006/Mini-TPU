@@ -19,11 +19,11 @@
 //   partial sums travel down and leave the bottom edge. Column c therefore
 //   computes sum_k A[r][k] * W[k][c], turning input row r into output row r.
 //
-// A note on names: DESIGN calls each input vector an "activation column",
-// because it enters the array as a skewed vertical slice. In the row-major
-// layout ref.h fixes, that vector is a *row* of the len x dim activation block.
-// This file follows ref.h, so `len` counts rows and the fill/drain formula
-// N + 2*dim - 1 is written with N = len.
+// On naming: an input vector is sometimes called an "activation column" because
+// it enters the array as a skewed vertical slice. In the row-major layout ref.h
+// fixes, that vector is a row of the len x dim activation block. This file
+// follows ref.h, so `len` counts rows and the fill/drain formula N + 2*dim - 1
+// is written with N = len.
 
 // When each part of a matmul finished, in absolute array cycles.
 struct MxuTiming {
@@ -31,9 +31,9 @@ struct MxuTiming {
     uint64_t end    = 0;   // array free again at this cycle (exclusive)
     uint64_t cycles = 0;   // end - start, always len + 2*dim - 1
 
-    // The cycle each output row became complete, meaning its last element left
-    // the bottom edge. Results emerge skewed by column, so a row is not usable
-    // the moment its first element appears.
+    // The cycle each output row became complete, i.e. its last element left the
+    // bottom edge. Results emerge skewed by column, so a row is not usable when
+    // its first element appears.
     std::vector<uint64_t> row_valid;
 };
 
@@ -52,9 +52,9 @@ struct MxuStats {
     // complete output row is emerging.
     uint64_t fill_drain_cycles = 0;
 
-    // MAC slots inside the real tile, versus slots spent multiplying by the zero
-    // padding of an undersized one. Splitting them is what makes a badly tiled
-    // workload visible instead of merely slow.
+    // MAC slots inside the real tile, versus slots spent multiplying the zero
+    // padding of an undersized one. Splitting them makes a badly tiled workload
+    // visible rather than merely slow.
     uint64_t useful_macs        = 0;
     uint64_t partial_tile_waste = 0;
 };
@@ -80,18 +80,18 @@ public:
 
     // Cycles the array must stand idle for a weight load. With double buffering
     // the weights shift into the shadow plane while the active plane keeps
-    // multiplying, so the load is free; without it the array waits dim cycles
-    // for the weights to arrive. Whether the *first* load of a program is truly
-    // free is a question about what it could overlap with, which only the
-    // sequencer can answer; the array applies one uniform rule.
+    // multiplying, so the load is free; without it the array waits dim cycles.
+    // Whether a program's first load is genuinely free depends on what it could
+    // overlap with, which only the sequencer knows; the array applies one
+    // uniform rule.
     uint32_t load_bubble() const { return cfg_.double_buffer ? 0u : cfg_.dim; }
 
     i8 weight_at(uint32_t k, uint32_t c, uint32_t plane) const {
         return pe(k, c).weight(plane);
     }
 
-    // The real shape of the tile resident in a plane, which is what separates
-    // useful MACs from padding.
+    // The real shape of the tile resident in a plane, which separates useful
+    // MACs from padding.
     uint32_t plane_rows(uint32_t plane) const { return rows_[plane]; }
     uint32_t plane_cols(uint32_t plane) const { return cols_[plane]; }
 
@@ -107,14 +107,12 @@ public:
 
     // Load a weight tile without touching the clock.
     //
-    // The sequencer uses this one: a Read_Weights has to pay the DDR latency as
-    // well as the load, so it folds both into the instruction's duration and lets
-    // the array charge neither. Having the array also charge its own bubble would
-    // count it twice.
+    // The sequencer uses this one: a Read_Weights pays both the DDR latency and
+    // the load, so it folds both into the instruction's duration and lets the
+    // array charge neither. Charging the array's own bubble would count it twice.
     //
-    // A tile smaller than the array is zero-padded, which is what makes an
-    // undersized matmul produce the right answer rather than a plausible one: the
-    // padded MACs contribute exactly zero.
+    // A tile smaller than the array is zero-padded, so the padded MACs contribute
+    // exactly zero and an undersized matmul still produces the right answer.
     void load_weights_untimed(const ConstI8View& w) {
         assert(w.rows() <= cfg_.dim && w.cols() <= cfg_.dim);
         const uint32_t plane = load_plane();
@@ -141,10 +139,10 @@ public:
         for (Pe& p : pe_) p.clear_pipeline();
     }
 
-    // Idle the array forward, for when the machine's clock has moved on without
-    // it -- waiting on a DMA, say, or on a weight tile that has not arrived.
-    // Those cycles are counted, so time the array spent with nothing to do shows
-    // up as lost utilization instead of vanishing. Never moves time backwards.
+    // Idle the array forward when the machine's clock has moved on without it,
+    // e.g. while waiting on a DMA or on a weight tile that has not arrived. Those
+    // cycles are counted, so idle array time shows up as lost utilization rather
+    // than vanishing. Never moves time backwards.
     void idle_until(uint64_t when) {
         if (when > cycle_) {
             cycle_        = when;
@@ -152,9 +150,8 @@ public:
         }
     }
 
-    // Fraction of MAC slots that did useful work, counting every cycle the array
-    // was occupied, fill and drain included. This is the number that makes the
-    // case for streaming many rows through one weight load.
+    // Fraction of MAC slots that did useful work, over every cycle the array was
+    // occupied, fill and drain included.
     double utilization() const {
         const double slots = static_cast<double>(cfg_.dim) * cfg_.dim * stats_.cycles;
         return slots == 0.0 ? 0.0 : static_cast<double>(stats_.useful_macs) / slots;
@@ -187,9 +184,9 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
     assert(acts.cols() == dim);
     assert(out.cols() == dim && out.rows() >= len);
 
-    // A shadow load becomes active here, instantaneously. That is the entire
-    // benefit of the second plane: the switch costs nothing, so the dim cycles
-    // of weight shifting happened while the previous matmul was still running.
+    // A shadow load becomes active here, instantaneously. That is the benefit of
+    // the second plane: the switch costs nothing, because the dim cycles of
+    // weight shifting happened while the previous matmul was still running.
     if (pending_) {
         active_  = 1u - active_;
         pending_ = false;
@@ -207,9 +204,9 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
     for (uint64_t s = 0; s < t.cycles; ++s) {
         // First, every PE reads its neighbours as of the start of the cycle.
         for (uint32_t k = 0; k < dim; ++k) {
-            // Row k is fed input row s - k. That skew is what makes all dim
-            // products contributing to one output element meet the descending
-            // partial sum in the right PE on the right cycle.
+            // Row k is fed input row s - k. That skew makes all dim products
+            // contributing to one output element meet the descending partial sum
+            // in the right PE on the right cycle.
             i8 left = 0;
             if (s >= k) {
                 const uint64_t r = s - k;
@@ -227,10 +224,9 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
 
         // De-skew the bottom edge. An activation reaching PE[k][c] has taken k
         // hops down and c hops right, so what column c presents after this cycle
-        // belongs to input row s + 1 - dim - c. Anything outside [0, len) is
-        // fill, drain, or a leftover from the previous matmul still draining
-        // out, and is dropped -- which is also why matmul does not need to clear
-        // the pipeline first.
+        // belongs to input row s + 1 - dim - c. Anything outside [0, len) is fill,
+        // drain, or a leftover from the previous matmul still draining, and is
+        // dropped; that is why matmul need not clear the pipeline first.
         for (uint32_t c = 0; c < dim; ++c) {
             const int64_t r = static_cast<int64_t>(s) + 1 - dim - c;
             if (r < 0 || r >= static_cast<int64_t>(len)) continue;

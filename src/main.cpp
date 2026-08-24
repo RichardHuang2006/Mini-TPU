@@ -5,8 +5,8 @@
 // file-static, so including it twice does not violate ODR.
 //
 // The driver loads a program and its tensors, checks them, disassembles on
-// request, and runs them on the timed model, reporting utilization, effective
-// TOPS, the stall-cause breakdown and where the run lands on the roofline.
+// request, and runs them on the timed model, reporting utilization, effective TOPS,
+// the stall-cause breakdown and the run's roofline placement.
 
 #include <algorithm>
 #include <cstddef>
@@ -41,8 +41,8 @@ struct CliOpts {
     bool show_help = false;
 
     // MACs the workload actually needs, padding excluded. Only the tiler knows it,
-    // so utilization is reported against the array's own MAC count unless it is
-    // given here.
+    // so utilization is reported against the array's own MAC count unless given
+    // here.
     uint32_t macs = 0;
 
     Config cfg;
@@ -179,8 +179,8 @@ inline void print_help() {
 // Reporting
 // ============================================================================
 
-// One line per instruction, operands named rather than positional so a listing
-// can be read without the encoding table to hand.
+// One line per instruction, operands named rather than positional so a listing can
+// be read without the encoding table.
 inline std::string disasm(const Decoded& d) {
     char buf[192];
     switch (d.op) {
@@ -235,10 +235,10 @@ inline void print_program(const std::vector<RawInst>& prog) {
     }
 }
 
-// How much host and weight memory the program actually reaches. Taking it from
-// the instruction stream rather than from a flag means a bundled example runs with
-// no sizing arguments at all, and a program that addresses past the end still
-// traps at the instruction that does it rather than being quietly given room.
+// How much host and weight memory the program actually reaches. Taking it from the
+// instruction stream rather than a flag lets a bundled example run with no sizing
+// arguments, and a program addressing past the end still traps at the instruction
+// that does so rather than being quietly given room.
 struct MemNeed {
     std::size_t host   = 0;
     std::size_t weight = 0;
@@ -278,8 +278,8 @@ inline int run_program(const CliOpts& opts, const std::vector<RawInst>& prog,
 
     Tpu t(opts.cfg, host_bytes, weight_bytes);
 
-    // Activations start at host address 0 and weights at DDR address 0, which is
-    // where the tiler places them by default.
+    // Activations start at host address 0 and weights at DDR address 0, where the
+    // tiler places them by default.
     for (std::size_t i = 0; i < acts.count() && i < host_bytes; ++i) {
         t.host()[i] = static_cast<uint8_t>(acts.wide ? static_cast<i8>(acts.i32v[i])
                                                     : acts.i8v[i]);
@@ -318,8 +318,8 @@ inline int run_program(const CliOpts& opts, const std::vector<RawInst>& prog,
 
 inline void print_tensor(const char* label, const TensorBlob& t) {
     std::printf("%s: %ux%u %s\n", label, t.rows, t.cols, t.wide ? "int32" : "int8");
-    // A handful of leading elements is enough to tell "loaded the right file"
-    // from "loaded the right shape of the wrong file".
+    // A few leading elements distinguish the right file from the right shape of
+    // the wrong file.
     const std::size_t show = t.count() < 8 ? t.count() : 8;
     if (show == 0) return;
     std::printf("  head:");

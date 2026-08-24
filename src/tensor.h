@@ -9,9 +9,9 @@
 #include "types.h"
 
 // Row-major 2-D views over storage somebody else owns. The row pitch is an
-// explicit `stride` rather than being implied by `cols`, which is what lets a
-// tile be a window into a larger buffer instead of a copy: the Unified Buffer
-// hands the array a dim x dim rectangle out of a much wider activation matrix.
+// explicit `stride` rather than implied by `cols`, which lets a tile be a window
+// into a larger buffer instead of a copy: the Unified Buffer hands the array a
+// dim x dim rectangle out of a much wider activation matrix.
 
 template <typename T>
 class TensorView {
@@ -46,8 +46,8 @@ public:
         return data_[static_cast<std::size_t>(r) * stride_ + c];
     }
 
-    // A window sharing the parent's storage. The stride is inherited, which is
-    // the whole point: a sub-tile addresses the same memory the parent does.
+    // A window sharing the parent's storage. The stride is inherited, so a
+    // sub-tile addresses the same memory the parent does.
     TensorView tile(uint32_t r0, uint32_t c0, uint32_t rows, uint32_t cols) const {
         assert(r0 + rows <= rows_ && c0 + cols <= cols_);
         return TensorView(&data_[static_cast<std::size_t>(r0) * stride_ + c0],
@@ -61,8 +61,8 @@ public:
     }
 
     // Copy `src` into the top-left corner and zero the remainder. A matmul
-    // dimension smaller than the array is padded this way: the result is
-    // correct, and the padded MAC-cycles are simply wasted work.
+    // dimension smaller than the array is padded this way: the result is correct
+    // and the padded MAC-cycles are wasted work.
     template <typename U>
     void zero_pad_from(const TensorView<U>& src) const {
         assert(src.rows() <= rows_ && src.cols() <= cols_);
@@ -105,9 +105,9 @@ bool same_values(const TensorView<A>& a, const TensorView<B>& b) {
     return true;
 }
 
-// Owning, contiguous backing store for a view. Tensors are only used at the
-// edges of the model (test inputs, host memory images); the simulator itself
-// passes views around.
+// Owning, contiguous backing store for a view. Tensors appear only at the edges
+// of the model (test inputs, host memory images); the simulator itself passes
+// views around.
 template <typename T>
 class Tensor {
 public:

@@ -46,11 +46,10 @@ struct Reservation {
 // concurrency model. SEQ covers the instructions with no unit of their own.
 enum class Unit : uint8_t { DMA, WEIGHT, MXU, ACT, SEQ, COUNT };
 
-// An instruction reads its inputs when it issues and commits its outputs when it
-// retires. The gap is what makes the scoreboard load-bearing for data and not
-// only for the schedule: a consumer allowed to issue too early reads the state
-// its producer has not replaced yet, so a missing interlock is a wrong answer
-// rather than merely a wrong cycle count.
+// An instruction reads its inputs at issue and commits its outputs at retire.
+// The gap makes the scoreboard matter for data as well as for the schedule: a
+// consumer allowed to issue too early reads state its producer has not replaced
+// yet, so a missing interlock is a wrong answer, not just a wrong cycle count.
 struct PendingWrite {
     UbAddr          ub_at = 0;
     std::vector<i8> ub_data;
@@ -72,7 +71,7 @@ struct InFlight {
     uint64_t     done_cycle  = 0;
 };
 
-// Why issue could not proceed, per cycle: a slow program is slow for one of
+// Why issue could not proceed, per cycle. A slow program is slow for one of
 // these reasons and the counters say which.
 struct StallStats {
     uint64_t ub_raw       = 0;   // reader waiting on the writer of its region
@@ -97,23 +96,21 @@ struct StallStats {
     }
 };
 
-// What the array was doing, cycle by cycle, and why it was not doing anything
-// better. src/stats.h turns this into utilization, TOPS and a stall-cause
-// breakdown; keeping the raw tallies here and the arithmetic there means the
-// machine never has to know how a number will be presented.
+// Raw per-cycle tallies of what the array was doing and what it was waiting on.
+// src/stats.h derives utilization, TOPS and the stall-cause breakdown from these,
+// so the machine never has to know how a number will be presented.
 //
 // The idle buckets partition `cycles - array_busy` exactly: every cycle the array
-// stands still bumps precisely one of them. That is the property that makes the
-// breakdown a diagnosis instead of a decoration -- if the buckets did not add up,
-// a dominant cause would be an artefact of what got double counted.
+// stands still bumps precisely one of them. Without that, a dominant cause would
+// only reflect what got double counted.
 struct RunProfile {
     uint64_t array_busy    = 0;   // cycles the MXU had a matmul in flight
     uint64_t stream_cycles = 0;   // of those, cycles spent streaming rows
     uint64_t matmuls       = 0;
 
     // MACs the array actually performed, padding included: one per PE per
-    // streaming cycle. The useful subset is a property of the workload, not of
-    // the machine, so the caller supplies it.
+    // streaming cycle. The useful subset is a property of the workload rather
+    // than of the machine, so the caller supplies it.
     uint64_t macs_performed = 0;
 
     uint64_t dma_bytes = 0;
@@ -166,8 +163,8 @@ struct TpuOptions {
 // FIFO, the DMA engine, host and weight memory, and a program counter.
 //
 // The units are independently drivable, one call per operation, with tick()
-// advancing time; run() layers the sequencer on top, turning a decoded
-// instruction stream into these same calls.
+// advancing time. run() layers the sequencer on top, turning a decoded
+// instruction stream into those same calls.
 class Tpu {
 public:
     explicit Tpu(const Config& cfg, std::size_t host_bytes = 1u << 16,
@@ -237,9 +234,9 @@ public:
 
 private:
     // What the instruction touches, plus whether its operands are in range. A
-    // false return fills `why` with the same text the oracle uses, because a trap
-    // reason is a contract between the two models rather than an independent
-    // guess -- the same exception made for requantization.
+    // false return fills `why` with the same text the oracle uses: a trap reason
+    // is a contract between the two models rather than an independent guess, the
+    // same exception made for requantization.
     bool validate(const Decoded& d, Reservation& res, std::string& why) const;
 
     // Cycles the instruction occupies its unit.
@@ -256,13 +253,13 @@ private:
     // Is there a free Unified Buffer port for this instruction's stream?
     //
     // A bank exposes one read and one write port per cycle, and an instruction
-    // touching the buffer holds the port of its direction for its whole duration.
-    // So the bank count is a budget on how many transfers in the
-    // same direction can be in flight at once, and the model tracks streams rather
-    // than the individual byte each one reaches in a given cycle: a row of a tile
-    // spans every bank at these sizes, so a byte-exact check would forbid a matmul
-    // and a DMA from ever overlapping. bank_of() remains the byte-exact primitive
-    // for the single-cycle multi-address case.
+    // touching the buffer holds the port of its direction for its whole duration,
+    // so the bank count budgets how many same-direction transfers can be in flight
+    // at once. The model tracks streams rather than the individual byte each one
+    // reaches in a given cycle: a tile row spans every bank at these sizes, so a
+    // byte-exact check would forbid a matmul and a DMA from ever overlapping.
+    // bank_of() remains the byte-exact primitive for the single-cycle
+    // multi-address case.
     bool ub_port_available(const Reservation& r);
 
     // Read the instruction's inputs and stage its outputs, returning how long it
@@ -280,8 +277,8 @@ private:
     void retire_completed(TpuResult& st);
     void reset_pipeline();
 
-    // Read ahead for upcoming Read_Weights and keep their tiles arriving from DDR,
-    // so the FIFO depth decides how much of the latency is hidden.
+    // Read ahead for upcoming Read_Weights and keep their tiles arriving from DDR;
+    // the FIFO depth then decides how much of the latency is hidden.
     void prefetch_weights(const std::vector<RawInst>& prog);
 
     // Charge one array-idle cycle to a cause, given the stall counters as they

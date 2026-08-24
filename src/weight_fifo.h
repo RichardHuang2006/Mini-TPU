@@ -23,10 +23,9 @@ struct WeightTile {
 
 // A bounded FIFO of weight tiles with a background refill.
 //
-// The refill latency is what makes the FIFO worth having: a tile takes
-// ddr_tile_latency cycles to arrive from DDR, so a program that stages tiles
-// ahead of the matmuls that need them hides that latency, and one that asks for a
-// tile at the moment it needs it eats the whole thing. Popping an empty FIFO is
+// A tile takes ddr_tile_latency cycles to arrive from DDR, so a program that
+// stages tiles ahead of the matmuls needing them hides that latency, while one
+// requesting a tile at the point of use pays it in full. Popping an empty FIFO is
 // the weight_fifo_empty stall.
 class WeightFifo {
 public:
@@ -47,8 +46,8 @@ public:
     const Stats& stats() const { return stats_; }
 
     // Slots held, whether the tile has arrived or is still in flight. A refill
-    // occupies its slot from the moment it is requested, which is what makes a
-    // 1-deep FIFO serialize back-to-back loads.
+    // occupies its slot from the moment it is requested, so a 1-deep FIFO
+    // serializes back-to-back loads.
     std::size_t occupancy() const { return q_.size(); }
     bool full() const { return q_.size() >= depth_; }
 
@@ -91,8 +90,8 @@ public:
         return true;
     }
 
-    // When the oldest in-flight tile arrives, so a caller can decide how long to
-    // wait rather than polling blindly.
+    // When the oldest in-flight tile arrives, so a caller can size its wait
+    // instead of polling.
     uint64_t next_ready_cycle() const {
         return q_.empty() ? now_ : q_.front().ready_cycle;
     }

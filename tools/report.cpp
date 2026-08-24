@@ -1,10 +1,10 @@
 // Generates the performance tables for the reference workloads.
 //
-// The tables are checked in, so they need to be reproducible rather than
-// hand-entered: `make report` prints markdown that can be pasted back, and the same
-// measurements are asserted by the test suite's "stats", "config_sweep" and
-// "properties" sections. If a change to the model moves a number here, the tests
-// that pin the reasons for it move too.
+// The tables are checked in and so must be reproducible rather than hand-entered:
+// `make report` prints markdown that can be pasted back, and the same measurements
+// are asserted by the test suite's "stats", "config_sweep" and "properties"
+// sections. A model change that moves a number here also moves the tests pinning
+// the reasons for it.
 
 #include <cstdio>
 #include <string>

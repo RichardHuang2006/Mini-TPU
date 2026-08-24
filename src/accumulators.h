@@ -11,17 +11,16 @@
 
 // int32 accumulator banks, addressed [bank][row][col].
 //
-// A MatMul either overwrites a bank or accumulates in place into it, and the
-// second mode is how the K dimension is tiled: successive MatMuls over slices of
-// K add into the same bank, and one Activate reads the finished sum out. The
-// bank, not the array, is what makes K-tiling possible -- the array only ever
-// sees dim of the K dimension at a time.
+// A MatMul either overwrites a bank or accumulates in place into it. The second
+// mode is how the K dimension is tiled: successive MatMuls over slices of K add
+// into the same bank and one Activate reads the finished sum out. The bank, not
+// the array, is what makes K-tiling possible, since the array only ever sees dim
+// of K at a time.
 //
-// Locking has a deliberate asymmetry. bank() hands out an unchecked view for
-// whoever owns the bank (the in-flight matmul writing into it), while read(),
-// write() and accumulate() are the consumer-facing entry points that refuse a
-// locked bank and count a hazard. Without that split, the matmul holding the lock
-// would be blocked by its own lock.
+// Locking is deliberately asymmetric. bank() hands out an unchecked view for the
+// owner of the bank (the in-flight matmul writing into it), while read(), write()
+// and accumulate() are the consumer-facing entry points that refuse a locked bank
+// and count a hazard. Without the split, a matmul would block on its own lock.
 class Accumulators {
 public:
     struct Stats {
@@ -76,8 +75,8 @@ public:
         bank(b).fill(0);
     }
 
-    // Checked entry points. Each returns false when the access cannot proceed --
-    // an invalid bank, or a locked one, in which case the caller stalls.
+    // Checked entry points. Each returns false when the access cannot proceed: an
+    // invalid bank, or a locked one, in which case the caller stalls.
     bool read(BankId b, const I32View& dst) const {
         if (!valid(b) || locked(b)) {
             if (valid(b)) ++stats_.hazards;

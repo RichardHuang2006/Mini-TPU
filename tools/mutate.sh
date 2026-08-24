@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Mutation harness: break the model on purpose, one edit at a time, and check the
-# test suite notices. A mutation that survives is a gap in the tests, not a
-# success.
+# Mutation harness: break the model on purpose, one edit at a time, and check that
+# the test suite notices. A surviving mutation is a gap in the tests.
 #
 #   tools/mutate.sh          run every mutation
 #
@@ -120,8 +119,8 @@ mutate "read and write ports share one budget" src/tpu.cpp \
 
 # --- the weight prefetcher ----------------------------------------------------
 # Mutating the prefetch loop's own `!fifo_.full()` guard would be an equivalent
-# mutant -- push_refill() rejects a full FIFO anyway and the loop breaks on that -- so
-# the depth is taken away at its source instead.
+# mutant, since push_refill() rejects a full FIFO anyway and the loop breaks on that,
+# so the depth is removed at its source instead.
 mutate "the FIFO ignores its own depth" src/weight_fifo.h \
     'bool full() const { return q_.size() >= depth_; }' \
     'bool full() const { return false; }'

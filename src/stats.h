@@ -12,22 +12,19 @@
 
 // Derived statistics for one run: utilization, effective TOPS, per-instruction
 // cycle counts, and a stall-cause breakdown attributing every idle array-cycle to
-// something.
+// exactly one cause.
 //
 // The machine collects tallies (RunProfile); everything here is arithmetic over
-// them. The split matters because the breakdown has a job to do -- naming the
-// bottleneck of a starved configuration -- and that job is easier to get wrong in
-// the accounting than in the measurement.
-//
-// Two properties keep it honest, both asserted by the test suite:
+// them. Two properties, both asserted by the test suite, keep the breakdown usable
+// for naming the bottleneck of a starved configuration:
 //
 //   * the idle buckets partition idle time exactly, so no cause can dominate by
 //     being counted twice, and
 //   * streaming plus fill/drain equals the time the array was busy.
 //
-// `partial_tile_waste` is deliberately outside that partition. It is waste inside
-// cycles the array *was* busy -- PEs multiplying padding -- so adding it to the
-// idle buckets would double count. It is reported alongside them, not among them.
+// `partial_tile_waste` sits outside that partition. It is waste inside cycles the
+// array was busy (PEs multiplying padding), so adding it to the idle buckets would
+// double count. It is reported alongside them, not among them.
 
 namespace stats {
 
@@ -110,8 +107,7 @@ struct Stats {
     uint64_t peak_macs() const { return cfg.peak_macs_per_cycle(); }
 
     // Useful MACs as a fraction of what the array could have done in the same
-    // wall-clock cycles. This is the number that should hurt: it counts padding,
-    // fill, drain and every stall against you.
+    // wall-clock cycles. Padding, fill, drain and every stall count against it.
     double utilization() const {
         const uint64_t offered = cycles * peak_macs();
         if (offered == 0) return 0.0;
@@ -142,7 +138,7 @@ struct Stats {
         return static_cast<double>(macs_useful) / static_cast<double>(dma_bytes);
     }
 
-    // MACs per byte at which the array and the DMA are exactly balanced. Below it a
+    // MACs per byte at which the array and the DMA are balanced. Below it a
     // workload is memory-bound and a larger array buys nothing.
     double ridge_point() const {
         if (cfg.dma_bytes_per_cycle == 0) return 0.0;
@@ -188,9 +184,9 @@ struct Stats {
 
     const char* dominant_name() const { return cause_name(dominant_cause()); }
 
-    // The largest cause a *configuration* could fix, which excludes the two that
+    // The largest cause a configuration could fix. This excludes the two that
     // belong to the workload and the array shape rather than to the machine's
-    // resources: fill/drain is what a systolic pipeline costs, and padding waste is
+    // resources: fill/drain is what a systolic pipeline costs, padding waste is
     // what the tile size costs. Those two dominate most runs, so ranking them
     // against the resource stalls would hide every provisioning problem behind
     // "array_fill_drain".
@@ -223,8 +219,8 @@ struct Stats {
 };
 
 // Gather a run's statistics. `useful_macs` is the workload's own MAC count with
-// padding excluded -- the tiler knows it and the machine cannot, since a padded
-// zero is indistinguishable from a real one at the array.
+// padding excluded: the tiler knows it and the machine cannot, since a padded zero
+// is indistinguishable from a real one at the array.
 inline Stats gather(const Config& cfg, const TpuResult& r, const RunProfile& p,
                     uint64_t useful_macs = 0, bool useful_known = false) {
     Stats s;
@@ -245,9 +241,9 @@ inline Stats gather(const Config& cfg, const TpuResult& r, const RunProfile& p,
         s.op_count[i]  = p.op_count[i];
     }
 
-    // Fill and drain is whatever busy time was not streaming, taken as a
-    // difference so the partition holds by construction instead of relying on the
-    // duration formula and the measured busy count agreeing.
+    // Fill and drain is whatever busy time was not streaming, taken as a difference
+    // so the partition holds by construction rather than relying on the duration
+    // formula and the measured busy count agreeing.
     s.lost.array_fill_drain =
         p.array_busy > p.stream_cycles ? p.array_busy - p.stream_cycles : 0;
 

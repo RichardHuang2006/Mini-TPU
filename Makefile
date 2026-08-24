@@ -1,6 +1,6 @@
-# Mini-TPU — cycle-accurate TPUv1-style int8 inference accelerator
+# Mini-TPU: cycle-accurate TPUv1-style int8 inference accelerator
 #
-# Targets: all (release) · debug (ASan+UBSan) · test · clean · help
+# Targets: all (release), debug (ASan+UBSan), test, examples, report, clean, help
 
 CXX      ?= g++
 CXXSTD    = -std=c++17
@@ -43,8 +43,8 @@ $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS_REL) -MMD -MP -c $< -o $@
 
 # ------------------------------------------------------ debug / sanitized ---
-# Building the sanitized binary is only half the point; the reason to have an
-# instrumented build is to run the whole suite under it.
+# The instrumented build exists to run the whole suite under it, so this target
+# builds and runs rather than only building.
 debug: $(BUILD)/minitpu-debug $(BUILD)/test_main-debug
 	./$(BUILD)/test_main-debug
 
@@ -69,8 +69,8 @@ examples:
 	  echo "examples: skipped, no $(TOOLS_SRC)"; \
 	fi
 
-# Performance tables regenerated from the model. Checked-in numbers that cannot
-# be reproduced are just decoration.
+# Performance tables regenerated from the model, so the checked-in numbers are
+# reproducible.
 $(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(REPORT_SRC) $(LIB_SRC) -o $@
 

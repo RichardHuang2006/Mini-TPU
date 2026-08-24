@@ -5,13 +5,10 @@
 
 #include "types.h"
 
-// Fixed-width instructions: one opcode/flag word plus five operand words. Every
-// field lives wholly inside one word, so an encoding is legible in a hex dump
-// and a decode is a field extraction rather than a bit-stitching exercise.
-//
-// Instructions are whole tensor operations, so six words of operands is
-// generous rather than tight -- there is no pressure to pack, and packing is
-// where encoding bugs come from.
+// Fixed-width instructions: one opcode/flag word plus five operand words. No
+// field straddles a word boundary, so an encoding is legible in a hex dump and a
+// decode is a field extraction rather than bit-stitching. Instructions are whole
+// tensor operations, so six words leave room to spare and nothing needs packing.
 //
 // word 0   flags and opcode
 //   [7:0]    opcode (Op)
@@ -94,8 +91,8 @@ struct Decoded {
 };
 
 // Encode a decoded instruction back to its wire form. Kept next to the field
-// layout so the encoder and the decoder cannot drift apart, and so the test
-// program builder has one obvious way to emit an instruction.
+// layout so encoder and decoder cannot drift apart, and so the test program
+// builder has one way to emit an instruction.
 inline RawInst encode(const Decoded& d) {
     assert(d.shift       <= isa::SHIFT_MASK);
     assert(d.pool_window <= isa::WINDOW_MASK);

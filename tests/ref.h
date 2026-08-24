@@ -1,14 +1,14 @@
 #pragma once
 
-// The oracle: an eager tensor model. Every instruction is carried out in full
-// the moment it is decoded -- no array, no FIFO, no double buffering, no
-// timing. `Tpu` is checked against it by comparing output bytes, accumulator
-// snapshots at each Sync, and the retired count.
+// The oracle: an eager tensor model. Every instruction is carried out in full the
+// moment it is decoded, with no array, no FIFO, no double buffering and no timing.
+// `Tpu` is checked against it on output bytes, accumulator snapshots at each Sync,
+// and the retired count.
 //
-// The arithmetic below deliberately does not share code with the timed model,
-// with one exception: quant.h. Two implementations that agree are evidence, one
-// called twice is not -- but bit-exact requantization is a *contract* rather
-// than an independent guess, so both sides call the same helper on purpose.
+// The arithmetic below deliberately shares no code with the timed model, with one
+// exception: quant.h. Two implementations that agree are evidence, one called twice
+// is not, but bit-exact requantization is a contract rather than an independent
+// guess, so both sides call the same helper on purpose.
 
 #include <cstddef>
 #include <cstdint>
@@ -33,13 +33,13 @@ namespace ref {
 //   accumulator bank   dim x dim int32: acc[r][c] = sum_k A[r][k] * W[k][c]
 //   activation output  int8 at ub_dst, row-major, stride = output columns
 //
-// One activation row is one input vector, and MatMul turns `len` input vectors
-// into `len` output vectors. That is why `len` may not exceed a bank's row
-// count: the bank is what holds the results.
+// One activation row is one input vector, and MatMul turns `len` input vectors into
+// `len` output vectors. Hence `len` may not exceed a bank's row count: the bank
+// holds the results.
 //
-// A matmul whose real K or N is smaller than the array relies on the unused
-// weights being zero, which is what makes a zero-padded partial tile produce
-// the right answer rather than merely a plausible one.
+// A matmul whose real K or N is smaller than the array relies on the unused weights
+// being zero, which is what makes a zero-padded partial tile produce the right
+// answer.
 // ---------------------------------------------------------------------------
 
 struct Options {
@@ -68,8 +68,8 @@ struct Result {
     bool done() const { return halted || trapped; }
 };
 
-// All of the machine's state. Public members: this is an oracle, and being
-// obvious matters more than being encapsulated.
+// All of the machine's state, public: this is an oracle, so being obvious matters
+// more than being encapsulated.
 struct Machine {
     Config cfg;
 
@@ -173,10 +173,10 @@ inline void step(Machine& m, Result& st, const std::vector<RawInst>& prog,
         }
 
         case Op::READ_WEIGHTS: {
-            // The `tile` operand is a FIFO staging slot, which is a timing
-            // artifact: with no FIFO to stage through, the resident weights are
-            // simply whatever the most recent Read_Weights fetched. A timed
-            // model must end up with the same tile resident.
+            // The `tile` operand names a FIFO staging slot, a timing artifact:
+            // with no FIFO to stage through, the resident weights are whatever the
+            // most recent Read_Weights fetched. A timed model must end up with the
+            // same tile resident.
             const std::size_t need = static_cast<std::size_t>(dim) * dim;
             if (!detail::range_ok(d.ddr_addr, need, m.weight_mem.size())) {
                 trap("Read_Weights: ddr range");
@@ -199,9 +199,9 @@ inline void step(Machine& m, Result& st, const std::vector<RawInst>& prog,
             const I32View bank = m.acc_bank(d.acc_bank);
             for (uint32_t r = 0; r < d.len; ++r) {
                 for (uint32_t c = 0; c < dim; ++c) {
-                    // Accumulated in int64 so the sum is well defined no matter
-                    // how many K-tiles pile into one bank; the store narrows to
-                    // the int32 the hardware bank actually holds.
+                    // Accumulated in int64 so the sum is well defined however many
+                    // K-tiles pile into one bank; the store narrows to the int32
+                    // the hardware bank holds.
                     int64_t sum = d.accumulate ? bank.at(r, c) : 0;
                     for (uint32_t k = 0; k < dim; ++k) {
                         const int64_t a = m.ub[d.ub_addr + static_cast<std::size_t>(r) * dim + k];
@@ -220,7 +220,7 @@ inline void step(Machine& m, Result& st, const std::vector<RawInst>& prog,
 
             const ConstI32View bank = m.acc_bank(d.acc_bank);
 
-            // Bias, requantize, activation function -- a len x dim int8 tile.
+            // Bias, requantize, activation function: a len x dim int8 tile.
             std::vector<i8> tile(static_cast<std::size_t>(d.len) * dim, 0);
             for (uint32_t r = 0; r < d.len; ++r) {
                 for (uint32_t c = 0; c < dim; ++c) {
@@ -230,9 +230,9 @@ inline void step(Machine& m, Result& st, const std::vector<RawInst>& prog,
                 }
             }
 
-            // Pool, if asked. Floor semantics: a window that does not divide
-            // the input evenly drops the ragged edge, which is what makes the
-            // uneven case worth a test of its own.
+            // Pool, if asked. Floor semantics: a window that does not divide the
+            // input evenly drops the ragged edge, which is why the uneven case
+            // gets a test of its own.
             uint32_t out_rows = d.len;
             uint32_t out_cols = dim;
             std::vector<i8> out;
@@ -278,8 +278,8 @@ inline void step(Machine& m, Result& st, const std::vector<RawInst>& prog,
         }
 
         case Op::SYNC: {
-            // A barrier has no state of its own; it is where the differential
-            // test gets to compare accumulators mid-program.
+            // A barrier has no state of its own; it is where the differential test
+            // compares accumulators mid-program.
             Snapshot s;
             s.acc = m.acc;
             st.syncs.push_back(std::move(s));
@@ -308,8 +308,8 @@ inline Result run(Machine& m, const std::vector<RawInst>& prog,
     Result st;
     while (!st.done()) {
         if (st.pc >= prog.size()) {
-            // A well-formed program ends in Halt; falling off the end is a bug
-            // in the program, so say so rather than stopping quietly.
+            // A well-formed program ends in Halt; falling off the end is a bug in
+            // the program, reported rather than stopped over quietly.
             st.trapped     = true;
             st.trap_reason = "ran past the end of the program";
             break;

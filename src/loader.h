@@ -17,10 +17,10 @@
 // Program and tensor input. Each entry point takes a stream so tests can drive
 // it from a string and the CLI from a file.
 //
-// Three tensor formats exist for one reason: the container carries its own
-// shape (so a bundled example is self-describing), while raw and hex do not
-// (so a tensor dumped by an external framework can be fed in with the shape on
-// the command line). All three must land the same bytes.
+// Three tensor formats: the MTPU container carries its own shape, so a bundled
+// example is self-describing, while raw and hex do not, so a tensor dumped by an
+// external framework can be fed in with the shape given on the command line. All
+// three must land the same bytes.
 
 namespace loader_detail {
 

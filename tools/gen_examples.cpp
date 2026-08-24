@@ -2,9 +2,8 @@
 // without the test binary.
 //
 // The programs and tensors come from wl::corpus(), the same definitions the test
-// suite runs against golden loops, so an example file cannot drift away from what
-// was verified. Nothing here computes a layer or emits an instruction; this is a
-// writer.
+// suite runs against golden loops, so an example file cannot drift from what was
+// verified. Nothing here computes a layer or emits an instruction.
 
 #include <cstdio>
 #include <fstream>
@@ -62,10 +61,9 @@ bool write_tensor(const std::string& path, const std::vector<i8>& data, uint32_t
     return true;
 }
 
-// Packed tensors are shipped as a flat row of bytes: the shape that matters is the
-// tiling the program was lowered for, which the program already encodes. Recording
-// them as 1 x N keeps the container honest rather than implying a 2D shape the
-// bytes are not in.
+// Packed tensors ship as a flat row of bytes, since the shape that matters is the
+// tiling the program was lowered for and the program already encodes it. Recording
+// them as 1 x N avoids implying a 2-D shape the bytes are not in.
 bool write_workload(const wl::Workload& w, const std::string& dir) {
     const std::string base = dir + "/" + w.name;
     return write_program(w, dir) &&

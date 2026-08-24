@@ -15,11 +15,11 @@
 // a copy.
 //
 // Banking is low-order interleaved, bank = addr % banks, so a contiguous row of
-// activations spreads across every bank instead of piling into one. That is the
-// whole point of banking here: the array consumes dim consecutive bytes per
-// cycle, and interleaving is what lets those arrive through dim different ports.
-// A block-partitioned layout (addr / bytes_per_bank) would put an entire row in
-// one bank and serialize precisely the access pattern the machine performs most.
+// activations spreads across every bank instead of piling into one. The array
+// consumes dim consecutive bytes per cycle, and interleaving lets those arrive
+// through dim different ports. A block-partitioned layout (addr / bytes_per_bank)
+// would put a whole row in one bank and serialize the machine's most common
+// access pattern.
 class UnifiedBuffer {
 public:
     // Each bank has one read port and one write port per cycle, so the direction
@@ -65,8 +65,8 @@ public:
         return in_range(at, static_cast<std::size_t>(rows - 1) * stride + cols);
     }
 
-    // A strided window onto the buffer's own storage. This is how the array gets
-    // its activations: no copy, so a tile of a much wider activation matrix costs
+    // A strided window onto the buffer's own storage, and how the array gets its
+    // activations: no copy, so a tile of a much wider activation matrix costs
     // nothing to address.
     I8View view(UbAddr at, uint32_t rows, uint32_t cols, uint32_t stride) {
         assert(tile_fits(at, rows, cols, stride));
@@ -79,8 +79,8 @@ public:
 
     // Copy a tile out of / into the buffer. `dst` and `src` supply the shape;
     // `stride` is the pitch on the buffer side, so a narrow tile can be lifted
-    // out of a wide region. Returns false rather than trapping when the tile does
-    // not fit, leaving the decision about what a bad address means to the caller.
+    // out of a wide region. A tile that does not fit returns false rather than
+    // trapping, leaving the meaning of a bad address to the caller.
     bool read_tile(UbAddr at, uint32_t stride, const I8View& dst) const {
         if (!tile_fits(at, dst.rows(), dst.cols(), stride)) return false;
         dst.copy_from(view(at, dst.rows(), dst.cols(), stride));

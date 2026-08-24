@@ -102,11 +102,10 @@ Config small_cfg(uint32_t dim = 4, uint32_t banks = 2) {
     return c;
 }
 
-// A deterministic byte source. Taking the top bits of an LCG gives a spread over
-// the whole int8 range, -128 included, which matters because -128 has no positive
-// counterpart and is where a sloppy negation would show up.
-// The same generator the bundled workloads use, so a test and an example built
-// from one seed hold the same bytes.
+// A deterministic byte source. Taking the top bits of an LCG spreads values over
+// the whole int8 range including -128, which has no positive counterpart and is
+// where a sloppy negation shows up. The same generator the bundled workloads use,
+// so a test and an example built from one seed hold the same bytes.
 using Lcg = wl::Rng;
 
 std::string show(const std::vector<int>& v) {
@@ -236,8 +235,8 @@ RunView view_of(Tpu& t, const TpuResult& r) {
     return v;
 }
 
-// Every comparand from DESIGN 8.1: output bytes, accumulators at each Sync, and
-// the retired count. Returns "" when the two runs agree.
+// Every comparand of the differential check: output bytes, accumulators at each
+// Sync, and the retired count. Returns "" when the two runs agree.
 std::string compare_runs(const char* a_name, const RunView& ra,
                          const char* b_name, const RunView& rb) {
     std::ostringstream os;
@@ -330,9 +329,9 @@ struct Inputs {
     std::vector<i8> ub_bytes;
 
     // Accumulator contents, row-major into one bank. Planting these lets a test
-    // choose the exact int32 values the activation pipeline will see, instead of
-    // taking whatever a matmul happens to produce -- which is the only way to sweep
-    // densely across a clamp boundary.
+    // choose the exact int32 values the activation pipeline sees rather than
+    // whatever a matmul happens to produce, which is the only way to sweep densely
+    // across a clamp boundary.
     BankId           acc_at = 0;
     std::vector<i32> acc_vals;
 };
@@ -485,7 +484,7 @@ SECTION("types") {
 SECTION("config") {
     Config c;
 
-    // Documented defaults (DESIGN 9.1).
+    // Documented defaults.
     REQUIRE(c.dim                 == 32);
     REQUIRE(c.ub_bytes            == 256u * 1024u);
     REQUIRE(c.ub_banks            == 8);
@@ -1475,9 +1474,8 @@ SECTION("mxu_weights") {
 // -------------------------------------------------- @section("mxu_matmul") ---
 SECTION("mxu_matmul") {
     // The first differential pass: the cycle-accurate array against the eager
-    // oracle, over a spread of shapes and over data that includes both int8
-    // extremes. Nothing here recomputes the matmul locally -- the expectation
-    // comes from running ref.h.
+    // oracle, over a spread of shapes and data covering both int8 extremes. Nothing
+    // here recomputes the matmul locally; the expectation comes from ref.h.
     Lcg rng(12345);
     int shapes = 0, disagreements = 0;
     std::string first_bad;
@@ -1682,10 +1680,10 @@ SECTION("mxu_timing") {
         }
     }
 
-    // Fill and drain is pure overhead, so utilization is len / (len + 2*dim - 1)
-    // and only a long stream amortizes it away. Double buffering is on here to
-    // keep weight-load bubbles out of the clock, leaving fill and drain as the
-    // only thing being measured.
+    // Fill and drain is pure overhead, so utilization is len / (len + 2*dim - 1) and
+    // only a long stream amortizes it away. Double buffering is on to keep
+    // weight-load bubbles out of the clock, leaving fill and drain as the only thing
+    // measured.
     {
         Config cfg = small_cfg(4, 2);
         cfg.double_buffer = true;
@@ -2073,11 +2071,10 @@ SECTION("accumulators") {
     REQUIRE(acc.stats().hazards == h);
 
     // ---- K-tiling ---------------------------------------------------------
-    // The real point of accumulate-in-place. A matmul with K four times the array
-    // width is split into four tiles that add into one bank, and the result must
-    // equal the full-K product. The expectation comes from a direct triple loop
-    // over the whole of K, which is a different computation from the one the
-    // array and the banks perform between them.
+    // A matmul with K four times the array width is split into four tiles that add
+    // into one bank, and the result must equal the full-K product. The expectation
+    // comes from a direct triple loop over the whole of K, a different computation
+    // from the one the array and the banks perform between them.
     {
         const uint32_t dim = 4;
         const uint32_t tiles = 4;
@@ -2214,9 +2211,8 @@ SECTION("weight_fifo") {
     }
 
     // ---- a 1-deep FIFO serializes back-to-back weight loads ---------------
-    // With depth 1 the second refill cannot even start until the first tile has
-    // been popped, so two loads cost two full latencies instead of overlapping
-    // into one.
+    // With depth 1 the second refill cannot start until the first tile has been
+    // popped, so two loads cost two full latencies instead of overlapping into one.
     {
         Config deep = cfg;
         deep.weight_fifo_depth = 4;
@@ -2451,11 +2447,11 @@ SECTION("tpu_units") {
     REQUIRE(out_ok);
 
     // The array's clock never lags the machine's, across every kind of operation.
-    // Tpu::matmul and load_weights_from_fifo each idle the array up to the
-    // machine clock before using it, which the current API cannot actually
-    // violate -- tick() keeps the two in step. The guards are there because
-    // the sequencer advances the clock while the array waits on a hazard, and
-    // this assertion is what will catch it if that stops holding.
+    // Tpu::matmul and load_weights_from_fifo each idle the array up to the machine
+    // clock before using it, which the current API cannot violate since tick() keeps
+    // the two in step. The guards exist because the sequencer advances the clock
+    // while the array waits on a hazard; this assertion catches it if that stops
+    // holding.
     {
         Tpu t(cfg);
         REQUIRE(t.mxu().cycle() == t.cycle());
@@ -2776,11 +2772,11 @@ SECTION("scoreboard") {
     // ---- write-after-read: a DMA must not overwrite what a MatMul is still
     // streaming out of the buffer.
     //
-    // This one can only ever be a timing property. An instruction reads its inputs
-    // at issue, so by the time a later writer could commit, the reader already has
-    // what it needed and no answer can change. A real array streams activations
-    // over many cycles and would be corrupted, so the stall belongs in the model --
-    // but the stall counter is the only thing that can witness it.
+    // This can only ever be a timing property. An instruction reads its inputs at
+    // issue, so by the time a later writer could commit, the reader already has what
+    // it needed and no answer can change. A real array streams activations over many
+    // cycles and would be corrupted, so the stall belongs in the model, but the
+    // stall counter is the only thing that can witness it.
     {
         tpuasm::Program p;
         p.read_weights(0)
@@ -2809,11 +2805,11 @@ SECTION("scoreboard") {
     }
 
     // ---- write-after-write across two different units -----------------------
-    // This is the case that needs the WAW check on its own merits: an Activate and
-    // a DMA live in different units, so nothing structural stops them overlapping.
-    // The Activate is the slower of the two, so if they were allowed to overlap the
-    // DMA would commit first and the Activate would then overwrite it -- leaving
-    // the region holding whichever finished last instead of what the program said.
+    // The case needing the WAW check on its own merits: an Activate and a DMA live
+    // in different units, so nothing structural stops them overlapping. The Activate
+    // is the slower of the two, so overlapping would let the DMA commit first and
+    // the Activate overwrite it, leaving the region holding whichever finished last
+    // rather than what the program said.
     {
         tpuasm::Program p;
         p.read_weights(0)
@@ -2980,9 +2976,9 @@ SECTION("weight_overlap") {
     REQUIRE(nodb.second.weight_load_bubble == 2ull * dim);
 
     // Only one DDR latency is ever exposed. The prefetcher requested both tiles
-    // before the program issued anything, so the second was already on its way
-    // while the first was being waited for; what is left is the first tile, which
-    // has nothing to hide behind.
+    // before the program issued anything, so the second was already on its way while
+    // the first was being waited for; what remains is the first tile, which has
+    // nothing to hide behind.
     REQUIRE_MSG(db.first == latency + 2 * mm + 2,
                 "    double-buffered: " + std::to_string(db.first) + " cycles, want " +
                     std::to_string(latency + 2 * mm + 2) + "\n");
@@ -3019,14 +3015,14 @@ SECTION("weight_overlap") {
     }
 
     // ---- FIFO depth is what decides how much latency is hidden --------------
-    // Four tiles, so a deep FIFO can have them all in flight at once and pay the
-    // DDR latency once, while a 1-deep FIFO cannot start a fetch until the previous
-    // tile has been consumed and pays it four times over.
+    // Four tiles, so a deep FIFO can have them all in flight at once and pay the DDR
+    // latency once, while a 1-deep FIFO cannot start a fetch until the previous tile
+    // has been consumed and pays it four times over.
     //
-    // The latency here is deliberately longer than a matmul. A shallow FIFO still
-    // starts its next fetch while the array works, so with a short latency the wait
-    // hides behind the compute and the depth costs nothing measurable -- depth only
-    // buys something once DDR is slower than the work available to cover it.
+    // The latency is deliberately longer than a matmul. A shallow FIFO still starts
+    // its next fetch while the array works, so with a short latency the wait hides
+    // behind the compute and depth costs nothing measurable; depth only buys
+    // something once DDR is slower than the work available to cover it.
     {
         const uint32_t slow_ddr = 40;      // longer than mm
         REQUIRE(slow_ddr > mm);
@@ -3206,10 +3202,9 @@ SECTION("sync") {
 // ---------------------------------------------------- @section("activate") ---
 SECTION("activate") {
     // A matmul-then-activate layer, byte-for-byte against the oracle, across every
-    // activation function and a spread of requantization scales. The arithmetic
-    // itself was pinned exhaustively in the quant section; what is under test here
-    // is that the machine feeds it the right accumulator and puts the result in the
-    // right place.
+    // activation function and a spread of requantization scales. The arithmetic was
+    // pinned exhaustively in the quant section; under test here is that the machine
+    // feeds it the right accumulator and puts the result in the right place.
     const uint32_t dim = 4, len = 4;
 
     Config cfg = small_cfg(dim, 2);
@@ -3298,11 +3293,11 @@ SECTION("activate") {
 
     // ---- the clamp boundaries, one requantized value at a time --------------
     // Random matmul products land on small integers too rarely to pin down where
-    // each function turns over: a ReLU that clamped everything below 2 rather than
-    // below 0 passed the sweep above, because nothing in it ever requantized to
-    // exactly 1. So plant the accumulator directly and walk it across the interesting
-    // range, where multiplier 1 / shift 0 requantizes each planted value to
-    // itself and every boundary gets hit exactly.
+    // each function turns over: a ReLU clamping everything below 2 rather than below
+    // 0 passed the sweep above, because nothing in it ever requantized to exactly 1.
+    // Planting the accumulator directly and walking it across the interesting range,
+    // with multiplier 1 and shift 0, requantizes each planted value to itself and
+    // hits every boundary exactly.
     {
         Inputs planted;
         planted.acc_at = 0;
@@ -3701,10 +3696,10 @@ SECTION("activate_timing") {
 // along the way.
 //
 // The two checks answer different questions. The oracle diff cannot catch a
-// mis-lowered layer, because the oracle runs the very same program -- if the tiler
-// emits the wrong instructions, both models faithfully execute the wrong thing and
-// agree. Only the golden comparison, which never sees a tile or an instruction,
-// can tell that the program does not compute the layer it claims to.
+// mis-lowered layer, because the oracle runs the same program: if the tiler emits
+// the wrong instructions, both models faithfully execute the wrong thing and agree.
+// Only the golden comparison, which never sees a tile or an instruction, can tell
+// that the program does not compute the layer it claims to.
 struct LayerRun {
     std::vector<i8> got;
     std::vector<i8> want;
@@ -3849,8 +3844,8 @@ SECTION("tiling") {
 
     // ---- K tiling accumulates across four tiles ----------------------------
     // Isolated from M and N tiling: one output tile, four K tiles piling into one
-    // bank. If accumulate-in-place were wrong, only the last K tile would survive
-    // and the answer would be off by three quarters of the sum.
+    // bank. If accumulate-in-place were wrong, only the last K tile would survive and
+    // the answer would be off by three quarters of the sum.
     {
         Config cfg;
         cfg.dim = 8;
@@ -3877,9 +3872,8 @@ SECTION("tiling") {
     }
 
     // ---- shapes that do not divide the array ------------------------------
-    // Every combination of ragged M, N and K, on a small array so the sweep is
-    // cheap. This is where zero padding and the short-`len` last row block have to
-    // agree with plain loops.
+    // Every combination of ragged M, N and K, on a small array so the sweep is cheap.
+    // Zero padding and the short-`len` last row block have to agree with plain loops.
     {
         Config cfg;
         cfg.dim = 4;
@@ -3913,10 +3907,10 @@ SECTION("tiling") {
     }
 
     // ---- the last row block is short, not padded out ----------------------
-    // A short final block is expressed with a smaller `len`, not by processing
-    // padding rows and discarding them afterwards. Padding rows would give the same
-    // answer -- unpack drops them -- so only the instruction stream and the cycle
-    // count can tell the difference, and both are checked here.
+    // A short final block is expressed with a smaller `len`, not by processing padding
+    // rows and discarding them afterwards. Padding rows would give the same answer,
+    // since unpack drops them, so only the instruction stream and the cycle count can
+    // tell the difference; both are checked here.
     {
         Config cfg;
         cfg.dim = 8;
@@ -3996,9 +3990,9 @@ SECTION("tiling") {
     }
 
     // ---- tiling actually overlaps ----------------------------------------
-    // The point of alternating accumulator banks and double buffering the output
-    // staging tile is that the drain of one output tile hides under the next
-    // tile's arithmetic. With a single bank there is nowhere to hide.
+    // Alternating accumulator banks and double buffering the output staging tile let
+    // the drain of one output tile hide under the next tile's arithmetic. With a
+    // single bank there is nowhere to hide.
     {
         Config cfg;
         cfg.dim = 8;
@@ -4037,10 +4031,10 @@ SECTION("tiling") {
         REQUIRE(a.stalls.accum_hazard > b.stalls.accum_hazard);
 
         // ---- the output staging tile is double buffered ---------------------
-        // Consecutive Activates have to write different buffers. Sharing one is
-        // still correct -- the scoreboard would stall the Activate until the drain
-        // it collides with has finished -- so the only trace of the choice is in the
-        // addresses the tiler emits.
+        // Consecutive Activates have to write different buffers. Sharing one stays
+        // correct, since the scoreboard would stall the Activate until the drain it
+        // collides with finished, so the only trace of the choice is in the addresses
+        // the tiler emits.
         {
             const wl::Lowering low = wl::lower_layer(l, four_bank);
             std::vector<UbAddr> dsts;
@@ -4067,8 +4061,8 @@ SECTION("tiling") {
         // ---- and the deferred drain is what makes the banks reachable -------
         // Emitting each Write_Host right after its Activate costs nothing in
         // correctness and a great deal in cycles: issue is in order, so the drain
-        // stalls on its own activation and the next tile's MatMuls queue up behind
-        // it, unable to reach the idle banks waiting for them.
+        // stalls on its own activation and the next tile's MatMuls queue behind it,
+        // unable to reach the idle banks waiting for them.
         wl::Sched naive;
         naive.defer_drain = false;
 
@@ -4187,10 +4181,10 @@ SECTION("conv") {
     }
 
     // ---- padding really is zero -------------------------------------------
-    // With an all-ones input and an all-ones 3x3 kernel, each output is a count of
-    // the input pixels the window covered. The corners of a padded convolution see
-    // four, the edges six, the interior nine -- so if padding contributed anything
-    // other than zero, the border would be wrong in a way that is easy to read.
+    // With an all-ones input and an all-ones 3x3 kernel, each output counts the input
+    // pixels the window covered: four at the corners of a padded convolution, six at
+    // the edges, nine in the interior. Padding contributing anything other than zero
+    // would show up as a wrong border.
     {
         wl::Conv c;
         c.H = 5; c.W = 5; c.Cin = 1;
@@ -4323,11 +4317,11 @@ SECTION("mlp") {
     }
 
     // ---- chaining survives widths that do not divide the array -------------
-    // The subtle case. A layer's packed output has padding columns holding whatever
-    // the activation made of an all-zero accumulator, and the next layer reads those
-    // bytes as activations. They stay harmless only because they meet the zero rows
-    // of the next layer's packed weights. A non-zero bias makes that padding
-    // non-zero, so this is the shape that would catch it.
+    // A layer's packed output has padding columns holding whatever the activation made
+    // of an all-zero accumulator, and the next layer reads those bytes as activations.
+    // They stay harmless only because they meet the zero rows of the next layer's
+    // packed weights. A non-zero bias makes that padding non-zero, so this is the
+    // shape that would catch it.
     {
         Config cfg;
         cfg.dim = 8;
@@ -4538,9 +4532,9 @@ Measured measure(const wl::Workload& w, const Config& cfg) {
 SECTION("stats") {
     // ---- the accounting balances ------------------------------------------
     // Everything else in this section reads a number off the breakdown, so first
-    // establish that the breakdown is a partition: every cycle is either one the
-    // array was busy or one charged to exactly one cause. Without this a "dominant
-    // cause" would just be whichever bucket got double counted the most.
+    // establish that the breakdown is a partition: every cycle is either one the array
+    // was busy or one charged to exactly one cause. Without it, a "dominant cause"
+    // would be whichever bucket got double counted the most.
     {
         const std::vector<wl::Workload> all = wl::corpus();
         for (const wl::Workload& w : all) {
@@ -4665,17 +4659,16 @@ SECTION("stats") {
     }
 
     // ---- the breakdown diagnoses a starved configuration ------------------
-    // The point of the breakdown. Take a workload, starve one resource, and the
-    // bucket named after that resource must account for the slowdown.
+    // Starve one resource of a workload and the bucket named after that resource must
+    // account for the slowdown.
     //
-    // This is checked as a *delta* rather than as a dominant cause because on these
-    // workloads the largest bucket is almost always array_fill_drain -- a matmul
-    // streams dim rows but pays 2*dim-1 cycles of pipeline latency, so most of the
-    // array's time goes into filling and draining whatever the configuration. That
-    // is a property of a small systolic array, not a provisioning problem, and a
-    // breakdown that only ever answered "array_fill_drain" would be useless. What
-    // makes it a diagnosis is that when a resource is taken away, the extra cycles
-    // land in that resource's bucket and nowhere else.
+    // Checked as a delta rather than as a dominant cause, because on these workloads
+    // the largest bucket is almost always array_fill_drain: a matmul streams dim rows
+    // but pays 2*dim-1 cycles of pipeline latency, so most of the array's time goes
+    // into filling and draining whatever the configuration. That is a property of a
+    // small systolic array rather than a provisioning problem. What makes the
+    // breakdown a diagnosis is that removing a resource puts the extra cycles in that
+    // resource's bucket and nowhere else.
     {
         struct Starved {
             const char*  name;
@@ -4688,11 +4681,11 @@ SECTION("stats") {
             base.dim = 16;              // one array size, so only the knob varies
             base.ub_bytes = 64 * 1024;
 
-            // A 1-deep FIFO on its own is not a stress: the prefetcher starts the
-            // next fetch while the array works, and the default 8-cycle DDR latency
-            // hides completely behind a single matmul. Depth only costs anything
-            // once DDR is slower than the compute available to cover it, so the
-            // weight-starved configuration slows DDR down too.
+            // A 1-deep FIFO alone is not a stress: the prefetcher starts the next
+            // fetch while the array works, and the default 8-cycle DDR latency hides
+            // completely behind a single matmul. Depth only costs anything once DDR is
+            // slower than the compute available to cover it, so the weight-starved
+            // configuration slows DDR down too.
             Config fifo = base;
             fifo.weight_fifo_depth = 1;
             fifo.ddr_tile_latency  = 400;
@@ -4759,20 +4752,19 @@ SECTION("stats") {
     }
 
     // ---- Unified Buffer port contention -----------------------------------
-    // A single-bank UB is a much weaker stress than it looks, and it is worth
-    // being precise about why rather than reporting a number that only looks
-    // like a diagnosis.
+    // A single-bank UB is a weaker stress than it looks, and the reason is worth
+    // stating precisely.
     //
     // A bank carries one read and one write per cycle, so the bank count limits how
-    // many transfers in the same direction can be in flight. But at most one
-    // instruction per unit is ever in flight, so the only same-direction pairs that
-    // can exist are a matmul and a Write_Host reading, or a Read_Host and an
-    // Activate writing -- two streams per direction, whatever the workload. One bank
-    // therefore serializes at most one pair at a time, and above one bank there is
-    // no contention left to find at any depth.
+    // many same-direction transfers can be in flight. But at most one instruction per
+    // unit is ever in flight, so the only same-direction pairs that can exist are a
+    // matmul and a Write_Host reading, or a Read_Host and an Activate writing: two
+    // streams per direction, whatever the workload. One bank therefore serializes at
+    // most one pair at a time, and above one bank no contention remains to find at
+    // any depth.
     //
-    // So: the mechanism is real and worth measuring, but on the shipped workloads it
-    // is worth tens of cycles, not thousands, and it is never the dominant cause.
+    // The mechanism is real and worth measuring, but on the shipped workloads it is
+    // worth tens of cycles rather than thousands and is never the dominant cause.
     // Making it one would take more concurrency than this sequencer has.
     {
         const uint32_t dim = 8, len = 8;
@@ -4888,9 +4880,9 @@ SECTION("stats") {
 
 // Requantization computed from the specification rather than from quant.h: a
 // multiply, a divide by 2^shift rounding halves away from zero, and a saturating
-// narrow to int8. The point of writing it twice is that the timed model and the
-// oracle deliberately *share* quant.h -- a bit-exactness test against the same code
-// they both call would be vacuous -- so the third opinion has to come from here.
+// narrow to int8. The timed model and the oracle deliberately share quant.h, so a
+// bit-exactness test against that same code would be vacuous; the third opinion has
+// to come from here.
 i8 spec_requantize(i32 acc, i32 bias, i32 multiplier, uint32_t shift) {
     const long long biased  = static_cast<long long>(acc) + bias;
     const long long product = biased * multiplier;
@@ -4946,19 +4938,16 @@ SECTION("properties") {
     }
 
     // ---- and that fixes a ceiling on utilization --------------------------
-    // A full tile might be expected to reach >90% array utilization. It cannot,
-    // and the reason is worth stating precisely.
+    // A full tile cannot reach >90% array utilization, and the reason is structural.
     //
-    // Utilization is amortized over the stream: len cycles of work for
-    // len + 2*dim - 1 cycles of occupancy. Long streams would amortize the fill
-    // away, but `len` cannot exceed dim, because a matmul's results land in one
-    // accumulator bank and a bank is dim rows deep. So the best a single matmul can
-    // do is dim / (3*dim - 1), which falls towards one third as the array grows and
-    // is nowhere near 90% at any size.
+    // Utilization is amortized over the stream: len cycles of work for len + 2*dim - 1
+    // cycles of occupancy. Long streams would amortize the fill away, but `len` cannot
+    // exceed dim, because a matmul's results land in one accumulator bank and a bank
+    // is dim rows deep. The best a single matmul can do is therefore dim / (3*dim - 1),
+    // which falls towards one third as the array grows.
     //
-    // This is the headline finding of the characterization: the array is not stalling,
-    // it is draining. Deeper accumulator banks, not more bandwidth, are what would
-    // move it.
+    // The array is draining, not stalling: deeper accumulator banks rather than more
+    // bandwidth are what would move this number.
     for (const uint32_t dim : {8u, 32u}) {
         Config cfg = small_cfg(dim, 2);
         cfg.ub_bytes = 16 * dim * dim;
@@ -4990,16 +4979,16 @@ SECTION("properties") {
 
     // ---- the activation pipeline is scalar, and that is what binds --------
     // The throughput-1 pipeline emits one requantized element per cycle, so an
-    // Activate over a full bank costs dim*dim + depth cycles while the
-    // matmul that filled that bank cost only 3*dim - 1. The ratio grows linearly
-    // with dim, so past a small array the machine spends most of its time
-    // requantizing rather than multiplying -- which is exactly what the breakdown
-    // reports for the 32x32 and 256x256 configurations.
+    // Activate over a full bank costs dim*dim + depth cycles while the matmul that
+    // filled that bank cost only 3*dim - 1. The ratio grows linearly with dim, so past
+    // a small array the machine spends most of its time requantizing rather than
+    // multiplying, which is what the breakdown reports for the 32x32 and 256x256
+    // configurations.
     //
-    // There is no crossover to find: dim*dim + depth exceeds 3*dim - 1 at every
-    // array size, so the pipeline is always the more expensive half and the gap only
-    // widens. Pinning it here means a future dim-wide activation pipeline has to
-    // come and change this test on purpose.
+    // There is no crossover: dim*dim + depth exceeds 3*dim - 1 at every array size, so
+    // the pipeline is always the more expensive half and the gap only widens. Pinning
+    // it here means a future dim-wide activation pipeline has to change this test on
+    // purpose.
     double prev_ratio = 0.0;
     for (const uint32_t dim : {4u, 8u, 32u}) {
         Config cfg = small_cfg(dim, 2);
@@ -5069,9 +5058,9 @@ SECTION("properties") {
     }
 
     // ---- requantization is bit-exact against the specification ------------
-    // Driven through the machine, not through quant.h: accumulator values are
-    // planted in a bank and an Activate is asked to requantize them, so what is
-    // compared is the hardware path's output against an independent computation.
+    // Driven through the machine rather than through quant.h: accumulator values are
+    // planted in a bank and an Activate requantizes them, so the comparison is the
+    // hardware path's output against an independent computation.
     {
         const uint32_t dim = 8;
         const struct { i32 mult; uint32_t shift; i32 bias; } scales[] = {
@@ -5144,9 +5133,9 @@ SECTION("properties") {
     }
 
     // ---- below the ridge, time scales with bytes and not with MACs --------
-    // The roofline claim. Halving the DMA bandwidth of a memory-bound run should
-    // very nearly double it, because the array is already waiting; the same change
-    // to a compute-bound run should barely register.
+    // Halving the DMA bandwidth of a memory-bound run should very nearly double it,
+    // because the array is already waiting; the same change to a compute-bound run
+    // should barely register.
     {
         const wl::Spec spec = wl::specs().front();   // matmul_128
 
@@ -5217,12 +5206,11 @@ SECTION("properties") {
 SECTION("config_sweep") {
     // Every workload on all six reference configurations.
     //
-    // The value of the sweep is that dataflow, skew, interlock and padding bugs are
-    // configuration-dependent in a way arithmetic bugs are not: a skew that is off
-    // by one produces the right answer whenever dim divides the shape and the wrong
-    // one whenever it does not, and a lowering that assumes a full tile is only
-    // wrong on the ragged edge. Running one array size proves very little; running
-    // 8x8 next to 256x256 with the same expected output proves a lot.
+    // Dataflow, skew, interlock and padding bugs are configuration-dependent in a way
+    // arithmetic bugs are not: a skew off by one produces the right answer whenever
+    // dim divides the shape and the wrong one whenever it does not, and a lowering
+    // that assumes a full tile is only wrong on the ragged edge. One array size proves
+    // little; 8x8 next to 256x256 with the same expected output proves much more.
     struct Named {
         const char* name;
         Config (*make)(Config);
@@ -5301,9 +5289,9 @@ SECTION("diff_scaffold") {
         }
     };
 
-    // Two runs of the same program over the same inputs agree on every
-    // comparand. This is the whole point of the phase: the comparison works
-    // before there is a second implementation to point it at.
+    // Two runs of the same program over the same inputs agree on every comparand,
+    // establishing that the comparison works before there is a second
+    // implementation to point it at.
     const std::string same = diff_run(p.code(), cfg, setup);
     REQUIRE_MSG(same.empty(), same);
 

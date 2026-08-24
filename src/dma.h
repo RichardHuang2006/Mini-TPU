@@ -24,12 +24,10 @@ struct DmaRequest {
 // The host DMA engine: moves byte ranges between host memory and the Unified
 // Buffer at a configurable bandwidth.
 //
-// The bytes are copied at start() while the *timing* is accounted separately. A
-// reader that peeked at the buffer mid-transfer would therefore see finished
-// data, which is only sound because the scoreboard interlock stalls any
-// consumer until the DMA retires. Splitting the two this way keeps the data path
-// obviously correct and leaves the schedule as the only thing the timing model
-// has to get right.
+// start() copies the bytes while the timing is accounted separately, so a reader
+// peeking mid-transfer would see finished data. That is sound only because the
+// scoreboard interlock stalls every consumer until the DMA retires; the split
+// leaves the schedule as the only thing the timing model has to get right.
 class Dma {
 public:
     struct Stats {
@@ -62,10 +60,9 @@ public:
 
     // Reserve the engine and account for the transfer without moving any bytes.
     // The sequencer uses this one: it reads the source at issue and commits the
-    // destination when the instruction retires, so that a consumer which issued
-    // too early sees the old bytes rather than the new ones. That is what makes a
-    // missing interlock show up as a wrong answer instead of only a wrong
-    // schedule.
+    // destination at retire, so a consumer that issued too early sees the old
+    // bytes. A missing interlock therefore surfaces as a wrong answer, not only
+    // as a wrong schedule.
     bool begin(const DmaRequest& r, uint64_t now, std::size_t host_bytes,
                const UnifiedBuffer& ub) {
         now_ = now;

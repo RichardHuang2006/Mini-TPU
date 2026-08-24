@@ -13,7 +13,7 @@ void Tpu::tick() {
     ++cycle_;
 
     // Reverse pipeline order: writeback before compute before issue before fetch,
-    // so a stage reads what its producer had at the end of the previous cycle
+    // so a stage reads what its producer held at the end of the previous cycle
     // rather than something produced earlier in this one.
     dma_.tick(cycle_);       // writeback / DMA completion
     mxu_.idle_until(cycle_); // compute
@@ -75,8 +75,8 @@ bool Tpu::matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate) {
     if (!ub_.tile_fits(ub_addr, len, cfg_.dim, cfg_.dim)) return false;
 
     // The array writes straight into the bank, so the bank is locked for the
-    // duration: a consumer that read it now would see a partial result. Driven by
-    // hand the matmul completes within the call, so the lock is released
+    // duration; a consumer reading it meanwhile would see a partial result. Driven
+    // by hand the matmul completes within the call and the lock is released
     // immediately; under the sequencer it is held until the matmul retires.
     acc_.lock(bank);
     mxu_.idle_until(cycle_);
@@ -100,14 +100,12 @@ bool Tpu::matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate) {
 // reduces to whether each instruction computes the right tensor and whether the
 // interlock ever lets a consumer read a region before its producer finished.
 //
-// An instruction's data effect lands when it issues, not spread over its
-// duration. That is sound precisely because of the scoreboard -- no other
-// instruction that could observe the difference is allowed to issue until this
-// one retires -- and it keeps the data path obviously correct, leaving the
-// schedule as the only thing the timing model has to get right. Read_Weights is
-// the one exception: its tile is popped from the FIFO and shifted into the
-// weight plane when it retires, since that is when the tile has actually
-// arrived from DDR.
+// An instruction's data effect lands at issue rather than spread over its
+// duration. The scoreboard is what makes that sound, since no instruction able to
+// observe the difference may issue until this one retires; the schedule is then
+// the only thing the timing model has to get right. Read_Weights is the one
+// exception: its tile is popped from the FIFO and shifted into the weight plane
+// at retire, which is when the tile has actually arrived from DDR.
 // ===========================================================================
 
 Unit Tpu::unit_of(Op op) {
@@ -191,8 +189,8 @@ bool Tpu::validate(const Decoded& d, Reservation& res, std::string& why) const {
         }
 
         case Op::MATMUL: {
-            // The order of these checks matches the oracle's, so a program with
-            // more than one thing wrong reports the same reason on both sides.
+            // Check order matches the oracle's, so a program with more than one
+            // fault reports the same reason on both sides.
             if (d.acc_bank >= cfg_.acc_banks) {
                 why = "MatMul: bank out of range";
                 return false;
@@ -262,11 +260,10 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
             return std::max<uint64_t>(1, dma_.transfer_cycles(d.bytes));
 
         case Op::READ_WEIGHTS:
-            // Only the shift into a plane. The DDR fetch is not here because the
-            // FIFO already paid for it in the background -- that is what the FIFO is
-            // for, and charging the latency again would make its depth irrelevant.
-            // With a shadow plane the shift hides under whatever the array is doing,
-            // so it costs nothing; without one it is dim exposed cycles.
+            // Only the shift into a plane. The FIFO already paid the DDR fetch in
+            // the background, and charging that latency again would make FIFO depth
+            // irrelevant. With a shadow plane the shift hides under whatever the
+            // array is doing; without one it is dim exposed cycles.
             return mxu_.load_bubble();
 
         case Op::MATMUL:
@@ -277,11 +274,10 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
             // Throughput-1 after fill: one accumulator element per cycle, plus the
             // pipeline depth to fill it.
             //
-            // The count is over *input* elements, not output ones, so pooling does
-            // not make an Activate cheaper: every accumulator element still has to
-            // be read and requantized before the window reduction can see it. A
-            // model charging for outputs instead would make a 2x2 pool look four
-            // times faster than it is.
+            // The count is over input elements, not output ones, so pooling does
+            // not make an Activate cheaper: every accumulator element is still read
+            // and requantized before the window reduction sees it. Charging for
+            // outputs would make a 2x2 pool look four times faster than it is.
             return static_cast<uint64_t>(d.len) * cfg_.dim + cfg_.act_pipeline_depth;
 
         case Op::SYNC:
@@ -318,10 +314,10 @@ bool Tpu::interlocked(const Reservation& r) {
         if (!f.active) continue;
 
         // A reader waits for the writer of its region; a writer waits for both
-        // readers and writers. WAR matters even though effects land at issue: the
-        // array streams its activations out of the buffer over many cycles, so a
-        // DMA overwriting that region early would corrupt a real machine. Being
-        // conservative here can cost overlap but never correctness.
+        // readers and writers. WAR matters even though effects land at issue,
+        // because the array streams activations out of the buffer over many cycles
+        // and a DMA overwriting that region early would corrupt a real machine.
+        // Being conservative here can cost overlap but never correctness.
         if (r.ub_read.overlaps(f.res.ub_write))  { ++stalls_.ub_raw; return true; }
         if (r.ub_write.overlaps(f.res.ub_read))  { ++stalls_.ub_war; return true; }
         if (r.ub_write.overlaps(f.res.ub_write)) { ++stalls_.ub_waw; return true; }
@@ -335,10 +331,10 @@ bool Tpu::interlocked(const Reservation& r) {
         // A MatMul needs the tile its Read_Weights was fetching.
         if (r.reads_weights && f.res.writes_weights) { ++stalls_.weight_stall; return true; }
 
-        // And a Read_Weights must not overwrite the tile a running MatMul is
-        // still multiplying by -- unless there is a shadow plane to put it in,
-        // which is exactly what double buffering buys. The whole benefit falls out
-        // of this one condition rather than being a special case elsewhere.
+        // And a Read_Weights must not overwrite the tile a running MatMul is still
+        // multiplying by, unless there is a shadow plane to put it in. The entire
+        // benefit of double buffering falls out of this one condition rather than
+        // a special case elsewhere.
         if (r.writes_weights && f.res.reads_weights && !cfg_.double_buffer) {
             ++stalls_.weight_stall;
             return true;
@@ -386,15 +382,15 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
         }
 
         case Op::READ_WEIGHTS:
-            // The tile is already in the FIFO -- the prefetcher put it there, and
-            // issue only proceeded because it had arrived. All that is left is the
-            // shift into the weight plane, which happens at retire.
+            // The prefetcher already put the tile in the FIFO, and issue only
+            // proceeded because it had arrived. What remains is the shift into the
+            // weight plane, which happens at retire.
             stalls_.weight_load_bubble += mxu_.load_bubble();
             break;
 
         case Op::MATMUL: {
-            // The array's own timing model decides how long this takes, so the
-            // sequencer does not carry a second copy of the fill/drain formula.
+            // The array's own timing model decides the duration, so the sequencer
+            // carries no second copy of the fill/drain formula.
             mxu_.idle_until(cycle_);
 
             pw.bank     = d.acc_bank;
@@ -403,7 +399,7 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
             const I32View out(pw.acc_data.data(), d.len, dim);
 
             // Accumulating in place starts from what the bank holds now, so the
-            // read of the bank happens at issue like every other input.
+            // bank is read at issue like every other input.
             if (d.accumulate) out.copy_from(acc_.bank(d.acc_bank).tile(0, 0, d.len, dim));
 
             const ConstI8View acts = ub_.view(d.ub_addr, d.len, dim, dim);
@@ -425,9 +421,9 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
 }
 
 // Bias add, requantize, activation function, then an optional window reduction.
-// The pooling stage sees the requantized int8 stream rather than the int32
-// accumulators, so a pooled Activate and an unpooled one requantize identically
-// and only differ in what happens afterwards.
+// Pooling sees the requantized int8 stream rather than the int32 accumulators, so
+// pooled and unpooled Activates requantize identically and differ only in what
+// follows.
 void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
     const uint32_t     dim  = cfg_.dim;
     const ConstI32View bank = acc_.bank(d.acc_bank);
@@ -438,7 +434,7 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
             const i8 q =
                 quant::requantize_biased(bank.at(r, c), d.bias, d.multiplier, d.shift);
             // Clamped in the output's own quantized units, so ReLU6's bound is the
-            // int8 value 6 and not 6.0 in some notional real scale.
+            // int8 value 6, not 6.0 on some notional real scale.
             i8 v = q;
             switch (d.act) {
                 case ActFn::IDENTITY: break;
@@ -474,8 +470,8 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
                     if (v > best) best = v;
                 }
             }
-            // Average pooling rounds the way requantization does, through the same
-            // helper, so the two cannot drift apart on a tie.
+            // Average pooling rounds through the same helper as requantization, so
+            // the two cannot drift apart on a tie.
             pw.ub_data[static_cast<std::size_t>(orow) * cols + ocol] =
                 d.pool == Pool::MAX
                   ? best
@@ -485,8 +481,8 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
 }
 
 void Tpu::finish(InFlight& f) {
-    // Commit the staged outputs. Until this moment a consumer that issued too
-    // early would have read the state this instruction is replacing.
+    // Commit the staged outputs. Until now, a consumer that issued too early would
+    // have read the state this instruction is replacing.
     const PendingWrite& pw = f.pending;
     for (std::size_t i = 0; i < pw.ub_data.size(); ++i) {
         ub_.at(static_cast<UbAddr>(pw.ub_at + i)) = pw.ub_data[i];
@@ -509,9 +505,8 @@ void Tpu::finish(InFlight& f) {
             mxu_.load_weights_untimed(t.view());
         } else {
             // Unreachable: the duration covers the DDR latency, so the tile is
-            // always ready by now. Counted rather than ignored so that a change
-            // which breaks the assumption shows up instead of silently loading
-            // stale weights.
+            // always ready by now. Counted rather than ignored so a change breaking
+            // that assumption surfaces instead of silently loading stale weights.
             ++stalls_.weight_fifo_empty;
         }
     }
@@ -520,7 +515,7 @@ void Tpu::finish(InFlight& f) {
 
 void Tpu::retire_completed(TpuResult& st) {
     // Reverse pipeline order: writeback before issue, so a unit freed this cycle
-    // can take new work in the same cycle rather than leaving a dead cycle behind
+    // can take new work in the same cycle instead of leaving a dead cycle behind
     // every instruction.
     for (InFlight& f : units_) {
         if (f.active && cycle_ >= f.done_cycle) {
@@ -534,7 +529,7 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
                      const TpuOptions& opts) {
     if (st.pc >= prog.size()) {
         // A well-formed program ends in Halt. Wait for the machine to go quiet
-        // first so the retired count and final state are exactly what the oracle
+        // first, so the retired count and final state match what the oracle
         // reports for the same program.
         if (!quiet()) { ++stalls_.drain; return; }
         st.trapped     = true;
@@ -568,8 +563,8 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     if (slot(u).active) { ++stalls_.unit_busy; return; }
 
     // The tile has to have arrived from DDR. With a deep enough FIFO the
-    // prefetcher is far enough ahead that it always has; with a shallow one this is
-    // where the array waits on memory.
+    // prefetcher stays far enough ahead that it always has; with a shallow one this
+    // is where the array waits on memory.
     if (d.op == Op::READ_WEIGHTS && fifo_.empty()) {
         ++stalls_.weight_fifo_empty;
         return;
@@ -595,8 +590,8 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     if (d.op == Op::READ_HOST || d.op == Op::WRITE_HOST) profile_.dma_bytes += d.bytes;
     if (d.op == Op::MATMUL) {
         ++profile_.matmuls;
-        // The steady-state part of the matmul: one row admitted per cycle, every
-        // PE multiplying. The rest of its duration is fill and drain.
+        // The steady-state part of the matmul: one row admitted per cycle, every PE
+        // multiplying. The rest of the duration is fill and drain.
         profile_.stream_cycles  += d.len;
         profile_.macs_performed += static_cast<uint64_t>(d.len) * cfg_.dim * cfg_.dim;
     }
@@ -634,10 +629,10 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
 // Keep the weight FIFO as full as it will go, reading ahead in the instruction
 // stream for the tiles upcoming Read_Weights will ask for.
 //
-// This is what the FIFO is for. A Read_Weights that both requested its tile and
-// consumed it would pay the DDR latency in full every time and the depth would
-// change nothing; running the fetches ahead of the instructions that need them is
-// how the latency gets hidden, and the depth is how far ahead it can get.
+// A Read_Weights that both requested and consumed its tile would pay the DDR
+// latency in full every time, leaving depth irrelevant. Running the fetches ahead
+// of the instructions that need them is how the latency is hidden, and the depth
+// bounds how far ahead they can get.
 //
 // Reading ahead is safe because nothing in the ISA writes weight memory, so a tile
 // fetched early cannot be stale. An out-of-range address is left alone rather than
@@ -675,15 +670,15 @@ void Tpu::reset_pipeline() {
 // Charge one cycle in which the array stood still to whatever the machine was
 // waiting on, given which stall counter moved during this cycle's issue attempt.
 //
-// The order of the tests is the attribution policy. The weight path, the buffer
-// ports and the accumulators are named causes and claim their own stalls first.
-// Anything else that coincides with a transfer in flight is charged to data
-// movement, which is what makes a starved DMA read as dma_bound rather than
-// hiding behind the read-after-write it happens to trigger.
+// Test order is the attribution policy. The weight path, the buffer ports and the
+// accumulators are named causes and claim their own stalls first. Anything else
+// coinciding with a transfer in flight is charged to data movement, so a starved
+// DMA reads as dma_bound rather than hiding behind the read-after-write it
+// happens to trigger.
 //
-// Note that the unit slots are enough to decide this: whichever in-flight
-// instruction the scoreboard blocked on is by definition still in flight now, since
-// nothing retires between issue and here.
+// The unit slots suffice to decide this: whichever in-flight instruction the
+// scoreboard blocked on is still in flight now, since nothing retires between
+// issue and here.
 void Tpu::charge_idle_cycle(const StallStats& before) {
     const StallStats& n = stalls_;
 
@@ -722,8 +717,8 @@ TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
 
         // Sampled after issue, so the cycle a matmul starts on counts as busy and
         // the cycle it retires on does not. Sampling first would undercount every
-        // matmul by exactly one cycle and leave array_busy one short of the duration
-        // the array charged for it.
+        // matmul by one cycle, leaving array_busy short of the duration the array
+        // charged for it.
         if (slot(Unit::MXU).active) ++profile_.array_busy;
         else                        charge_idle_cycle(before);
 
