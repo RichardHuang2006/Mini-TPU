@@ -20,7 +20,7 @@ TPU_SRC = $(wildcard src/*.cpp)
 TPU_OBJ = $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(TPU_SRC))
 DBG_OBJ = $(patsubst src/%.cpp,$(DBGDIR)/%.o,$(TPU_SRC))
 
-TEST_SRC   = tests/test_main.cpp
+TEST_SRC   = $(wildcard tests/test_*.cpp)
 TOOLS_SRC  = tools/gen_examples.cpp
 REPORT_SRC = tools/report.cpp
 HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
@@ -78,14 +78,16 @@ report: $(BUILD)/report
 	@./$(BUILD)/report
 
 # ------------------------------------------------------------------ test ---
-# One translation unit that pulls in nearly every header, so it is rebuilt on
-# any header change rather than tracked dependency by dependency.
+# One translation unit per subsystem (tests/test_*.cpp), linked into a single
+# binary whose main() lives in tests/test_main.cpp. Every TU pulls in nearly
+# every header, so the suite is rebuilt on any header change rather than
+# tracked dependency by dependency.
 $(BUILD)/test_main: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
-	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
+	@if [ -z "$(TEST_SRC)" ]; then echo "no tests/test_*.cpp"; exit 1; fi
 	$(CXX) $(CXXFLAGS_REL) $(TEST_SRC) $(LIB_SRC) -o $@
 
 $(BUILD)/test_main-debug: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
-	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
+	@if [ -z "$(TEST_SRC)" ]; then echo "no tests/test_*.cpp"; exit 1; fi
 	$(CXX) $(CXXFLAGS_DBG) $(TEST_SRC) $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
 
 test: $(BUILD)/test_main examples
