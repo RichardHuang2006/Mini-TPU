@@ -10,8 +10,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "datapath.h"
 #include "isa.h"
-#include "types.h"
 
 namespace tpuasm {
 

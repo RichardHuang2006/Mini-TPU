@@ -6,9 +6,11 @@
 // and the retired count.
 //
 // The arithmetic below deliberately shares no code with the timed model, with one
-// exception: quant.h. Two implementations that agree are evidence, one called twice
-// is not, but bit-exact requantization is a contract rather than an independent
-// guess, so both sides call the same helper on purpose.
+// exception: the quant:: helpers in datapath.h. Two implementations that agree are
+// evidence, one called twice is not, but bit-exact requantization is a contract
+// rather than an independent guess, so both sides call the same helper on purpose.
+// The activation functions and the pooling window walk are re-implemented here for
+// that same reason: they are evidence, not contract.
 
 #include <cstddef>
 #include <cstdint>
@@ -17,11 +19,8 @@
 #include <vector>
 
 #include "config.h"
-#include "decoder.h"
+#include "datapath.h"
 #include "isa.h"
-#include "quant.h"
-#include "tensor.h"
-#include "types.h"
 
 namespace ref {
 

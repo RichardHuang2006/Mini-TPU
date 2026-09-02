@@ -24,10 +24,9 @@
 #include <vector>
 
 #include "config.h"
+#include "datapath.h"
 #include "isa.h"
-#include "quant.h"
 #include "tpuasm.h"
-#include "types.h"
 
 namespace wl {
 

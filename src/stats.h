@@ -6,9 +6,9 @@
 #include <string>
 
 #include "config.h"
+#include "datapath.h"
 #include "isa.h"
 #include "tpu.h"
-#include "types.h"
 
 // Derived statistics for one run: utilization, effective TOPS, per-instruction
 // cycle counts, and a stall-cause breakdown attributing every idle array-cycle to

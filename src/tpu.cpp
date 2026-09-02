@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "quant.h"
+#include "datapath.h"
 
 Tpu::Tpu(const Config& cfg, std::size_t host_bytes, std::size_t weight_bytes)
     : cfg_(cfg), ub_(cfg), acc_(cfg), fifo_(cfg), dma_(cfg), mxu_(cfg),
@@ -438,8 +438,8 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
             i8 v = q;
             switch (d.act) {
                 case ActFn::IDENTITY: break;
-                case ActFn::RELU:     v = q < 0 ? i8{0} : q; break;
-                case ActFn::RELU6:    v = q < 0 ? i8{0} : (q > 6 ? i8{6} : q); break;
+                case ActFn::RELU:     v = quant::relu(q); break;
+                case ActFn::RELU6:    v = quant::relu6(q); break;
             }
             tile[static_cast<std::size_t>(r) * dim + c] = v;
         }
@@ -467,15 +467,13 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
                     const i8 v =
                         tile[static_cast<std::size_t>(orow * s + dr) * dim + (ocol * s + dc)];
                     sum += v;
-                    if (v > best) best = v;
+                    best = quant::pool_max(best, v);
                 }
             }
             // Average pooling rounds through the same helper as requantization, so
             // the two cannot drift apart on a tie.
             pw.ub_data[static_cast<std::size_t>(orow) * cols + ocol] =
-                d.pool == Pool::MAX
-                  ? best
-                  : quant::saturate(quant::round_div(sum, static_cast<int64_t>(w) * w));
+                d.pool == Pool::MAX ? best : quant::pool_avg(sum, w);
         }
     }
 }
@@ -696,6 +694,25 @@ void Tpu::charge_idle_cycle(const StallStats& before) {
     ++profile_.idle_other;
 }
 
+// The whole machine, one cycle per loop iteration. Reading from the top of the
+// loop, each cycle performs, in order:
+//
+//   1. completion:      retire_completed() finishes any unit whose work is done,
+//                       committing its staged outputs;
+//   2. scoreboard:      retiring clears the unit's reservation, so the hazards it
+//                       imposed vanish here;
+//   3. weight prefetch: prefetch_weights() reads ahead for upcoming Read_Weights
+//                       and keeps their DDR refills in flight;
+//   4. decode:          issue_step() decodes the instruction at the PC;
+//   5. hazard checks:   validate(), interlocked() and ub_port_available() decide
+//                       whether it may issue this cycle;
+//   6. issue:           at most one instruction issues per cycle;
+//   7. unit launch:     execute() computes the instruction's effect, stages its
+//                       writes, and occupies its unit for the duration;
+//   8. statistics:      the array-busy / idle-cause tallies for this cycle;
+//   9. advance:         the PC moved if the instruction issued, otherwise the
+//                       stall counter that blocked it moved; either way the
+//                       clock ticks and the units see the new time.
 TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
     TpuResult st;
     reset_pipeline();

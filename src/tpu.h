@@ -7,15 +7,12 @@
 #include <cstdio>
 #include <string>
 
-#include "accumulators.h"
 #include "config.h"
-#include "decoder.h"
-#include "dma.h"
+#include "datapath.h"
 #include "isa.h"
-#include "mxu.h"
-#include "types.h"
-#include "unified_buffer.h"
-#include "weight_fifo.h"
+#include "storage.h"
+#include "systolic_array.h"
+#include "transfer.h"
 
 // ---------------------------------------------------------------------------
 // The scoreboard's view of an instruction: which Unified Buffer bytes it reads

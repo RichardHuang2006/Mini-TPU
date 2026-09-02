@@ -10,7 +10,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-FILES=(src/tpu.cpp src/stats.h src/mxu.h src/quant.h src/weight_fifo.h tests/workloads.h)
+FILES=(src/tpu.cpp src/stats.h src/systolic_array.h src/datapath.h src/transfer.h tests/workloads.h)
 BACKUP=$(mktemp -d)
 for f in "${FILES[@]}"; do
     mkdir -p "$BACKUP/$(dirname "$f")"
@@ -121,7 +121,7 @@ mutate "read and write ports share one budget" src/tpu.cpp \
 # Mutating the prefetch loop's own `!fifo_.full()` guard would be an equivalent
 # mutant, since push_refill() rejects a full FIFO anyway and the loop breaks on that,
 # so the depth is removed at its source instead.
-mutate "the FIFO ignores its own depth" src/weight_fifo.h \
+mutate "the FIFO ignores its own depth" src/transfer.h \
     'bool full() const { return q_.size() >= depth_; }' \
     'bool full() const { return false; }'
 
@@ -130,7 +130,7 @@ mutate "Read_Weights does not wait for its tile" src/tpu.cpp \
     '    if (false) {'
 
 # --- timing -------------------------------------------------------------------
-mutate "weight load bubble always zero" src/mxu.h \
+mutate "weight load bubble always zero" src/systolic_array.h \
     'return cfg_.double_buffer ? 0u : cfg_.dim;' \
     'return 0u;'
 
@@ -139,15 +139,15 @@ mutate "activation charged per row, not per element" src/tpu.cpp \
     'return static_cast<uint64_t>(d.len) + cfg_.act_pipeline_depth;'
 
 # --- arithmetic ---------------------------------------------------------------
-mutate "requantize rounds half toward zero" src/quant.h \
+mutate "requantize rounds half toward zero" src/datapath.h \
     'return v >= 0 ? (v + half) >> shift : -((-v + half) >> shift);' \
     'return v >= 0 ? (v + half - 1) >> shift : -((-v + half - 1) >> shift);'
 
-mutate "requantize floors negatives" src/quant.h \
+mutate "requantize floors negatives" src/datapath.h \
     'return v >= 0 ? (v + half) >> shift : -((-v + half) >> shift);' \
     'return (v + half) >> shift;'
 
-mutate "saturation clamps only the top" src/quant.h \
+mutate "saturation clamps only the top" src/datapath.h \
     '    if (v < I8_MIN) return static_cast<i8>(I8_MIN);' \
     '    if (false) return static_cast<i8>(I8_MIN);'
 

@@ -15,19 +15,13 @@
 #include <utility>
 #include <vector>
 
-#include "types.h"
 #include "config.h"
-#include "tensor.h"
-#include "quant.h"
+#include "datapath.h"
 #include "isa.h"
-#include "decoder.h"
 #include "loader.h"
-#include "pe.h"
-#include "mxu.h"
-#include "unified_buffer.h"
-#include "accumulators.h"
-#include "weight_fifo.h"
-#include "dma.h"
+#include "systolic_array.h"
+#include "storage.h"
+#include "transfer.h"
 #include "tpu.h"
 #include "stats.h"
 #include "tpuasm.h"

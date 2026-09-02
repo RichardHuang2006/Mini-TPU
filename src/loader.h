@@ -10,9 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "datapath.h"
 #include "isa.h"
-#include "tensor.h"
-#include "types.h"
 
 // Program and tensor input. Each entry point takes a stream so tests can drive
 // it from a string and the CLI from a file.

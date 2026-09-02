@@ -6,14 +6,94 @@
 #include <vector>
 
 #include "config.h"
-#include "pe.h"
-#include "tensor.h"
-#include "types.h"
+#include "datapath.h"
+
+// The weight-stationary systolic array: one processing element (Pe), and the
+// matrix unit (Mxu) that clocks a dim x dim grid of them cycle by cycle.
+//
+// To trace one value through the array:
+//
+//   * an activation enters the left edge of its row, moves one PE to the right
+//     per cycle, and falls off the right edge;
+//   * a weight stays put in its PE for the whole matmul (that is what
+//     "weight-stationary" means), having been shifted in by a weight load;
+//   * a partial sum starts as zero at the top of a column, gains one product
+//     at every PE it passes, moves one PE down per cycle, and leaves the
+//     bottom edge as a finished int32 dot product.
+
+// ============================================================================
+// Processing element
+// ============================================================================
+
+// One processing element: a stationary weight, one int8 x int8 -> int32 MAC, and
+// registered pass-throughs for the activation (left to right) and the partial
+// sum (top to bottom).
+//
+//         act_in ->--+-------> act_out (next cycle)
+//                    |
+//                  [ w ]  <- stationary weight
+//                    |
+//    psum_in v-------+------v psum_out = psum_in + act_in * w
+//
+// Both outputs are registered, so a value handed to tick() reaches the
+// neighbours only on the following cycle. That one-cycle-per-hop delay is what
+// the activation skew in Mxu::matmul is computed against; combinational
+// forwarding would let one activation sweep the whole array in a single cycle.
+//
+// Updating is split into tick() and commit() so every PE reads its neighbours'
+// registers as of the start of the cycle. Fusing the two would leak PE visit
+// order into the results.
+class Pe {
+public:
+    // An active plane and a shadow plane, so a tile can be loaded while the
+    // other one is still multiplying.
+    static constexpr uint32_t PLANES = 2;
+
+    void set_weight(i8 w, uint32_t plane) { w_[plane] = w; }
+    i8   weight(uint32_t plane) const { return w_[plane]; }
+
+    // The registered outputs, as of the start of the current cycle.
+    i8  act_out() const { return act_; }
+    i32 psum_out() const { return psum_; }
+
+    // Multiply-accumulate into the pending half of the registers.
+    //
+    // int32 accumulation matches the width the hardware carries down a column.
+    // One column of a dim-deep array sums dim products of magnitude at most
+    // 128*128, so overflow would need a dim in the millions; UBSan reports it
+    // rather than letting the result wrap silently.
+    void tick(i8 act_in, i32 psum_in, uint32_t plane) {
+        act_next_  = act_in;
+        psum_next_ = psum_in + static_cast<i32>(act_in) * static_cast<i32>(w_[plane]);
+    }
+
+    // Latch what tick() computed.
+    void commit() {
+        act_  = act_next_;
+        psum_ = psum_next_;
+    }
+
+    // Drops in-flight data but keeps the weights: weights are loaded by their
+    // own instruction and outlive any single matmul.
+    void clear_pipeline() {
+        act_  = act_next_  = 0;
+        psum_ = psum_next_ = 0;
+    }
+
+private:
+    i8  w_[PLANES] = {0, 0};
+    i8  act_ = 0,  act_next_ = 0;
+    i32 psum_ = 0, psum_next_ = 0;
+};
+
+// ============================================================================
+// Matrix unit
+// ============================================================================
 
 // The matrix unit: a dim x dim grid of weight-stationary processing elements,
 // clocked one cycle at a time.
 //
-// Layout, matching the contract fixed in ref.h:
+// Layout, matching the contract fixed in tests/ref.h:
 //
 //   PE[k][c] holds W[k][c]. Activations enter the left edge and travel right;
 //   partial sums travel down and leave the bottom edge. Column c therefore
@@ -24,6 +104,22 @@
 // fixes, that vector is a row of the len x dim activation block. This file
 // follows ref.h, so `len` counts rows and the fill/drain formula N + 2*dim - 1
 // is written with N = len.
+//
+// Why a matmul over `len` rows occupies the array for exactly
+//
+//     len + 2*dim - 1
+//
+// cycles under this schedule: one input row is admitted per cycle, and row r's
+// element for PE row k enters k cycles after the row itself starts -- that is
+// the activation skew, which makes all dim products of one output element meet
+// the descending partial sum in the right PE on the right cycle. Row r's
+// partial sum for column c then takes dim hops to descend the column and c
+// hops of skew to reach that column, so its last element (column dim-1)
+// leaves the bottom edge at cycle r + (dim - 1) + dim = r + 2*dim - 1,
+// counting from the start of the stream. The final row is r = len - 1, whose
+// last element lands after len - 1 + 2*dim - 1 complete cycles, so the array
+// is occupied for (len - 1 + 2*dim - 1) + 1 = len + 2*dim - 1 cycles: `len`
+// cycles of streaming plus 2*dim - 1 cycles of fill and drain overhead.
 
 // When each part of a matmul finished, in absolute array cycles.
 struct MxuTiming {

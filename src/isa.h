@@ -2,9 +2,13 @@
 
 #include <cassert>
 #include <cstdint>
+#include <string>
 
-#include "types.h"
+#include "datapath.h"
 
+// The CISC instruction set: the opcode enum, the fixed six-word encoding and
+// its field layout, the encoder, the decoder, and the disassembler.
+//
 // Fixed-width instructions: one opcode/flag word plus five operand words. No
 // field straddles a word boundary, so an encoding is legible in a hex dump and a
 // decode is a field extraction rather than bit-stitching. Instructions are whole
@@ -27,6 +31,19 @@
 //   ACTIVATE      acc_bank, ub_dst, len, bias, multiplier
 //   HALT          code
 //   SYNC / NOP    none
+
+// One opcode per whole-tensor operation; this class drives every dispatch
+// decision from the sequencer onward.
+enum class Op : uint8_t {
+    READ_HOST,      // DMA host -> Unified Buffer
+    READ_WEIGHTS,   // stage a weight tile into the weight FIFO / shadow plane
+    MATMUL,         // stream activations through the array into an accumulator
+    ACTIVATE,       // bias, requantize, activation function, optional pool
+    WRITE_HOST,     // DMA Unified Buffer -> host
+    SYNC,           // barrier: stall issue until all in-flight ops retire
+    NOP,            // no operation
+    HALT,           // stop the machine (also the illegal-opcode trap)
+};
 
 inline constexpr uint32_t ISA_WORDS      = 6;
 inline constexpr uint32_t ISA_INST_BYTES = ISA_WORDS * 4;
@@ -143,6 +160,15 @@ inline RawInst encode(const Decoded& d) {
     }
     return r;
 }
+
+// Wire form to field form. The only failure mode is an opcode outside the
+// defined set, which decodes to a trapping HALT: a malformed program stops the
+// machine rather than running on undefined state.
+Decoded decode(const RawInst& raw);
+
+// One line per instruction, operands named rather than positional so a listing
+// can be read without the encoding table.
+std::string disasm(const Decoded& d);
 
 inline const char* op_name(Op op) {
     switch (op) {
