@@ -102,10 +102,12 @@ clean:
 
 help:
 	@echo "Mini-TPU targets:"
-	@echo "  all      build/minitpu         (release, -O2, warnings on)"
-	@echo "  debug    build/minitpu-debug   (ASan + UBSan, -O1 -g) + run the suite sanitized"
-	@echo "  test     compile+run tests/test_main after regenerating examples/"
-	@echo "  clean    remove build/ and examples/"
+	@echo "  all       build/minitpu         (release, -O2, warnings on)"
+	@echo "  debug     build/minitpu-debug   (ASan + UBSan, -O1 -g) + run the suite sanitized"
+	@echo "  test      compile+run the test suite after regenerating examples/"
+	@echo "  examples  write the bundled workloads to examples/"
+	@echo "  report    regenerate the performance tables from the model"
+	@echo "  clean     remove build/ and examples/"
 
 # Auto-generated header dependencies.
 -include $(TPU_OBJ:.o=.d) $(DBG_OBJ:.o=.d)
