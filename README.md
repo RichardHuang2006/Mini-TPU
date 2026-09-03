@@ -41,7 +41,7 @@ the distinction:
 | Scoreboard state | regions and banks reserved by in-flight instructions | stall counters that must fire (or must not) |
 | Performance statistics | derived reporting: utilization, TOPS, roofline | balance invariants and starvation experiments |
 
-## 2. Resume-level feature summary
+## 2. Feature summary
 
 - **Weight-stationary systolic array** of `dim x dim` int8 processing elements,
   each holding a stationary weight and performing one int8 x int8 -> int32
