@@ -155,6 +155,33 @@ struct MxuStats {
     uint64_t partial_tile_waste = 0;
 };
 
+class Mxu;
+
+// An observer of the array's internal steps, for tracing. Every hook only
+// reads registers; the defaults do nothing, and a null observer costs one
+// branch per step, so a run without one is unchanged.
+struct MxuObserver {
+    virtual ~MxuObserver() = default;
+
+    // Once per matmul, after any pending plane switch has been resolved.
+    virtual void on_matmul_begin(const Mxu& mxu, uint32_t len, uint32_t plane, bool switched) {
+        (void)mxu; (void)len; (void)plane; (void)switched;
+    }
+
+    // A finished partial sum left the bottom edge at column c during step s,
+    // for output row `row`. `v` is the value the PE presented, `dst_after` the
+    // staged output element after it was written (overwrite or accumulate).
+    virtual void on_landing(uint64_t s, uint32_t c, uint32_t row, i32 v, i32 dst_after) {
+        (void)s; (void)c; (void)row; (void)v; (void)dst_after;
+    }
+
+    // After step s committed and its landings were reported. `left` holds the
+    // dim values fed into the left edge during this step, one per PE row.
+    virtual void on_step(const Mxu& mxu, uint64_t s, const i8* left) {
+        (void)mxu; (void)s; (void)left;
+    }
+};
+
 class Mxu {
 public:
     explicit Mxu(const Config& cfg)
@@ -165,6 +192,10 @@ public:
     uint32_t dim() const { return cfg_.dim; }
     uint64_t cycle() const { return cycle_; }
     const MxuStats& stats() const { return stats_; }
+
+    // Registered outputs of one PE as of the start of the current step.
+    i8  pe_act(uint32_t k, uint32_t c) const { return pe(k, c).act_out(); }
+    i32 pe_psum(uint32_t k, uint32_t c) const { return pe(k, c).psum_out(); }
 
     uint32_t active_plane() const { return active_; }
 
@@ -228,8 +259,10 @@ public:
     }
 
     // Stream `acts` (len x dim, A[r][k]) through the resident tile and de-skew
-    // the results into `out` (at least len rows x dim columns of int32).
-    MxuTiming matmul(const ConstI8View& acts, const I32View& out, bool accumulate);
+    // the results into `out` (at least len rows x dim columns of int32). An
+    // observer, if given, sees every step.
+    MxuTiming matmul(const ConstI8View& acts, const I32View& out, bool accumulate,
+                     MxuObserver* obs = nullptr);
 
     void clear_pipeline() {
         for (Pe& p : pe_) p.clear_pipeline();
@@ -274,7 +307,8 @@ private:
     MxuStats stats_;
 };
 
-inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool accumulate) {
+inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool accumulate,
+                             MxuObserver* obs) {
     const uint32_t dim = cfg_.dim;
     const uint32_t len = acts.rows();
     assert(acts.cols() == dim);
@@ -283,6 +317,7 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
     // A shadow load becomes active here, instantaneously. That is the benefit of
     // the second plane: the switch costs nothing, because the dim cycles of
     // weight shifting happened while the previous matmul was still running.
+    const bool switched = pending_;
     if (pending_) {
         active_  = 1u - active_;
         pending_ = false;
@@ -290,12 +325,16 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
     }
 
     const uint32_t plane = active_;
+    if (obs) obs->on_matmul_begin(*this, len, plane, switched);
 
     MxuTiming t;
     t.start  = cycle_;
     t.cycles = static_cast<uint64_t>(len) + 2ull * dim - 1ull;
     t.end    = t.start + t.cycles;
     t.row_valid.assign(len, 0);
+
+    std::vector<i8> left_edge;
+    if (obs) left_edge.assign(dim, 0);
 
     for (uint64_t s = 0; s < t.cycles; ++s) {
         // First, every PE reads its neighbours as of the start of the cycle.
@@ -308,6 +347,7 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
                 const uint64_t r = s - k;
                 if (r < len) left = acts.at(static_cast<uint32_t>(r), k);
             }
+            if (obs) left_edge[k] = left;
             for (uint32_t c = 0; c < dim; ++c) {
                 const i8  act_in  = (c == 0) ? left : pe(k, c - 1).act_out();
                 const i32 psum_in = (k == 0) ? 0 : pe(k - 1, c).psum_out();
@@ -331,10 +371,13 @@ inline MxuTiming Mxu::matmul(const ConstI8View& acts, const I32View& out, bool a
             const i32      v   = pe(dim - 1, c).psum_out();
             i32&           dst = out.at(row, c);
             dst = accumulate ? static_cast<i32>(dst + v) : v;
+            if (obs) obs->on_landing(s, c, row, v, dst);
 
             // The row is complete once its last column has landed.
             if (c == dim - 1) t.row_valid[row] = t.start + s + 1;
         }
+
+        if (obs) obs->on_step(*this, s, left_edge.data());
     }
 
     const uint64_t slots = static_cast<uint64_t>(len) * dim * dim;

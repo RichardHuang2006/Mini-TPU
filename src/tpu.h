@@ -43,6 +43,49 @@ struct Reservation {
 // concurrency model. SEQ covers the instructions with no unit of their own.
 enum class Unit : uint8_t { DMA, WEIGHT, MXU, ACT, SEQ, COUNT };
 
+inline const char* unit_name(Unit u) {
+    switch (u) {
+        case Unit::DMA:    return "DMA";
+        case Unit::WEIGHT: return "WEIGHT";
+        case Unit::MXU:    return "MXU";
+        case Unit::ACT:    return "ACT";
+        case Unit::SEQ:    return "SEQ";
+        case Unit::COUNT:  break;
+    }
+    return "?";
+}
+
+// Why one issue attempt failed. Each value names the StallStats counter that
+// moved; a trace records one of these per cycle that issued nothing.
+enum class StallReason : uint8_t {
+    NONE,
+    DRAIN,
+    UNIT_BUSY,
+    WEIGHT_FIFO_EMPTY,
+    UB_RAW,
+    UB_WAR,
+    UB_WAW,
+    ACCUM_HAZARD,
+    WEIGHT_STALL,
+    UB_BANK_CONFLICT,
+};
+
+inline const char* stall_reason_name(StallReason r) {
+    switch (r) {
+        case StallReason::NONE:              return "none";
+        case StallReason::DRAIN:             return "drain";
+        case StallReason::UNIT_BUSY:         return "unit_busy";
+        case StallReason::WEIGHT_FIFO_EMPTY: return "weight_fifo_empty";
+        case StallReason::UB_RAW:            return "ub_raw";
+        case StallReason::UB_WAR:            return "ub_war";
+        case StallReason::UB_WAW:            return "ub_waw";
+        case StallReason::ACCUM_HAZARD:      return "accum_hazard";
+        case StallReason::WEIGHT_STALL:      return "weight_stall";
+        case StallReason::UB_BANK_CONFLICT:  return "ub_bank_conflict";
+    }
+    return "?";
+}
+
 // An instruction reads its inputs at issue and commits its outputs at retire.
 // The gap makes the scoreboard matter for data as well as for the schedule: a
 // consumer allowed to issue too early reads state its producer has not replaced
@@ -62,6 +105,7 @@ struct PendingWrite {
 struct InFlight {
     bool         active      = false;
     Op           op          = Op::NOP;
+    std::size_t  pc          = 0;      // which instruction this is, for tracing
     Reservation  res;
     PendingWrite pending;
     uint64_t     issue_cycle = 0;
@@ -150,10 +194,17 @@ struct TpuResult {
     bool done() const { return halted || trapped; }
 };
 
+// Structured trace observer and its per-cycle record, defined in src/trace.h.
+// A null sink means no tracing, and every hook site is guarded on that, so a
+// run without a sink is the same run as before the hooks existed.
+struct TraceSink;
+struct CycleInfo;
+
 struct TpuOptions {
     uint64_t   max_cycles = 10'000'000;   // runaway backstop
     bool       trace      = false;
     std::FILE* trace_out  = stderr;
+    TraceSink* sink       = nullptr;
 };
 
 // The machine: the MXU, the Unified Buffer, the accumulator banks, the weight
@@ -179,9 +230,23 @@ public:
 
     const UnifiedBuffer& ub() const { return ub_; }
     const Accumulators&  acc() const { return acc_; }
+    const WeightFifo&    weight_fifo() const { return fifo_; }
+    const Dma&           dma() const { return dma_; }
+    const Mxu&           mxu() const { return mxu_; }
 
     std::vector<uint8_t>& host() { return host_; }
     std::vector<i8>&      weight_mem() { return weight_mem_; }
+
+    const std::vector<uint8_t>& host() const { return host_; }
+    const std::vector<i8>&      weight_mem() const { return weight_mem_; }
+
+    // Read-only views of the sequencer's state, for a trace sink.
+    const InFlight& unit(Unit u) const { return slot(u); }
+    std::size_t     prefetch_pc() const { return prefetch_pc_; }
+
+    // How many in-flight instructions hold a Unified Buffer read stream and how
+    // many a write stream: the quantities the port model budgets.
+    void ub_streams(uint32_t& readers, uint32_t& writers) const;
 
     // One cycle. Stages are evaluated in reverse pipeline order so each observes
     // the previous cycle's output of its producer, making the inter-stage
@@ -244,8 +309,9 @@ private:
     const InFlight& slot(Unit u) const { return units_[static_cast<std::size_t>(u)]; }
 
     // Does anything in flight conflict with this reservation? Bumps the matching
-    // stall counter and returns true.
-    bool interlocked(const Reservation& r);
+    // stall counter, names the reason and the unit that held the conflicting
+    // reservation, and returns true.
+    bool interlocked(const Reservation& r, StallReason& why, Unit& blocker);
 
     // Is there a free Unified Buffer port for this instruction's stream?
     //
@@ -282,6 +348,9 @@ private:
     // stood before this cycle's issue attempt.
     void charge_idle_cycle(const StallStats& before);
 
+    // The per-cycle trace record, sampled after the accounting step.
+    CycleInfo cycle_info(const RunProfile& before, const TpuResult& st) const;
+
     Config cfg_;
 
     UnifiedBuffer ub_;
@@ -302,4 +371,13 @@ private:
     InFlight   units_[static_cast<std::size_t>(Unit::COUNT)];
     StallStats stalls_;
     RunProfile profile_;
+
+    // Tracing. The sink is set for the duration of run(); the rest records the
+    // outcome of the current cycle's issue attempt for the per-cycle hook.
+    TraceSink*  sink_            = nullptr;
+    bool        last_issued_     = false;
+    bool        last_trapped_    = false;
+    StallReason last_reason_     = StallReason::NONE;
+    Unit        last_blocker_    = Unit::COUNT;
+    std::size_t last_blocker_pc_ = 0;
 };

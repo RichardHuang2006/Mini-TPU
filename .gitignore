@@ -1,2 +1,5 @@
 build/
 examples/
+
+# Generated trace containers (make trace); the small one ships embedded as viz/traces/matmul_8.js
+viz/traces/*.mtpt

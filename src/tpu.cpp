@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "datapath.h"
+#include "trace.h"
 
 Tpu::Tpu(const Config& cfg, std::size_t host_bytes, std::size_t weight_bytes)
     : cfg_(cfg), ub_(cfg), acc_(cfg), fifo_(cfg), dma_(cfg), mxu_(cfg),
@@ -288,17 +289,23 @@ uint64_t Tpu::duration_of(const Decoded& d) const {
     return 1;
 }
 
+void Tpu::ub_streams(uint32_t& readers, uint32_t& writers) const {
+    readers = 0;
+    writers = 0;
+    for (const InFlight& f : units_) {
+        if (!f.active) continue;
+        if (!f.res.ub_read.empty())  ++readers;
+        if (!f.res.ub_write.empty()) ++writers;
+    }
+}
+
 bool Tpu::ub_port_available(const Reservation& r) {
     const bool wants_read  = !r.ub_read.empty();
     const bool wants_write = !r.ub_write.empty();
     if (!wants_read && !wants_write) return true;
 
     uint32_t readers = 0, writers = 0;
-    for (const InFlight& f : units_) {
-        if (!f.active) continue;
-        if (!f.res.ub_read.empty())  ++readers;
-        if (!f.res.ub_write.empty()) ++writers;
-    }
+    ub_streams(readers, writers);
 
     if ((wants_read && readers >= cfg_.ub_banks) ||
         (wants_write && writers >= cfg_.ub_banks)) {
@@ -309,27 +316,33 @@ bool Tpu::ub_port_available(const Reservation& r) {
     return true;
 }
 
-bool Tpu::interlocked(const Reservation& r) {
-    for (const InFlight& f : units_) {
+bool Tpu::interlocked(const Reservation& r, StallReason& why, Unit& blocker) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(Unit::COUNT); ++i) {
+        const InFlight& f = units_[i];
         if (!f.active) continue;
+        blocker = static_cast<Unit>(i);
 
         // A reader waits for the writer of its region; a writer waits for both
         // readers and writers. WAR matters even though effects land at issue,
         // because the array streams activations out of the buffer over many cycles
         // and a DMA overwriting that region early would corrupt a real machine.
         // Being conservative here can cost overlap but never correctness.
-        if (r.ub_read.overlaps(f.res.ub_write))  { ++stalls_.ub_raw; return true; }
-        if (r.ub_write.overlaps(f.res.ub_read))  { ++stalls_.ub_war; return true; }
-        if (r.ub_write.overlaps(f.res.ub_write)) { ++stalls_.ub_waw; return true; }
+        if (r.ub_read.overlaps(f.res.ub_write))  { ++stalls_.ub_raw; why = StallReason::UB_RAW; return true; }
+        if (r.ub_write.overlaps(f.res.ub_read))  { ++stalls_.ub_war; why = StallReason::UB_WAR; return true; }
+        if (r.ub_write.overlaps(f.res.ub_write)) { ++stalls_.ub_waw; why = StallReason::UB_WAW; return true; }
 
         const bool acc_conflict =
             (r.acc_read != INVALID_BANK && r.acc_read == f.res.acc_write) ||
             (r.acc_write != INVALID_BANK && (r.acc_write == f.res.acc_write ||
                                              r.acc_write == f.res.acc_read));
-        if (acc_conflict) { ++stalls_.accum_hazard; return true; }
+        if (acc_conflict) { ++stalls_.accum_hazard; why = StallReason::ACCUM_HAZARD; return true; }
 
         // A MatMul needs the tile its Read_Weights was fetching.
-        if (r.reads_weights && f.res.writes_weights) { ++stalls_.weight_stall; return true; }
+        if (r.reads_weights && f.res.writes_weights) {
+            ++stalls_.weight_stall;
+            why = StallReason::WEIGHT_STALL;
+            return true;
+        }
 
         // And a Read_Weights must not overwrite the tile a running MatMul is still
         // multiplying by, unless there is a shadow plane to put it in. The entire
@@ -337,10 +350,17 @@ bool Tpu::interlocked(const Reservation& r) {
         // a special case elsewhere.
         if (r.writes_weights && f.res.reads_weights && !cfg_.double_buffer) {
             ++stalls_.weight_stall;
+            why = StallReason::WEIGHT_STALL;
             return true;
         }
-        if (r.writes_weights && f.res.writes_weights) { ++stalls_.weight_stall; return true; }
+        if (r.writes_weights && f.res.writes_weights) {
+            ++stalls_.weight_stall;
+            why = StallReason::WEIGHT_STALL;
+            return true;
+        }
     }
+    why     = StallReason::NONE;
+    blocker = Unit::COUNT;
     return false;
 }
 
@@ -403,7 +423,7 @@ uint64_t Tpu::execute(const Decoded& d, PendingWrite& pw) {
             if (d.accumulate) out.copy_from(acc_.bank(d.acc_bank).tile(0, 0, d.len, dim));
 
             const ConstI8View acts = ub_.view(d.ub_addr, d.len, dim, dim);
-            const MxuTiming   t    = mxu_.matmul(acts, out, d.accumulate);
+            const MxuTiming   t    = mxu_.matmul(acts, out, d.accumulate, sink_);
             duration               = t.cycles;
             break;
         }
@@ -479,6 +499,8 @@ void Tpu::stage_activate(const Decoded& d, PendingWrite& pw) {
 }
 
 void Tpu::finish(InFlight& f) {
+    if (sink_) sink_->on_retire(*this, cycle_, static_cast<Unit>(&f - units_), f);
+
     // Commit the staged outputs. Until now, a consumer that issued too early would
     // have read the state this instruction is replacing.
     const PendingWrite& pw = f.pending;
@@ -500,7 +522,9 @@ void Tpu::finish(InFlight& f) {
         // instruction's duration.
         WeightTile t;
         if (fifo_.pop(t)) {
+            const uint32_t plane = mxu_.load_plane();
             mxu_.load_weights_untimed(t.view());
+            if (sink_) sink_->on_weight_load(*this, cycle_, f.pc, t, plane, mxu_.switch_pending());
         } else {
             // Unreachable: the duration covers the DDR latency, so the tile is
             // always ready by now. Counted rather than ignored so a change breaking
@@ -525,13 +549,46 @@ void Tpu::retire_completed(TpuResult& st) {
 
 void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
                      const TpuOptions& opts) {
+    last_issued_     = false;
+    last_trapped_    = false;
+    last_reason_     = StallReason::NONE;
+    last_blocker_    = Unit::COUNT;
+    last_blocker_pc_ = 0;
+
+    // A failed attempt records its reason once, here, so a trace and the stall
+    // counters cannot disagree. A drain names the unit that retires last, since
+    // that is what the barrier is waiting for.
+    auto stall = [&](StallReason why, Unit blocker, const Decoded* d) {
+        if (why == StallReason::DRAIN) {
+            uint64_t latest = 0;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(Unit::COUNT); ++i) {
+                if (units_[i].active && units_[i].done_cycle >= latest) {
+                    latest  = units_[i].done_cycle;
+                    blocker = static_cast<Unit>(i);
+                }
+            }
+        }
+        last_reason_     = why;
+        last_blocker_    = blocker;
+        last_blocker_pc_ = blocker != Unit::COUNT ? slot(blocker).pc : 0;
+        if (sink_) {
+            sink_->on_stall(*this, cycle_, st.pc, d ? *d : Decoded{}, why, last_blocker_,
+                            last_blocker_pc_);
+        }
+    };
+    auto trap = [&](const std::string& reason) {
+        last_trapped_ = true;
+        if (sink_) sink_->on_trap(*this, cycle_, st.pc, reason);
+    };
+
     if (st.pc >= prog.size()) {
         // A well-formed program ends in Halt. Wait for the machine to go quiet
         // first, so the retired count and final state match what the oracle
         // reports for the same program.
-        if (!quiet()) { ++stalls_.drain; return; }
+        if (!quiet()) { ++stalls_.drain; stall(StallReason::DRAIN, Unit::COUNT, nullptr); return; }
         st.trapped     = true;
         st.trap_reason = "ran past the end of the program";
+        trap(st.trap_reason);
         return;
     }
 
@@ -545,31 +602,37 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     if (!ok) {
         // Everything before this instruction must retire before the trap is
         // reported, for the same reason as above.
-        if (!quiet()) { ++stalls_.drain; return; }
+        if (!quiet()) { ++stalls_.drain; stall(StallReason::DRAIN, Unit::COUNT, &d); return; }
         st.trapped     = true;
         st.trap_reason = why;
         ++st.retired;
+        trap(why);
         return;
     }
 
     // A barrier and a halt both need the machine quiet.
     if (d.op == Op::SYNC || d.op == Op::HALT) {
-        if (!quiet()) { ++stalls_.drain; return; }
+        if (!quiet()) { ++stalls_.drain; stall(StallReason::DRAIN, Unit::COUNT, &d); return; }
     }
 
     const Unit u = unit_of(d.op);
-    if (slot(u).active) { ++stalls_.unit_busy; return; }
+    if (slot(u).active) { ++stalls_.unit_busy; stall(StallReason::UNIT_BUSY, u, &d); return; }
 
     // The tile has to have arrived from DDR. With a deep enough FIFO the
     // prefetcher stays far enough ahead that it always has; with a shallow one this
     // is where the array waits on memory.
     if (d.op == Op::READ_WEIGHTS && fifo_.empty()) {
         ++stalls_.weight_fifo_empty;
+        stall(StallReason::WEIGHT_FIFO_EMPTY, Unit::COUNT, &d);
         return;
     }
 
-    if (interlocked(res)) return;
-    if (!ub_port_available(res)) return;
+    {
+        StallReason reason  = StallReason::NONE;
+        Unit        blocker = Unit::COUNT;
+        if (interlocked(res, reason, blocker)) { stall(reason, blocker, &d); return; }
+    }
+    if (!ub_port_available(res)) { stall(StallReason::UB_BANK_CONFLICT, Unit::COUNT, &d); return; }
 
     if (opts.trace && opts.trace_out) {
         std::fprintf(opts.trace_out, "%8llu  issue %4zu: %s\n",
@@ -594,6 +657,9 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
         profile_.macs_performed += static_cast<uint64_t>(d.len) * cfg_.dim * cfg_.dim;
     }
 
+    last_issued_ = true;
+    if (sink_) sink_->on_issue(*this, cycle_, st.pc, d, u, res, duration, pw);
+
     ++st.pc;
 
     // Halt stops the machine here rather than occupying a unit: it only issued
@@ -603,6 +669,7 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
         st.halted    = true;
         st.exit_code = d.code;
         ++st.retired;
+        if (sink_) sink_->on_halt(*this, cycle_, st.pc - 1, d.code);
         ++cycle_;
         return;
     }
@@ -610,6 +677,7 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
     InFlight& f   = slot(u);
     f.active      = true;
     f.op          = d.op;
+    f.pc          = st.pc - 1;
     f.res         = res;
     f.pending     = std::move(pw);
     f.issue_cycle = cycle_;
@@ -621,6 +689,7 @@ void Tpu::issue_step(const std::vector<RawInst>& prog, TpuResult& st,
         TpuSnapshot s;
         s.acc = acc_.raw();
         st.syncs.push_back(std::move(s));
+        if (sink_) sink_->on_sync(*this, cycle_, st.pc - 1, st.syncs.size() - 1);
     }
 }
 
@@ -654,8 +723,43 @@ void Tpu::prefetch_weights(const std::vector<RawInst>& prog) {
         t.data.assign(weight_mem_.begin() + d.ddr_addr,
                       weight_mem_.begin() + d.ddr_addr + static_cast<std::ptrdiff_t>(need));
         if (!fifo_.push_refill(t, cycle_)) break;
+        if (sink_) {
+            sink_->on_prefetch(*this, cycle_, prefetch_pc_, t, cycle_ + fifo_.latency(),
+                               fifo_.occupancy());
+        }
         ++prefetch_pc_;
     }
+}
+
+CycleInfo Tpu::cycle_info(const RunProfile& before, const TpuResult& st) const {
+    CycleInfo ci;
+    ci.pc         = last_issued_ ? st.pc - 1 : st.pc;
+    ci.issued     = last_issued_;
+    ci.trapped    = last_trapped_;
+    ci.halted     = st.halted;
+    ci.reason     = last_reason_;
+    ci.blocker    = last_blocker_;
+    ci.blocker_pc = last_blocker_pc_;
+
+    // Which tally the accounting step moved: the busy count or one idle bucket.
+    const RunProfile& p = profile_;
+    if      (p.array_busy   != before.array_busy)   ci.idle_bucket = 0;
+    else if (p.idle_weights != before.idle_weights) ci.idle_bucket = 1;
+    else if (p.idle_bank    != before.idle_bank)    ci.idle_bucket = 2;
+    else if (p.idle_accum   != before.idle_accum)   ci.idle_bucket = 3;
+    else if (p.idle_dma     != before.idle_dma)     ci.idle_bucket = 4;
+    else if (p.idle_act     != before.idle_act)     ci.idle_bucket = 5;
+    else                                             ci.idle_bucket = 6;
+
+    for (std::size_t i = 0; i < static_cast<std::size_t>(Unit::COUNT); ++i) {
+        if (units_[i].active) ci.units_active |= static_cast<uint8_t>(1u << i);
+    }
+    ci.fifo_occ   = fifo_.occupancy();
+    ci.fifo_ready = fifo_.ready();
+    ub_streams(ci.ub_readers, ci.ub_writers);
+    ci.plane   = mxu_.active_plane();
+    ci.pending = mxu_.switch_pending();
+    return ci;
 }
 
 void Tpu::reset_pipeline() {
@@ -716,6 +820,8 @@ void Tpu::charge_idle_cycle(const StallStats& before) {
 TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
     TpuResult st;
     reset_pipeline();
+    sink_ = opts.sink;
+    if (sink_) sink_->on_run_begin(*this);
 
     const uint64_t start = cycle_;
     while (!st.done()) {
@@ -724,12 +830,18 @@ TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
             break;
         }
 
+        // This iteration's cycle. Halt advances cycle_ itself, so the number is
+        // captured before anything can move it.
+        const uint64_t t = cycle_;
+
         retire_completed(st);
         if (st.done()) break;
 
         prefetch_weights(prog);
 
         const StallStats before = stalls_;
+        RunProfile       profile_before;
+        if (sink_) profile_before = profile_;
         issue_step(prog, st, opts);
 
         // Sampled after issue, so the cycle a matmul starts on counts as busy and
@@ -738,6 +850,8 @@ TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
         // charged for it.
         if (slot(Unit::MXU).active) ++profile_.array_busy;
         else                        charge_idle_cycle(before);
+
+        if (sink_) sink_->on_cycle_end(*this, t, cycle_info(profile_before, st));
 
         if (st.done()) break;
 
@@ -749,5 +863,7 @@ TpuResult Tpu::run(const std::vector<RawInst>& prog, const TpuOptions& opts) {
 
     st.cycles = cycle_ - start;
     pc_       = st.pc;
+    if (sink_) sink_->on_run_end(*this, st);
+    sink_ = nullptr;
     return st;
 }

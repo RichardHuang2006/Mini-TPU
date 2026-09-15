@@ -77,6 +77,28 @@ $(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
 report: $(BUILD)/report
 	@./$(BUILD)/report
 
+# ----------------------------------------------------------------- trace ---
+# The trace generator instruments a run through the TraceSink in src/trace.h
+# and writes the .mtpt containers the visualizer under viz/ opens. It checks
+# that tracing left the run unchanged and that the trace agrees with the
+# oracle, the golden loops and itself, and fails if any check does.
+TRACE_SRC = tools/tracegen.cpp
+TRACE_DIR = viz/traces
+
+$(BUILD)/tracegen: $(TRACE_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
+	$(CXX) $(CXXFLAGS_REL) $(TRACE_SRC) $(LIB_SRC) -o $@
+
+trace: $(BUILD)/tracegen examples
+	@mkdir -p $(TRACE_DIR)
+	./$(BUILD)/tracegen --small --out $(TRACE_DIR)/matmul_8.mtpt
+	./$(BUILD)/tracegen --prog examples/matmul_128.hex \
+	    --acts examples/matmul_128.acts.mtpu --weights examples/matmul_128.weights.mtpu \
+	    --expect examples/matmul_128.expect.mtpu --layer 128,128,128 \
+	    --dim 32 --ub 262144 --acc-banks 4 --macs 2097152 \
+	    --out $(TRACE_DIR)/matmul_128.mtpt
+	python3 viz/check_trace.py $(TRACE_DIR)/matmul_8.mtpt $(TRACE_DIR)/matmul_128.mtpt
+	python3 viz/embed_small.py $(TRACE_DIR)/matmul_8.mtpt viz/traces/matmul_8.js
+
 # ------------------------------------------------------------------ test ---
 # One translation unit per subsystem (tests/test_*.cpp), linked into a single
 # binary whose main() lives in tests/test_main.cpp. Every TU pulls in nearly
