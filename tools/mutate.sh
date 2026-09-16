@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Mutation harness: break the model on purpose, one edit at a time, and check that
-# the test suite notices. A surviving mutation is a gap in the tests.
-#
-#   tools/mutate.sh          run every mutation
-#
-# Each mutation is a file, a literal to find, and a replacement. The originals are
-# restored afterwards even if a run fails.
+# Breaks the model on purpose, one edit at a time, and checks that the suite
+# notices. A surviving mutation is a gap in the tests.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -44,8 +39,6 @@ PY
         printf '  %-46s DID NOT COMPILE\n' "$name"
         fail=$((fail + 1))
     elif printf '%s' "$out" | grep -qE '[1-9][0-9]* failing'; then
-        local where
-        where=$(printf '%s' "$out" | grep -oE '@?section\("[a-z_]+"\)|=== [a-z_]+ ===' | tail -1)
         printf '  %-46s caught\n' "$name"
         pass=$((pass + 1))
     else
@@ -58,7 +51,7 @@ PY
 
 echo "mutating the statistics and the timing model:"
 
-# --- the breakdown's partition ------------------------------------------------
+# the breakdown's partition
 mutate "idle cycle charged to two buckets" src/tpu.cpp \
     '    if (weights) { ++profile_.idle_weights; return; }' \
     '    if (weights) { ++profile_.idle_weights; ++profile_.idle_other; return; }'
@@ -80,7 +73,7 @@ mutate "fill/drain not counted as lost" src/stats.h \
         p.array_busy > p.stream_cycles ? p.array_busy - p.stream_cycles : 0;' \
     '    s.lost.array_fill_drain = 0;'
 
-# --- attribution --------------------------------------------------------------
+# attribution
 mutate "DMA claims stalls before the weight path" src/tpu.cpp \
     '    if (weights) { ++profile_.idle_weights; return; }' \
     '    if (slot(Unit::DMA).active) { ++profile_.idle_dma; return; }
@@ -90,7 +83,7 @@ mutate "bank conflicts charged to 'other'" src/tpu.cpp \
     'if (n.ub_bank_conflict != before.ub_bank_conflict) { ++profile_.idle_bank; return; }' \
     'if (n.ub_bank_conflict != before.ub_bank_conflict) { ++profile_.idle_other; return; }'
 
-# --- the counters themselves --------------------------------------------------
+# the counters themselves
 mutate "MACs counted per matmul, not per row" src/tpu.cpp \
     'profile_.macs_performed += static_cast<uint64_t>(d.len) * cfg_.dim * cfg_.dim;' \
     'profile_.macs_performed += static_cast<uint64_t>(cfg_.dim) * cfg_.dim;'
@@ -107,7 +100,7 @@ mutate "padding waste ignored" src/stats.h \
     '        s.lost.partial_tile_waste = (s.macs_performed - s.macs_useful) / peak;' \
     '        s.lost.partial_tile_waste = 0;'
 
-# --- the UB port model --------------------------------------------------------
+# the UB port model
 mutate "UB port contention removed" src/tpu.cpp \
     '    if (!ub_port_available(res)) return;' \
     '    (void)0;'
@@ -117,10 +110,8 @@ mutate "read and write ports share one budget" src/tpu.cpp \
         (wants_write && writers >= cfg_.ub_banks)) {' \
     '    if (readers + writers >= cfg_.ub_banks) {'
 
-# --- the weight prefetcher ----------------------------------------------------
-# Mutating the prefetch loop's own `!fifo_.full()` guard would be an equivalent
-# mutant, since push_refill() rejects a full FIFO anyway and the loop breaks on that,
-# so the depth is removed at its source instead.
+# the weight prefetcher; the depth is removed at its source because mutating the
+# prefetch loop's own !fifo_.full() guard would be an equivalent mutant
 mutate "the FIFO ignores its own depth" src/transfer.h \
     'bool full() const { return q_.size() >= depth_; }' \
     'bool full() const { return false; }'
@@ -129,7 +120,7 @@ mutate "Read_Weights does not wait for its tile" src/tpu.cpp \
     '    if (d.op == Op::READ_WEIGHTS && fifo_.empty()) {' \
     '    if (false) {'
 
-# --- timing -------------------------------------------------------------------
+# timing
 mutate "weight load bubble always zero" src/systolic_array.h \
     'return cfg_.double_buffer ? 0u : cfg_.dim;' \
     'return 0u;'
@@ -138,7 +129,7 @@ mutate "activation charged per row, not per element" src/tpu.cpp \
     'return static_cast<uint64_t>(d.len) * cfg_.dim + cfg_.act_pipeline_depth;' \
     'return static_cast<uint64_t>(d.len) + cfg_.act_pipeline_depth;'
 
-# --- arithmetic ---------------------------------------------------------------
+# arithmetic
 mutate "requantize rounds half toward zero" src/datapath.h \
     'return v >= 0 ? (v + half) >> shift : -((-v + half) >> shift);' \
     'return v >= 0 ? (v + half - 1) >> shift : -((-v + half - 1) >> shift);'
@@ -151,7 +142,7 @@ mutate "saturation clamps only the top" src/datapath.h \
     '    if (v < I8_MIN) return static_cast<i8>(I8_MIN);' \
     '    if (false) return static_cast<i8>(I8_MIN);'
 
-# --- the tiler ----------------------------------------------------------------
+# the tiler
 mutate "last row block always uses full dim" tests/workloads.h \
     'const uint32_t rows = std::min(dim, l.M - m * dim);' \
     'const uint32_t rows = dim;'

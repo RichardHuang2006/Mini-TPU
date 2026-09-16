@@ -1,13 +1,5 @@
-// Mini-TPU trace container (.mtpt) reader.
-//
-// Layout (tools/tracegen.cpp): "MTPT", u32 version, u32 manifest length, the
-// JSON manifest, padding to 8 bytes, then 8-byte-aligned little-endian
-// sections the manifest indexes by name. Everything except the per-MatMul PE
-// detail ("mm.<i>.*") is loaded eagerly; PE detail is sliced on demand and
-// kept in a small cache, so the 33 MB large container costs about 1 MB of
-// memory until the array view is opened.
-//
-// Classic script: defines window.MTV.Container.
+// Reader for the .mtpt container viz/README.md documents. Everything but the
+// per-MatMul PE detail is eager; PE detail is sliced on demand and cached.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -138,8 +130,7 @@
       return out;
     }
 
-    // Synchronous variant when the whole container is in memory (the embedded
-    // example), so the array view can render without an await.
+    // For an in-memory container, so the array view renders without an await.
     mmSync(i) {
       if (this.mmCache.has(i)) return this.mmCache.get(i);
       if (!this.sliceSync) return null;

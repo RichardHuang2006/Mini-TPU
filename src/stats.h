@@ -10,22 +10,7 @@
 #include "isa.h"
 #include "tpu.h"
 
-// Derived statistics for one run: utilization, effective TOPS, per-instruction
-// cycle counts, and a stall-cause breakdown attributing every idle array-cycle to
-// exactly one cause.
-//
-// The machine collects tallies (RunProfile); everything here is arithmetic over
-// them. Two properties, both asserted by the test suite, keep the breakdown usable
-// for naming the bottleneck of a starved configuration:
-//
-//   * the idle buckets partition idle time exactly, so no cause can dominate by
-//     being counted twice, and
-//   * streaming plus fill/drain equals the time the array was busy.
-//
-// `partial_tile_waste` sits outside that partition. It is waste inside cycles the
-// array was busy (PEs multiplying padding), so adding it to the idle buckets would
-// double count. It is reported alongside them, not among them.
-
+// Derived statistics: arithmetic over RunProfile, described in README section 16.
 namespace stats {
 
 enum class Cause : uint8_t {
@@ -55,14 +40,7 @@ inline const char* cause_name(Cause c) {
     return "?";
 }
 
-// Lost array-cycles by cause, named from the array's point of view; a few
-// cover more than one of the machine's issue-point counters:
-//
-//   weight_fifo_empty  every cycle the array had no tile to multiply by, whether
-//                      the sequencer was waiting on DDR latency, on FIFO space, or
-//                      on the Read_Weights ahead of it
-//   dma_bound          the array idle with a transfer in flight, however the
-//                      hazard that blocked issue was named
+// Lost array-cycles by cause, from the array's point of view.
 struct Breakdown {
     uint64_t array_fill_drain   = 0;
     uint64_t weight_fifo_empty  = 0;
@@ -72,8 +50,7 @@ struct Breakdown {
     uint64_t activation         = 0;
     uint64_t other              = 0;
 
-    // Outside the partition above: array-cycles' worth of MAC slots spent on
-    // padding while the array was busy.
+    // Outside the partition: MAC slots spent on padding while the array was busy.
     uint64_t partial_tile_waste = 0;
 
     uint64_t idle() const {
@@ -102,35 +79,28 @@ struct Stats {
 
     Breakdown lost;
 
-    // ---- utilization -------------------------------------------------------
-
     uint64_t peak_macs() const { return cfg.peak_macs_per_cycle(); }
 
-    // Useful MACs as a fraction of what the array could have done in the same
-    // wall-clock cycles. Padding, fill, drain and every stall count against it.
+    // Useful MACs over what the array could have done in the same cycles.
     double utilization() const {
         const uint64_t offered = cycles * peak_macs();
         if (offered == 0) return 0.0;
         return static_cast<double>(macs_useful) / static_cast<double>(offered);
     }
 
-    // The same fraction over only the cycles the array had work, which separates
-    // "the array was idle" from "the array was busy doing nothing useful".
+    // The same fraction over only the cycles the array had work.
     double busy_utilization() const {
         const uint64_t offered = array_busy * peak_macs();
         if (offered == 0) return 0.0;
         return static_cast<double>(macs_useful) / static_cast<double>(offered);
     }
 
-    // Two ops per MAC, the usual convention, at a nominal clock. TPUv1 ran at
-    // 700 MHz, so that is the default and the numbers are comparable to its 92 TOPS.
+    // Two ops per MAC, at TPUv1's 700 MHz by default.
     double tops(double clock_ghz = 0.7) const {
         if (cycles == 0) return 0.0;
         const double seconds = static_cast<double>(cycles) / (clock_ghz * 1e9);
         return 2.0 * static_cast<double>(macs_useful) / seconds / 1e12;
     }
-
-    // ---- roofline ----------------------------------------------------------
 
     // Useful MACs per byte moved across the host interface.
     double arithmetic_intensity() const {
@@ -138,8 +108,7 @@ struct Stats {
         return static_cast<double>(macs_useful) / static_cast<double>(dma_bytes);
     }
 
-    // MACs per byte at which the array and the DMA are balanced. Below it a
-    // workload is memory-bound and a larger array buys nothing.
+    // MACs per byte at which the array and the DMA are balanced.
     double ridge_point() const {
         if (cfg.dma_bytes_per_cycle == 0) return 0.0;
         return static_cast<double>(peak_macs()) /
@@ -147,8 +116,6 @@ struct Stats {
     }
 
     bool below_ridge() const { return cfg.dma_bound(macs_useful, dma_bytes); }
-
-    // ---- diagnosis ---------------------------------------------------------
 
     uint64_t weight_of(Cause c) const {
         switch (c) {
@@ -165,8 +132,7 @@ struct Stats {
         return 0;
     }
 
-    // The single largest reason the array did not do useful work. Ties go to the
-    // earlier cause in the list, which is stable across runs.
+    // The largest reason the array did no useful work; ties go to the earlier.
     Cause dominant_cause() const {
         const Cause all[] = {
             Cause::ARRAY_FILL_DRAIN, Cause::PARTIAL_TILE_WASTE, Cause::WEIGHT_FIFO_EMPTY,
@@ -184,12 +150,7 @@ struct Stats {
 
     const char* dominant_name() const { return cause_name(dominant_cause()); }
 
-    // The largest cause a configuration could fix. This excludes the two that
-    // belong to the workload and the array shape rather than to the machine's
-    // resources: fill/drain is what a systolic pipeline costs, padding waste is
-    // what the tile size costs. Those two dominate most runs, so ranking them
-    // against the resource stalls would hide every provisioning problem behind
-    // "array_fill_drain".
+    // The largest cause a configuration could fix, so not fill/drain or padding.
     Cause dominant_stall_cause() const {
         const Cause all[] = {
             Cause::WEIGHT_FIFO_EMPTY, Cause::UB_BANK_CONFLICT, Cause::ACCUM_HAZARD,
@@ -206,21 +167,16 @@ struct Stats {
 
     const char* dominant_stall_name() const { return cause_name(dominant_stall_cause()); }
 
-    // The accounting adds up: every cycle is either array-busy or charged to one
-    // idle cause, and busy time splits into streaming and fill/drain.
+    // Every cycle is either array-busy or charged to exactly one idle cause.
     bool balances() const {
         return array_busy + lost.idle() == cycles &&
                stream_cycles + lost.array_fill_drain == array_busy;
     }
 
-    // ---- reporting ---------------------------------------------------------
-
     std::string report(const std::string& title = "") const;
 };
 
-// Gather a run's statistics. `useful_macs` is the workload's own MAC count with
-// padding excluded: the tiler knows it and the machine cannot, since a padded zero
-// is indistinguishable from a real one at the array.
+// `useful_macs` excludes padding, which only the tiler can know.
 inline Stats gather(const Config& cfg, const TpuResult& r, const RunProfile& p,
                     uint64_t useful_macs = 0, bool useful_known = false) {
     Stats s;
@@ -241,9 +197,7 @@ inline Stats gather(const Config& cfg, const TpuResult& r, const RunProfile& p,
         s.op_count[i]  = p.op_count[i];
     }
 
-    // Fill and drain is whatever busy time was not streaming, taken as a difference
-    // so the partition holds by construction rather than relying on the duration
-    // formula and the measured busy count agreeing.
+    // Taken as a difference, so the partition holds by construction.
     s.lost.array_fill_drain =
         p.array_busy > p.stream_cycles ? p.array_busy - p.stream_cycles : 0;
 

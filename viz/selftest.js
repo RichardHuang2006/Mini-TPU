@@ -1,9 +1,6 @@
 #!/usr/bin/env node
-// Runs the visualizer's container reader and cycle model under node against a
-// trace container and asserts facts that are true of the simulator (and, for
-// the bundled matmul_128, values checked by hand against the example files).
-//
-//   node viz/selftest.js viz/traces/matmul_8.mtpt viz/traces/matmul_128.mtpt
+// Runs the page's container reader and cycle model under node against a trace
+// container: node viz/selftest.js viz/traces/matmul_8.mtpt [more.mtpt ...]
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -60,6 +57,47 @@ async function run(file) {
   for (let t = 0; t < m.cycles; t += stride) { m.setCycle(t, 'account'); lines += MTV.narrate(m, m.state).length; }
   check('narrate', lines > 0, lines + ' lines over the sampled cycles');
 
+  // Every hop obeys the release rule it claims, and every chain terminates.
+  {
+    let hops = 0, bad = 0, deepest = 0;
+    for (const p of m.program) {
+      if (p.issue === null) continue;
+      const ch = m.blockerChain(p.pc);
+      deepest = Math.max(deepest, ch.length);
+      const end = ch[ch.length - 1];
+      if (!end || !['root', 'resource'].includes(end.kind)) bad++;
+      for (const h of ch) {
+        hops++;
+        if (h.kind === 'blocked' && m.program[h.next].retire !== h.issue) bad++;
+        if (h.kind === 'in_order' && m.program[h.next].issue !== h.issue - 1) bad++;
+        if (h.kind === 'loop') bad++;
+      }
+    }
+    check('blocker chains', bad === 0, hops + ' hops over ' + m.program.length + ' chains, deepest ' + deepest + ', violations ' + bad);
+  }
+
+  // The whole run equals the recorded statistics, a sub-window a direct count.
+  {
+    const wc = m.windowCounts(0, m.cycles);
+    const s = m.m.stats;
+    let ok = wc.idle.busy === s.array_busy;
+    for (const k of ['weights', 'bank', 'accum', 'dma', 'act', 'other']) ok = ok && wc.idle[k] === s.idle[k];
+    for (const k of ['drain', 'unit_busy', 'weight_fifo_empty', 'ub_raw', 'ub_war', 'ub_waw', 'accum_hazard', 'weight_stall', 'ub_bank_conflict']) ok = ok && wc.outcome[k] === s.stalls[k];
+    check('window counts, run', ok, 'whole-run Pareto equals RunProfile idle buckets and StallStats');
+    const a = Math.floor(m.cycles / 3), b = Math.floor((2 * m.cycles) / 3);
+    const sub = m.windowCounts(a, b);
+    const idle = {}, out = {};
+    for (let t = a; t < b; t++) {
+      const i = MTV.IDLE_NAMES[m.cyc.idle[t]]; idle[i] = (idle[i] || 0) + 1;
+      const o = MTV.STALL_NAMES[m.cyc.outcome[t]]; out[o] = (out[o] || 0) + 1;
+    }
+    let ok2 = sub.n === b - a;
+    for (const k of MTV.IDLE_NAMES) ok2 = ok2 && (idle[k] || 0) === sub.idle[k];
+    for (const k of MTV.STALL_NAMES) ok2 = ok2 && (out[k] || 0) === sub.outcome[k];
+    ok2 = ok2 && m.matchCount({ kind: 'idle', key: 'busy' }, a, b) === sub.idle.busy && m.matchCount({ kind: 'stall', key: 'ub_raw' }, a, b) === sub.outcome.ub_raw;
+    check('window counts, sub', ok2, '[' + a + ', ' + b + ') matches a direct count');
+  }
+
   if (m.workload.name === 'matmul_128') {
     m.setCycle(289, 'start');
     check('289 start', m.state.units.MXU && m.state.units.MXU.pc === 5 && m.state.units.WEIGHT === null &&
@@ -92,6 +130,13 @@ async function run(file) {
     const ce = m.cElement(5, 0);
     check('C[5][0]', ce.chain.length === 4 && ce.chain[0].pc === 5 && ce.acts.length === 1 && ce.acts[0].pc === 12 && ce.writes[0].pc === 21,
           'chain pcs ' + ce.chain.map((p) => p.pc).join(',') + '; activate pc ' + ce.acts[0].pc + '; write pc ' + ce.writes[0].pc);
+    const ch21 = m.blockerChain(21);
+    check('chain pc 21', ch21[0].kind === 'blocked' && ch21[0].reason === 'ub_raw' && ch21[0].next === 12 &&
+          ch21[1].pc === 12 && ch21[1].reason === 'accum_hazard' && ch21[1].next === 11 &&
+          ch21[ch21.length - 1].pc === 0 && ch21[ch21.length - 1].kind === 'root',
+          ch21.slice(0, 3).map((h) => 'pc ' + h.pc + ' ' + h.kind + (h.reason ? ' ' + h.reason : '')).join(' → ') + ' … root pc ' + ch21[ch21.length - 1].pc + ' (' + ch21.length + ' hops)');
+    const ib = m.idleBlockerAt(1000);
+    check('idle blocker 1000', ib.pc === 12 && ib.via === 'blocker' && ib.o.idle === 'act', 'cycle 1000 charged to ' + ib.o.idle + ', points at pc ' + ib.pc + ' via ' + ib.via);
     m.setCycle(m.cycles - 1, 'account');
     check('final C[5][0]', m.img.host[ce.host] === 16, 'host byte 0x' + ce.host.toString(16) + ' = ' + m.img.host[ce.host]);
   }
@@ -100,6 +145,10 @@ async function run(file) {
     const o = m.outcomeAt(5);
     check('5 fifo empty', o.kind === 'stall' && o.reason === 'weight_fifo_empty' && o.pc === 2,
           o.reason + ' at cycle 5 for pc ' + o.pc + '; next ready ' + (m.state.fifo[0] && m.state.fifo[0].push.ready));
+    const ch28 = m.blockerChain(28);
+    const end = ch28[ch28.length - 1];
+    check('chain Halt', end.pc === 2 && end.kind === 'resource' && end.reason === 'weight_fifo_empty' && end.prefetch && end.prefetch.ready === 8,
+          ch28.length + ' hops from Halt to pc ' + end.pc + ' (' + end.kind + ': ' + end.reason + ', tile ready at ' + (end.prefetch && end.prefetch.ready) + ')');
     m.setCycle(20, 'issue');
     check('20 accumulate', m.state.units.MXU && m.state.units.MXU.pc === 5 && m.state.planes.active === 0,
           'pc 5 (accumulate) issued on plane 0');

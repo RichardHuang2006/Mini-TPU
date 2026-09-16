@@ -8,31 +8,10 @@
 #include "config.h"
 #include "datapath.h"
 
-// The on-chip storage: the banked int8 Unified Buffer that feeds the array, and
-// the int32 accumulator banks that catch what the array produces. They are two
-// distinct structures with two distinct jobs -- the buffer is byte-addressable
-// working memory with per-cycle port limits, the accumulators are wide
-// fixed-shape banks with locking -- and they stay separate classes here.
-
-// ============================================================================
-// Unified Buffer
-// ============================================================================
-
-// The Unified Buffer: a banked, byte-addressable scratchpad holding activations
-// and intermediate results. Addresses are byte offsets and tensors are row-major
-// with an explicit stride, so a tile is a strided rectangular window rather than
-// a copy.
-//
-// Banking is low-order interleaved, bank = addr % banks, so a contiguous row of
-// activations spreads across every bank instead of piling into one. The array
-// consumes dim consecutive bytes per cycle, and interleaving lets those arrive
-// through dim different ports. A block-partitioned layout (addr / bytes_per_bank)
-// would put a whole row in one bank and serialize the machine's most common
-// access pattern.
+// A byte-addressable int8 scratchpad, low-order interleaved as addr % banks.
 class UnifiedBuffer {
 public:
-    // Each bank has one read port and one write port per cycle, so the direction
-    // of an access is part of whether it collides.
+    // Each bank has one read port and one write port per cycle.
     enum class Port { READ, WRITE };
 
     struct Access {
@@ -65,18 +44,14 @@ public:
         return at <= mem_.size() && n <= mem_.size() - at;
     }
 
-    // Does a rows x cols tile with this row pitch fit? The last row only needs
-    // `cols` bytes, not a full stride, which matters for a tile that ends flush
-    // against the top of the buffer.
+    // Does a tile fit? The last row needs only `cols` bytes, not a full stride.
     bool tile_fits(UbAddr at, uint32_t rows, uint32_t cols, uint32_t stride) const {
         if (rows == 0 || cols == 0) return in_range(at, 0);
         if (cols > stride) return false;
         return in_range(at, static_cast<std::size_t>(rows - 1) * stride + cols);
     }
 
-    // A strided window onto the buffer's own storage, and how the array gets its
-    // activations: no copy, so a tile of a much wider activation matrix costs
-    // nothing to address.
+    // A strided window onto the buffer's own storage; no copy.
     I8View view(UbAddr at, uint32_t rows, uint32_t cols, uint32_t stride) {
         assert(tile_fits(at, rows, cols, stride));
         return I8View(&mem_[at], rows, cols, stride);
@@ -86,10 +61,7 @@ public:
         return ConstI8View(&mem_[at], rows, cols, stride);
     }
 
-    // Copy a tile out of / into the buffer. `dst` and `src` supply the shape;
-    // `stride` is the pitch on the buffer side, so a narrow tile can be lifted
-    // out of a wide region. A tile that does not fit returns false rather than
-    // trapping, leaving the meaning of a bad address to the caller.
+    // Copy a tile out of / into the buffer; false when it does not fit.
     bool read_tile(UbAddr at, uint32_t stride, const I8View& dst) const {
         if (!tile_fits(at, dst.rows(), dst.cols(), stride)) return false;
         dst.copy_from(view(at, dst.rows(), dst.cols(), stride));
@@ -106,12 +78,8 @@ public:
         return true;
     }
 
-    // Would these accesses, all in one cycle, exceed a bank's port budget? Two
-    // accesses in the same direction to one bank collide; a read and a write to
-    // the same bank do not, because each bank has one port of each.
-    //
-    // Pure, so the sequencer can ask speculatively before deciding to stall.
-    // Whoever actually stalls calls note_bank_conflict().
+    // Do these same-cycle accesses exceed a bank's port budget? Pure, so the
+    // sequencer may ask speculatively; whoever stalls calls note_bank_conflict().
     bool port_conflict(const std::vector<Access>& accesses) const {
         std::vector<uint8_t> read_seen(banks_, 0), write_seen(banks_, 0);
         for (const Access& a : accesses) {
@@ -143,22 +111,7 @@ private:
     mutable Stats   stats_;
 };
 
-// ============================================================================
-// Accumulator banks
-// ============================================================================
-
 // int32 accumulator banks, addressed [bank][row][col].
-//
-// A MatMul either overwrites a bank or accumulates in place into it. The second
-// mode is how the K dimension is tiled: successive MatMuls over slices of K add
-// into the same bank and one Activate reads the finished sum out. The bank, not
-// the array, is what makes K-tiling possible, since the array only ever sees dim
-// of K at a time.
-//
-// Locking is deliberately asymmetric. bank() hands out an unchecked view for the
-// owner of the bank (the in-flight matmul writing into it), while read(), write()
-// and accumulate() are the consumer-facing entry points that refuse a locked bank
-// and count a hazard. Without the split, a matmul would block on its own lock.
 class Accumulators {
 public:
     struct Stats {
@@ -166,8 +119,7 @@ public:
         uint64_t writes      = 0;
         uint64_t accumulates = 0;
 
-        // Accesses refused because the bank was still being written. This is the
-        // accum_hazard of the stall breakdown.
+        // Accesses refused because the bank was still being written.
         uint64_t hazards = 0;
     };
 
@@ -213,8 +165,7 @@ public:
         bank(b).fill(0);
     }
 
-    // Checked entry points. Each returns false when the access cannot proceed: an
-    // invalid bank, or a locked one, in which case the caller stalls.
+    // Checked entry points; false means an invalid or locked bank.
     bool read(BankId b, const I32View& dst) const {
         if (!valid(b) || locked(b)) {
             if (valid(b)) ++stats_.hazards;

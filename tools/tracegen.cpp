@@ -1,22 +1,5 @@
-// Writes a trace container (.mtpt) for the visualizer under viz/.
-//
-// The container is one file: a JSON manifest followed by 8-byte-aligned binary
-// sections the manifest indexes. It holds everything the machine did, cycle by
-// cycle: every issue and retire with the bytes read and committed, every stall
-// with its reason and blocker, every prefetch and weight-plane load, and for
-// every MatMul the whole PE grid after every array step.
-//
-// Nothing here simulates. A TraceSink (src/trace.h) records what Tpu::run does;
-// the generator then runs the same workload untraced and asserts that tracing
-// changed nothing, compares the run to the eager oracle and to the golden loops,
-// and re-checks the trace against itself (PE arithmetic, landings, commits,
-// requantization, stall and idle partitions). The results go into the manifest.
-//
-//   tracegen --small --out viz/traces/matmul_8.mtpt
-//   tracegen --prog examples/matmul_128.hex --acts ... --weights ... \
-//            --expect examples/matmul_128.expect.mtpu --layer 128,128,128 \
-//            --dim 32 --ub 262144 --acc-banks 4 --macs 2097152 \
-//            --out viz/traces/matmul_128.mtpt
+// Records a run through the TraceSink of src/trace.h, runs the checks below,
+// and writes the .mtpt container viz/README.md documents. Nothing here simulates.
 
 #define MINI_TPU_NO_ENTRY
 #include "main.cpp"
@@ -34,10 +17,6 @@
 #include "workloads.h"
 
 namespace {
-
-// ============================================================================
-// JSON writer
-// ============================================================================
 
 std::string jstr(const std::string& s) {
     std::string o = "\"";
@@ -107,10 +86,6 @@ private:
     }
 };
 
-// ============================================================================
-// Container sections
-// ============================================================================
-
 struct Section {
     std::string          name;
     std::string          dtype;   // u8 i8 u32 i32
@@ -128,10 +103,6 @@ Section make_section(const std::string& name, const std::string& dtype, const st
     if (!v.empty()) std::memcpy(s.bytes.data(), v.data(), s.bytes.size());
     return s;
 }
-
-// ============================================================================
-// The recorder
-// ============================================================================
 
 struct CommitRec {
     uint64_t    cycle = 0;
@@ -301,7 +272,7 @@ struct Recorder : TraceSink {
         }
     }
 
-    // ---- retire: commits with before-images -------------------------------
+    // retire: commits with before-images
     void on_retire(const Tpu&, uint64_t cycle, Unit unit, const InFlight& f) override {
         RetireRec r;
         r.cycle = cycle;
@@ -405,7 +376,7 @@ struct Recorder : TraceSink {
         stalls.push_back(s);
     }
 
-    // ---- issue: input snapshots ------------------------------------------
+    // issue: input snapshots
     uint32_t add_read(uint64_t cycle, std::size_t pc, char kind, uint64_t addr, uint32_t rows,
                       uint32_t cols, const void* data, std::size_t bytes, std::size_t elem) {
         ReadRec r;
@@ -483,7 +454,7 @@ struct Recorder : TraceSink {
         issues.push_back(std::move(ir));
     }
 
-    // ---- the array ---------------------------------------------------------
+    // the array
     void on_matmul_begin(const Mxu& mxu, uint32_t len, uint32_t plane, bool switched) override {
         MmRec m;
         m.len = len; m.plane = plane; m.switched = switched;
@@ -514,7 +485,7 @@ struct Recorder : TraceSink {
         }
     }
 
-    // ---- sequencer outcomes ------------------------------------------------
+    // sequencer outcomes
     void on_sync(const Tpu& tpu, uint64_t cycle, std::size_t pc, std::size_t) override {
         syncs.emplace_back(cycle, pc);
         const std::vector<i32>& a = tpu.acc().raw();
@@ -548,10 +519,6 @@ struct Recorder : TraceSink {
         rows.push_back(r);
     }
 };
-
-// ============================================================================
-// Workload description
-// ============================================================================
 
 struct Workload {
     std::string name, note;
@@ -603,9 +570,8 @@ void load_into(Tpu& t, const Workload& w) {
         t.weight_mem()[w.b_ddr + i] = w.b_packed[i];
 }
 
-// Which logical tile each instruction touches, from the tiler's packing
-// (tests/workloads.h). Address-based, so any dense layer lowered by
-// wl::lower_layer annotates; anything else gets no tile.
+// Which logical tile each instruction touches, by address, so any dense layer
+// lowered by wl::lower_layer annotates and anything else gets no tile.
 struct Tile { char kind = 0; int m = -1, n = -1, k = -1; };
 
 std::vector<Tile> annotate(const Workload& w) {
@@ -672,10 +638,6 @@ std::vector<Tile> annotate(const Workload& w) {
     return out;
 }
 
-// ============================================================================
-// Checks
-// ============================================================================
-
 struct Checks {
     bool trace_noop      = false;
     bool oracle          = false;
@@ -736,8 +698,7 @@ i8 act_fn(i8 v, ActFn fn) {
     return v;
 }
 
-// The activation pipeline recomputed from its written rules (the same quant::
-// helpers both models share), over the bank rows the instruction read.
+// The activation pipeline recomputed over the bank rows the instruction read.
 std::vector<i8> requantize_tile(const Decoded& d, const i32* bank, uint32_t dim) {
     std::vector<i8> tile(static_cast<std::size_t>(d.len) * dim, 0);
     for (uint32_t r = 0; r < d.len; ++r)
@@ -815,8 +776,7 @@ Checks run_checks(const Workload& w, const Recorder& rec, const Tpu& traced, con
         ck.golden = got.size() == w.expect.size() && ck.golden_mismatches == 0;
     }
 
-    // 4. Every recorded PE step satisfies psum_out = psum_in + act_in * w, and
-    //    the act register carried the operand in.
+    // 4. Every PE step satisfies psum_out = psum_in + act_in * w.
     {
         std::size_t checked = 0, bad = 0;
         const std::size_t n = static_cast<std::size_t>(dim) * dim;
@@ -844,8 +804,7 @@ Checks run_checks(const Workload& w, const Recorder& rec, const Tpu& traced, con
         ck.pe_identity = bad == 0;
     }
 
-    // 5. Landings equal the bottom row at the landing step, and the staged rows
-    //    committed at retire equal (bank at issue +) landings.
+    // 5. Landings equal the bottom row, and the rows committed equal them.
     {
         bool ok = true;
         const std::size_t n = static_cast<std::size_t>(dim) * dim;
@@ -876,8 +835,7 @@ Checks run_checks(const Workload& w, const Recorder& rec, const Tpu& traced, con
         ck.landings = ok;
     }
 
-    // 6. Replaying the after-images reproduces the final memories; before-images
-    //    reproduce the initial ones when applied in reverse.
+    // 6. After-images replay to the final memories, before-images to the initial.
     {
         std::vector<uint8_t> host = rec.init_host;
         std::vector<i8> ub(traced.ub().bytes(), 0);
@@ -909,8 +867,7 @@ Checks run_checks(const Workload& w, const Recorder& rec, const Tpu& traced, con
         ck.commit_replay = ok;
     }
 
-    // 7. Requantization recomputed from the bank rows read at issue equals the
-    //    int8 tile committed at retire.
+    // 7. Requantizing the bank rows read at issue gives the tile committed.
     {
         bool ok = true;
         for (const ActRec& a : rec.acts) {
@@ -963,10 +920,6 @@ Checks run_checks(const Workload& w, const Recorder& rec, const Tpu& traced, con
     }
     return ck;
 }
-
-// ============================================================================
-// Manifest + container
-// ============================================================================
 
 void write_reservation(JW& j, const Reservation& r) {
     j.obj();

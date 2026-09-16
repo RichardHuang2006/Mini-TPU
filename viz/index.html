@@ -6,7 +6,9 @@
 <title>Mini-TPU Cycle Visualizer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;600&display=swap">
+<!-- Optional web fonts. Loaded as print media and switched on when they arrive, so an
+     offline or file:// open never waits on the request; app.css carries full fallback stacks. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;600&display=swap" media="print" onload="this.media='all'">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -126,13 +128,33 @@
   </main>
 
   <footer id="timeline">
-    <div id="tl-labels"></div>
-    <canvas id="tl-canvas"></canvas>
+    <div id="tl-scroll">
+      <div id="tl-corner" title="Wheel: zoom · shift+wheel or horizontal swipe: pan · alt+wheel: scroll rows · click a label: collapse · hover: details · click a stall or idle run: select its blocker"><span class="lbl">rows ⓘ</span><button id="tl-fit" type="button" title="Show the whole run (double-click the tracks does the same)">fit</button></div>
+      <canvas id="tl-ruler" title="Click or drag to seek; wheel to zoom"></canvas>
+      <div id="tl-labels" role="group" aria-label="Timeline rows: click a label to collapse or expand it"></div>
+      <canvas id="tl-canvas" aria-label="Timeline tracks"></canvas>
+    </div>
+    <aside id="tl-summary" aria-label="Where the cycles went in the visible window">
+      <div class="sum-head"><span class="lbl">Where the cycles went</span><span id="sum-window" class="mono muted"></span></div>
+      <div id="sum-sub" class="sum-sub"></div>
+      <div class="sum-cols">
+        <div>
+          <div class="sum-title">Array idle<span class="src">charge_idle_cycle bucket</span></div>
+          <div id="sum-idle"></div>
+        </div>
+        <div>
+          <div class="sum-title">Issue refused<span class="src">StallStats counter</span></div>
+          <div id="sum-stall"></div>
+        </div>
+      </div>
+      <div id="sum-filter" class="sum-filter"></div>
+      <div class="sum-note" title="Counted from the per-cycle trace columns (cyc.idle, cyc.outcome) over the visible window. Over the whole run they equal RunProfile idle buckets and StallStats, which tools/tracegen checks.">Counts of recorded per-cycle columns in the visible window. Click a bar to dim the rest.</div>
+    </aside>
     <div id="tl-foot">
-      <span id="tl-legend" class="legend"></span>
-      <span class="spacer"></span>
+      <div id="tl-legend"></div>
       <span id="badge" class="badge">no trace</span>
     </div>
+    <div id="tl-tip" hidden></div>
   </footer>
 </div>
 

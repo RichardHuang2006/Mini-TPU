@@ -1,10 +1,7 @@
 #pragma once
 
-// Header-only builder for Mini-TPU programs, so the tests need no external
-// tooling to produce an instruction stream.
-//
-// Operands are named regions rather than bare byte offsets, so a test reads like a
-// short program instead of a hand-computed set of Unified Buffer offsets.
+// Header-only builder for Mini-TPU programs, with named regions instead of
+// hand-computed Unified Buffer offsets.
 
 #include <cstddef>
 #include <cstdint>
@@ -15,8 +12,7 @@
 
 namespace tpuasm {
 
-// A named slice of the Unified Buffer. Converts to its own address, so it can
-// be passed anywhere an operand is expected.
+// A named slice of the Unified Buffer, converting to its own address.
 struct Region {
     UbAddr   addr  = 0;
     uint32_t bytes = 0;
@@ -24,8 +20,7 @@ struct Region {
     operator UbAddr() const { return addr; }
 };
 
-// Bump allocator over the Unified Buffer, so a test asks for the regions it needs
-// rather than computing offsets.
+// Bump allocator over the Unified Buffer.
 class UbAlloc {
 public:
     explicit UbAlloc(UbAddr base = 0, uint32_t align = 4) : next_(base), align_(align) {}
@@ -64,8 +59,7 @@ struct ActArgs {
     uint32_t pool_stride = 1;
 };
 
-// Instruction stream under construction. Every method returns *this so a
-// program reads as one chained statement.
+// Instruction stream under construction; every method returns *this.
 class Program {
 public:
     Program& read_host(HostAddr host, UbAddr ub, uint32_t bytes) {

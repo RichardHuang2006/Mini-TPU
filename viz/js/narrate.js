@@ -1,10 +1,5 @@
-// "What happened this cycle?": a fixed template walked in the run loop's order
-// over the events the trace recorded for cycle t. Every line names the
-// simulator function that produced the event. No line is generated without a
-// backing record, and the only causal language is the stall reason and blocker
-// the sequencer itself recorded.
-//
-// Classic script: defines window.MTV.narrate and formatting helpers.
+// "What happened this cycle?": fixed templates walked in the run loop's order.
+// No line is generated without a backing record in the trace.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});

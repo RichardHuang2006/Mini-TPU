@@ -1,9 +1,5 @@
-// Writes the bundled workloads to examples/ so the CLI has something to run
-// without the test binary.
-//
-// The programs and tensors come from wl::corpus(), the same definitions the test
-// suite runs against golden loops, so an example file cannot drift from what was
-// verified. Nothing here computes a layer or emits an instruction.
+// Writes the bundled workloads to examples/ so the CLI has something to run.
+// Everything comes from wl::corpus(), the definitions the suite verifies.
 
 #include <cstdio>
 #include <fstream>
@@ -61,9 +57,7 @@ bool write_tensor(const std::string& path, const std::vector<i8>& data, uint32_t
     return true;
 }
 
-// Packed tensors ship as a flat row of bytes, since the shape that matters is the
-// tiling the program was lowered for and the program already encodes it. Recording
-// them as 1 x N avoids implying a 2-D shape the bytes are not in.
+// Packed tensors ship as 1 x N, since the program already encodes the tiling.
 bool write_workload(const wl::Workload& w, const std::string& dir) {
     const std::string base = dir + "/" + w.name;
     return write_program(w, dir) &&

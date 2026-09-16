@@ -1,6 +1,4 @@
-# Mini-TPU: cycle-accurate TPUv1-style int8 inference accelerator
-#
-# Targets: all (release), debug (ASan+UBSan), test, examples, report, clean, help
+# Mini-TPU. `make help` lists the targets.
 
 CXX      ?= g++
 CXXSTD    = -std=c++17
@@ -25,14 +23,12 @@ TOOLS_SRC  = tools/gen_examples.cpp
 REPORT_SRC = tools/report.cpp
 HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 
-# The tests reuse every src/*.cpp but main.cpp, whose main() they replace by
-# #including it.
+# The tests replace main.cpp's main() by #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(TPU_SRC))
 
 .PHONY: all debug test examples report clean help
 .DEFAULT_GOAL := all
 
-# ---------------------------------------------------------------- release ---
 all: $(BUILD)/minitpu
 
 $(BUILD)/minitpu: $(TPU_OBJ) | $(BUILD)
@@ -42,9 +38,7 @@ $(BUILD)/minitpu: $(TPU_OBJ) | $(BUILD)
 $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS_REL) -MMD -MP -c $< -o $@
 
-# ------------------------------------------------------ debug / sanitized ---
-# The instrumented build exists to run the whole suite under it, so this target
-# builds and runs rather than only building.
+# Builds and runs, since the point of the instrumented build is the suite.
 debug: $(BUILD)/minitpu-debug $(BUILD)/test_main-debug
 	./$(BUILD)/test_main-debug
 
@@ -55,12 +49,10 @@ $(BUILD)/minitpu-debug: $(DBG_OBJ) | $(BUILD)
 $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 	$(CXX) $(CXXFLAGS_DBG) -MMD -MP -c $< -o $@
 
-# --------------------------------------------------------------- tooling ---
 $(BUILD)/gen_examples: $(TOOLS_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(TOOLS_SRC) -o $@
 
-# Skipped while the generator does not exist, rather than failing on a
-# prerequisite that cannot be built.
+# Skipped, not failed, when the generator does not exist.
 examples:
 	@if [ -f $(TOOLS_SRC) ]; then \
 	  $(MAKE) --no-print-directory $(BUILD)/gen_examples && \
@@ -69,19 +61,14 @@ examples:
 	  echo "examples: skipped, no $(TOOLS_SRC)"; \
 	fi
 
-# Performance tables regenerated from the model, so the checked-in numbers are
-# reproducible.
+# Regenerated from the model, so the numbers are reproducible.
 $(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(REPORT_SRC) $(LIB_SRC) -o $@
 
 report: $(BUILD)/report
 	@./$(BUILD)/report
 
-# ----------------------------------------------------------------- trace ---
-# The trace generator instruments a run through the TraceSink in src/trace.h
-# and writes the .mtpt containers the visualizer under viz/ opens. It checks
-# that tracing left the run unchanged and that the trace agrees with the
-# oracle, the golden loops and itself, and fails if any check does.
+# Writes the .mtpt containers viz/ opens, failing if any of its checks does.
 TRACE_SRC = tools/tracegen.cpp
 TRACE_DIR = viz/traces
 
@@ -99,11 +86,8 @@ trace: $(BUILD)/tracegen examples
 	python3 viz/check_trace.py $(TRACE_DIR)/matmul_8.mtpt $(TRACE_DIR)/matmul_128.mtpt
 	python3 viz/embed_small.py $(TRACE_DIR)/matmul_8.mtpt viz/traces/matmul_8.js
 
-# ------------------------------------------------------------------ test ---
-# One translation unit per subsystem (tests/test_*.cpp), linked into a single
-# binary whose main() lives in tests/test_main.cpp. Every TU pulls in nearly
-# every header, so the suite is rebuilt on any header change rather than
-# tracked dependency by dependency.
+# Every test TU pulls in nearly every header, so the suite is rebuilt whenever
+# any of them changes rather than tracked dependency by dependency.
 $(BUILD)/test_main: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
 	@if [ -z "$(TEST_SRC)" ]; then echo "no tests/test_*.cpp"; exit 1; fi
 	$(CXX) $(CXXFLAGS_REL) $(TEST_SRC) $(LIB_SRC) -o $@
@@ -115,7 +99,6 @@ $(BUILD)/test_main-debug: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)
 test: $(BUILD)/test_main examples
 	./$(BUILD)/test_main
 
-# ---------------------------------------------------------------- housekeeping
 $(BUILD) $(OBJDIR) $(DBGDIR):
 	@mkdir -p $@
 

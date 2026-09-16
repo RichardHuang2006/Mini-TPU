@@ -1,10 +1,5 @@
-// Generates the performance tables for the reference workloads.
-//
-// The tables are checked in and so must be reproducible rather than hand-entered:
-// `make report` prints markdown that can be pasted back, and the same measurements
-// are asserted by the test suite's "stats", "config_sweep" and "properties"
-// sections. A model change that moves a number here also moves the tests pinning
-// the reasons for it.
+// Prints the README's performance tables as markdown, so the checked-in numbers
+// are reproducible rather than hand-entered.
 
 #include <cstdio>
 #include <string>
@@ -46,7 +41,7 @@ Run execute(const wl::Spec& spec, const Config& cfg) {
 Config sized(const wl::Spec& spec, uint32_t dim) {
     Config cfg = spec.cfg;
     cfg.dim = dim;
-    // Room for the tiles this array size needs, whatever the workload shipped with.
+    // Room for the tiles this array size needs.
     cfg.ub_bytes = std::max<uint32_t>(cfg.ub_bytes, 16 * dim * dim);
     return cfg;
 }

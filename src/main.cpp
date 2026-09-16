@@ -1,12 +1,4 @@
-// Top-level driver for Mini-TPU.
-//
-// `int main()` is guarded so tests can #include this file and drive
-// parse_args / print_help directly. Everything else is inline or
-// file-static, so including it twice does not violate ODR.
-//
-// The driver loads a program and its tensors, checks them, disassembles on
-// request, and runs them on the timed model, reporting utilization, effective TOPS,
-// the stall-cause breakdown and the run's roofline placement.
+// Top-level driver; main() is guarded so tests can include this file.
 
 #include <algorithm>
 #include <cstddef>
@@ -24,10 +16,6 @@
 #include "stats.h"
 #include "tpu.h"
 
-// ============================================================================
-// CLI surface
-// ============================================================================
-
 struct CliOpts {
     std::string prog_hex_path;
     std::string prog_raw_path;
@@ -39,16 +27,13 @@ struct CliOpts {
     bool run       = false;   // execute on the timed model
     bool show_help = false;
 
-    // MACs the workload actually needs, padding excluded. Only the tiler knows it,
-    // so utilization is reported against the array's own MAC count unless given
-    // here.
+    // MACs the workload needs, padding excluded; only the tiler knows it.
     uint32_t macs = 0;
 
     Config cfg;
 };
 
-// One entry per uint32_t Config knob. The pointer-to-member lets the parser
-// assign to any field uniformly, so adding a knob is one row here.
+// One entry per uint32_t Config knob, so adding a knob is one row here.
 struct ConfigKnob {
     const char*        flag;
     uint32_t Config::* member;
@@ -174,12 +159,6 @@ inline void print_help() {
     std::printf("  %-18s  %s\n", "--no-double-buffer", "load weights into the active plane");
 }
 
-// ============================================================================
-// Reporting
-// ============================================================================
-
-// disasm() itself lives with the ISA in src/isa.cpp, next to the encoding it
-// renders; the driver only formats listings around it.
 inline void print_program(const std::vector<RawInst>& prog) {
     std::printf("program: %zu instructions\n", prog.size());
     for (std::size_t i = 0; i < prog.size(); ++i) {
@@ -188,10 +167,7 @@ inline void print_program(const std::vector<RawInst>& prog) {
     }
 }
 
-// How much host and weight memory the program actually reaches. Taking it from the
-// instruction stream rather than a flag lets a bundled example run with no sizing
-// arguments, and a program addressing past the end still traps at the instruction
-// that does so rather than being quietly given room.
+// How much host and weight memory the program reaches, so sizing needs no flag.
 struct MemNeed {
     std::size_t host   = 0;
     std::size_t weight = 0;
@@ -231,8 +207,7 @@ inline int run_program(const CliOpts& opts, const std::vector<RawInst>& prog,
 
     Tpu t(opts.cfg, host_bytes, weight_bytes);
 
-    // Activations start at host address 0 and weights at DDR address 0, where the
-    // tiler places them by default.
+    // Where the tiler places them by default.
     for (std::size_t i = 0; i < acts.count() && i < host_bytes; ++i) {
         t.host()[i] = static_cast<uint8_t>(acts.wide ? static_cast<i8>(acts.i32v[i])
                                                     : acts.i8v[i]);
@@ -271,8 +246,6 @@ inline int run_program(const CliOpts& opts, const std::vector<RawInst>& prog,
 
 inline void print_tensor(const char* label, const TensorBlob& t) {
     std::printf("%s: %ux%u %s\n", label, t.rows, t.cols, t.wide ? "int32" : "int8");
-    // A few leading elements distinguish the right file from the right shape of
-    // the wrong file.
     const std::size_t show = t.count() < 8 ? t.count() : 8;
     if (show == 0) return;
     std::printf("  head:");
@@ -290,10 +263,6 @@ inline void print_config(const Config& cfg) {
                 cfg.weight_fifo_depth, cfg.dma_bytes_per_cycle,
                 cfg.double_buffer ? "on" : "off");
 }
-
-// ============================================================================
-// Entry point (compiled out when included from a test TU).
-// ============================================================================
 
 #ifndef MINI_TPU_NO_ENTRY
 int main(int argc, char** argv) {
@@ -359,7 +328,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    // Any illegal encoding is worth reporting now rather than at issue time.
+    // Report any illegal encoding now rather than at issue time.
     std::size_t traps = 0;
     for (const RawInst& inst : prog) {
         if (decode(inst).trap) ++traps;

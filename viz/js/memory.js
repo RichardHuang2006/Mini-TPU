@@ -1,10 +1,5 @@
-// Memory view: the Unified Buffer (with its named regions, reservations and
-// the addr % banks stripe of each byte), the accumulator banks as int32 grids,
-// host memory, weight memory and the two weight planes. Values come from the
-// replayed memory image at the current cycle and phase; bytes committed this
-// cycle are highlighted violet, bytes read at issue green.
-//
-// Classic script: defines window.MTV.views.memory.
+// The Unified Buffer, accumulator banks, host and weight memory and the weight
+// planes, replayed at this cycle; commits are violet, issue-time reads green.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});

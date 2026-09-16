@@ -1,15 +1,7 @@
 #pragma once
 
-// Shared plumbing for the Mini-TPU test suite: the section registry, the
-// REQUIRE macros, and the helpers every subsystem's tests lean on -- small
-// configurations, deterministic data, reference-machine pokes and peeks, and
-// the differential comparison between the timed machine and the eager oracle.
-//
-// The suite is split into one translation unit per hardware concept
-// (test_datapath.cpp, test_systolic_array.cpp, ...), all linked into one
-// binary whose main() lives in test_main.cpp. A SECTION() registers itself at
-// static-initialization time, so adding a test is writing one in the right
-// file; nothing else needs to change.
+// The section registry, the REQUIRE macros, and the helpers shared by every
+// test translation unit. A SECTION() registers itself at static-init time.
 
 #include <cstdint>
 
@@ -38,7 +30,6 @@
 #include "ref.h"
 #include "workloads.h"   // the layer tiler, shared with tools/gen_examples.cpp
 
-// ---------------------------------------------------------- harness plumbing ---
 namespace test {
 
 using Fn = std::function<void()>;
@@ -59,8 +50,7 @@ inline void report_fail(const char* expr, const char* file, int line) {
     ++assertion_failures;
 }
 
-// For failures where the expression alone says nothing useful, such as a
-// tensor compare that needs to print what actually came out.
+// For failures where the expression alone says nothing useful.
 inline void report_fail_msg(const char* expr, const std::string& detail,
                             const char* file, int line) {
     std::fprintf(stderr, "  FAIL: %s   at %s:%d\n%s", expr, file, line, detail.c_str());
@@ -88,12 +78,7 @@ inline void report_fail_msg(const char* expr, const std::string& detail,
         if (!(expr)) ::test::report_fail_msg(#expr, (detail), __FILE__, __LINE__); \
     } while (0)
 
-// ------------------------------------------------------------------ helpers ---
-// Shared across the test translation units; everything below is inline so
-// every test file can include this header.
-
-// A small machine: hand-checked expectations are only possible when the array
-// is small enough to multiply on paper.
+// A machine small enough to multiply on paper.
 inline Config small_cfg(uint32_t dim = 4, uint32_t banks = 2) {
     Config c;
     c.dim       = dim;
@@ -102,10 +87,8 @@ inline Config small_cfg(uint32_t dim = 4, uint32_t banks = 2) {
     return c;
 }
 
-// A deterministic byte source. Taking the top bits of an LCG spreads values over
-// the whole int8 range including -128, which has no positive counterpart and is
-// where a sloppy negation shows up. The same generator the bundled workloads use,
-// so a test and an example built from one seed hold the same bytes.
+// The same generator the bundled workloads use, so one seed gives both the
+// same bytes; it spans the whole int8 range, -128 included.
 using Lcg = wl::Rng;
 
 inline std::string show(const std::vector<int>& v) {
@@ -129,10 +112,8 @@ inline std::string diff_vec(const char* what, const std::vector<int>& got,
     return os.str();
 }
 
-// ---- reference-machine pokes and peeks ------------------------------------
-// The reference model's state is public on purpose; a test sets up exactly the
-// state it means to exercise instead of arranging a program to produce it.
-
+// The reference model's state is public, so a test can set up exactly the state
+// it means to exercise rather than arranging a program to produce it.
 inline void put_bytes(ref::Machine& m, UbAddr at, std::initializer_list<int> vals) {
     std::size_t i = 0;
     for (const int v : vals) m.ub[at + i++] = static_cast<i8>(v);
@@ -176,8 +157,6 @@ inline std::vector<int> acc_slice(const ref::Machine& m, BankId b, uint32_t rows
     return out;
 }
 
-// ---- differential comparison ---------------------------------------------
-
 template <typename T>
 std::size_t first_diff(const std::vector<T>& a, const std::vector<T>& b) {
     const std::size_t n = std::min(a.size(), b.size());
@@ -187,8 +166,7 @@ std::size_t first_diff(const std::vector<T>& a, const std::vector<T>& b) {
     return n;   // a common prefix; the sizes are what differ
 }
 
-// Everything a run is compared on, lifted out of whichever model produced it so
-// one comparison serves both the reference model and the timed machine.
+// Everything a run is compared on, lifted out of whichever model produced it.
 struct RunView {
     bool     halted    = false;
     bool     trapped   = false;
@@ -235,8 +213,7 @@ inline RunView view_of(Tpu& t, const TpuResult& r) {
     return v;
 }
 
-// Every comparand of the differential check: output bytes, accumulators at each
-// Sync, and the retired count. Returns "" when the two runs agree.
+// Returns "" when the two runs agree on every comparand.
 inline std::string compare_runs(const char* a_name, const RunView& ra,
                                 const char* b_name, const RunView& rb) {
     std::ostringstream os;
@@ -287,12 +264,10 @@ inline std::string compare_runs(const char* a_name, const RunView& ra,
 
 using Setup = std::function<void(ref::Machine&)>;
 
-// The same initial state, applied to the timed machine. Kept separate from Setup
-// so a test writes its inputs once and both models see them.
+// The same initial state, applied to the timed machine.
 using TpuSetup = std::function<void(Tpu&)>;
 
-// Two reference runs of the same program. This is what proved the comparison
-// itself works before there was a second implementation to point it at.
+// Two reference runs of the same program, which checks the comparison itself.
 inline std::string diff_run(const std::vector<RawInst>& prog, const Config& cfg,
                             const Setup& setup = {}) {
     ref::Machine ma(cfg), mb(cfg);
@@ -302,8 +277,7 @@ inline std::string diff_run(const std::vector<RawInst>& prog, const Config& cfg,
     return compare_runs("ref", view_of(ma, ra), "ref-again", view_of(mb, rb));
 }
 
-// The real thing: the cycle-accurate machine against the oracle. Returns "" when
-// they agree on every comparand.
+// The cycle-accurate machine against the oracle.
 inline std::string diff_tpu(const std::vector<RawInst>& prog, const Config& cfg,
                             const Setup& rsetup = {}, const TpuSetup& tsetup = {},
                             std::size_t host_bytes = 1u << 16,
@@ -318,8 +292,7 @@ inline std::string diff_tpu(const std::vector<RawInst>& prog, const Config& cfg,
     return compare_runs("ref", view_of(m, rr), "tpu", view_of(t, tr));
 }
 
-// Copy a byte image into host memory and weight memory on both models, so the
-// two setups cannot drift apart.
+// One byte image for both models, so their setups cannot drift apart.
 struct Inputs {
     HostAddr        host_at = 0;
     std::vector<i8> host_bytes;
@@ -328,10 +301,8 @@ struct Inputs {
     UbAddr          ub_at = 0;
     std::vector<i8> ub_bytes;
 
-    // Accumulator contents, row-major into one bank. Planting these lets a test
-    // choose the exact int32 values the activation pipeline sees rather than
-    // whatever a matmul happens to produce, which is the only way to sweep densely
-    // across a clamp boundary.
+    // Accumulator contents, row-major into one bank, so a test can choose the
+    // exact int32 values the activation pipeline sees.
     BankId           acc_at = 0;
     std::vector<i32> acc_vals;
 };
@@ -388,10 +359,7 @@ inline Inputs random_inputs(uint32_t seed, uint32_t dim, uint32_t len, std::size
     return in;
 }
 
-// ---- systolic array helpers ----------------------------------------------
-
-// The oracle's answer, obtained by actually running Read_Weights + MatMul
-// through ref.h rather than by reimplementing the matmul here.
+// The oracle's answer, from running Read_Weights + MatMul through ref.h.
 inline std::vector<int> ref_matmul(const Config& cfg, const std::vector<i8>& weights,
                                    const std::vector<i8>& acts, uint32_t len) {
     ref::Machine m(cfg);

@@ -96,6 +96,45 @@ each instruction's lifetime, reservation and tile, the issue / retire /
 prefetch / plane-load / stall-span records, the statistics, and the results of
 the generator's checks.
 
+## Timeline
+
+The bottom timeline has one row per unit (SEQ, DMA, WEIGHT, MXU, ACT) and four
+diagnostic rows (FIFO, UB ports, ACC banks, idle cause), all drawn from the
+per-cycle trace columns and the issue / retire / stall records.
+
+- **Hover** any row for what occupies it at that cycle: the instruction and its
+  lifetime on unit rows; occupancy and ready slots against `weight_fifo_depth`
+  on FIFO; read and write streams against `ub_banks` on UB ports; the pc
+  reserving each accumulator bank lane on ACC; and on idle cause, the bucket,
+  its run, `charge_idle_cycle`'s rule and the instruction it points at. When a
+  pixel covers several cycles the tooltip says which, and the FIFO and UB rows
+  draw the minimum solid with the min–max range as a lighter band, so a drop to
+  empty inside a pixel stays visible.
+- **Click** a stall run on SEQ or a run on idle cause to seek there and select
+  the blocker the sequencer recorded (or, for an idle cycle with no recorded
+  blocker, the DMA or ACT instruction the charge rule found active). Click a
+  unit bar or an ACC lane to select that instruction; alt+click also seeks.
+  Click the ruler or empty track to seek; drag to scrub.
+- **Wheel** zooms, shift+wheel or a horizontal swipe pans, alt+wheel scrolls
+  the rows. Rows keep a minimum height and scroll when they do not fit; click a
+  row label to collapse or expand it.
+- **Where the cycles went** (right of the tracks) is a Pareto of the
+  `charge_idle_cycle` buckets beside the `StallStats` issue-point counters for
+  the visible window, recomputed on every zoom and pan. Over the whole run they
+  equal the recorded statistics. Click a bar to dim every cycle that does not
+  match; click it again, or *clear*, to remove the filter.
+- **Blocker chain** (inspector, for any selected instruction) walks back from
+  its issue to the root of its critical path. Each hop follows the blocker
+  recorded for the instruction's last wait, which retired on the very cycle the
+  waiter issued, or the previous instruction when a hop issued on its first
+  attempt (in-order issue), and ends at pc 0 or at a wait with no blocking
+  instruction such as DDR latency. It is derived from recorded records only and
+  labelled as such; `viz/selftest.js` checks both release rules on every hop.
+
+Colours for stall reasons and idle buckets are theme tokens in `app.css`
+(`--st-*`, `--idle-*`); idle buckets are hatched, so no two buckets share a
+fill in either theme.
+
 ## Keyboard
 
 ← → cycle (Shift: ×10) · `.` `,` phase · Space play · `e` `E` next/previous event ·

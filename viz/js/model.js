@@ -1,17 +1,5 @@
-// The cycle model: state at (cycle t, phase) as a pure function of the trace.
-//
-// One machine cycle t is one iteration of Tpu::run (src/tpu.cpp):
-//   1 retire     units whose done_cycle <= t commit their staged outputs
-//   2 prefetch   the weight prefetcher pushes tiles into the FIFO
-//   3 issue      the instruction at pc issues, or exactly one stall counter moves
-//   4 account    the cycle is charged to array-busy or to one idle bucket
-//   5 advance
-// The phases exposed here are 'start' (before step 1), 'retire', 'prefetch',
-// 'issue', 'account' (after each step). Memory images are materialized by
-// replaying the recorded commits: after-images going forward, before-images
-// going backward, so scrubbing is deterministic in both directions.
-//
-// Classic script: defines window.MTV.Model.
+// State at (cycle t, phase) as a pure function of the trace, over the phases
+// viz/README.md's cycle contract defines. Memory images replay the commits.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -75,7 +63,7 @@
       this.state = null;
     }
 
-    // ---------------------------------------------------------- indexes ----
+    // indexes
     buildIndexes() {
       const m = this.m;
       this.unitIv = {};
@@ -123,6 +111,14 @@
       this.actByPc = new Map();
       for (const a of this.activates) this.actByPc.set(a.pc, a);
       this.stalls.forEach((s, i) => { s.index = i; });
+      this.stallsByPc = new Map();
+      for (const s of this.stalls) {
+        if (!this.stallsByPc.has(s.pc)) this.stallsByPc.set(s.pc, []);
+        this.stallsByPc.get(s.pc).push(s);
+      }
+      for (const list of this.stallsByPc.values()) list.sort((a, b) => a.from - b.from);
+      this.prefetchForPc = new Map();
+      for (const p of this.prefetches) if (!this.prefetchForPc.has(p.for_pc)) this.prefetchForPc.set(p.for_pc, p);
 
       // Idle runs (RLE of cyc.idle) and outcome runs, for the timeline.
       this.idleRuns = [];
@@ -158,8 +154,7 @@
           map.get(key).push(p);
         }
       }
-      // Named UB regions from the program (A tiles the DMA fills, C staging the
-      // Activate writes), for the memory map.
+      // Named UB regions from the program, for the memory map.
       this.ubRegions = [];
       const seen = new Set();
       for (const p of this.program) {
@@ -175,7 +170,7 @@
       this.ubRegions.sort((a, b) => a.addr - b.addr);
     }
 
-    // ------------------------------------------------------- memory images --
+    // memory images
     resetImages() {
       const dim = this.dim;
       this.img = {
@@ -223,7 +218,7 @@
       while (this.applied > target) { this.applied--; const c = this.commits[this.applied]; this.applyOne(c, this.commitBefore(c)); }
     }
 
-    // ------------------------------------------------------------ queries --
+    // queries
     unitAt(u, t, phase) {
       // Active instruction on unit u at (t, phase), or null.
       const iv = this.unitIv[u];
@@ -259,8 +254,7 @@
     }
 
     planesAt(t, phase) {
-      // Contents come from the memory image; active/pending from the per-cycle
-      // table of the previous cycle, adjusted for this cycle's phases.
+      // Contents from the memory image, active/pending from the per-cycle table.
       const prevPlane = t > 0 ? this.cyc.plane[t - 1] : 0;
       const prevPending = t > 0 ? !!this.cyc.pending[t - 1] : false;
       let active = prevPlane, pending = prevPending;
@@ -281,8 +275,7 @@
     // The MatMul whose array steps cover cycle t, and which frame to show.
     mxuAt(t, phase) {
       const x = this.unitAt('MXU', t, phase === 'start' || phase === 'retire' || phase === 'prefetch' ? 'account' : phase);
-      // x is active after issue; for early phases we want the matmul in flight
-      // at the start of t (issued before t, not yet retired at t).
+      // Before issue, the matmul in flight is the one issued before t.
       const early = phase === 'start' || phase === 'retire' || phase === 'prefetch';
       let mm = null, s = -1;
       if (early) {
@@ -327,7 +320,7 @@
       };
     }
 
-    // ----------------------------------------------------------- setCycle --
+    // setCycle
     setCycle(t, phase) {
       t = Math.max(0, Math.min(this.cycles - 1, t | 0));
       if (!PHASES.includes(phase)) phase = 'account';
@@ -358,7 +351,7 @@
       return st;
     }
 
-    // --------------------------------------------------------- navigation --
+    // navigation
     nextEventCycle(t) {
       // Next cycle where something other than a continued stall happens.
       for (let x = t + 1; x < this.cycles; x++) {
@@ -411,7 +404,7 @@
       return 0;
     }
 
-    // -------------------------------------------------- dense-layer helpers --
+    // dense-layer helpers
     tilesOf(n) { return Math.floor((n + this.dim - 1) / this.dim); }
     tileOff(tr, tc, cols) { return (tr * this.tilesOf(cols) + tc) * this.dim * this.dim; }
 
@@ -439,8 +432,105 @@
       return { i, j, m, n, r: i % dim, c: j % dim, host, chain, acts, writes };
     }
 
-    // History of a physical location: every read at issue and commit at retire
-    // whose range covers it. kind: 'ub' | 'host' | 'acc' (addr = bank, plus row, col).
+    // Prefix sums of the per-cycle columns, so any window costs O(buckets).
+    counts() {
+      if (this._counts) return this._counts;
+      const n = this.cycles;
+      const idle = IDLE_NAMES.map(() => new Uint32Array(n + 1));
+      const outcome = STALL_NAMES.map(() => new Uint32Array(n + 1));
+      const ci = this.cyc.idle, co = this.cyc.outcome;
+      for (let t = 0; t < n; t++) {
+        for (let b = 0; b < idle.length; b++) idle[b][t + 1] = idle[b][t] + (ci[t] === b ? 1 : 0);
+        for (let k = 0; k < outcome.length; k++) outcome[k][t + 1] = outcome[k][t] + (co[t] === k ? 1 : 0);
+      }
+      this._counts = { idle, outcome };
+      return this._counts;
+    }
+
+    // Counts over cycles [a, b).
+    windowCounts(a, b) {
+      a = Math.max(0, Math.min(this.cycles, a | 0));
+      b = Math.max(a, Math.min(this.cycles, b | 0));
+      const pre = this.counts();
+      const idle = {}, outcome = {};
+      IDLE_NAMES.forEach((name, i) => { idle[name] = pre.idle[i][b] - pre.idle[i][a]; });
+      STALL_NAMES.forEach((name, i) => { outcome[name] = pre.outcome[i][b] - pre.outcome[i][a]; });
+      return { a, b, n: b - a, idle, outcome };
+    }
+
+    // How many cycles in [a, b) match a filter {kind: 'idle' | 'stall', key}.
+    matchCount(filter, a, b) {
+      const pre = this.counts();
+      const arr = filter.kind === 'idle' ? pre.idle[IDLE_NAMES.indexOf(filter.key)] : pre.outcome[STALL_NAMES.indexOf(filter.key)];
+      if (!arr) return 0;
+      return arr[b] - arr[a];
+    }
+
+    idleRunAt(t) {
+      const i = upperBound(this.idleRuns, (r) => r.from, t) - 1;
+      return i >= 0 && t <= this.idleRuns[i].to ? this.idleRuns[i] : null;
+    }
+
+    // The instruction an idle-cause cycle points at, in the charge rule's order:
+    // the recorded blocker, the in-flight DMA or ACT, the MatMul, the staller.
+    idleBlockerAt(t) {
+      const o = this.outcomeAt(t);
+      if (o.kind === 'stall' && o.blockerPc !== null) return { pc: o.blockerPc, via: 'blocker', o };
+      const unitFor = { dma: 'DMA', act: 'ACT', busy: 'MXU' }[o.idle];
+      if (unitFor) {
+        const x = this.unitAt(unitFor, t, 'account');
+        if (x) return { pc: x.pc, via: o.idle === 'busy' ? 'busy' : 'charge', unit: unitFor, o };
+      }
+      if (this.program[o.pc]) return { pc: o.pc, via: 'stalled', o };
+      return { pc: null, via: 'none', o };
+    }
+
+    // Why pc issued when it did, walked back to the root of the critical path;
+    // each hop is tagged blocked / in_order / resource / root / unissued.
+    blockerChain(pc, maxHops) {
+      maxHops = maxHops || 4096;
+      const hops = [];
+      const seen = new Set();
+      let cur = pc;
+      while (cur !== null && cur !== undefined && hops.length < maxHops) {
+        const p = this.program[cur];
+        if (!p) break;
+        if (seen.has(cur)) { hops.push({ pc: cur, kind: 'loop', next: null, spans: [] }); break; }
+        seen.add(cur);
+        const spans = this.stallsByPc.get(cur) || [];
+        const hop = {
+          pc: cur, op: p.op, unit: p.unit, first: p.first_attempt, issue: p.issue, retire: p.retire, spans,
+          waited: spans.reduce((sum, x) => sum + (x.to - x.from + 1), 0), next: null,
+        };
+        const last = spans[spans.length - 1];
+        if (p.issue === null) {
+          hop.kind = 'unissued';
+          if (last && last.blocker_pc !== null) { hop.reason = last.reason; hop.span = last; }
+        } else if (last && last.to + 1 === p.issue) {
+          hop.reason = last.reason;
+          hop.span = last;
+          if (last.blocker_pc !== null) {
+            hop.kind = 'blocked';
+            hop.next = last.blocker_pc;
+            hop.nextUnit = last.blocker_unit;
+          } else {
+            hop.kind = 'resource';
+            if (last.reason === 'weight_fifo_empty') hop.prefetch = this.prefetchForPc.get(cur) || null;
+          }
+        } else if (cur === 0) {
+          hop.kind = 'root';
+        } else {
+          const prev = this.program[cur - 1];
+          if (prev && prev.issue !== null && prev.issue === p.issue - 1) { hop.kind = 'in_order'; hop.next = cur - 1; }
+          else hop.kind = 'root';
+        }
+        hops.push(hop);
+        cur = hop.next;
+      }
+      return hops;
+    }
+
+    // Every read and commit covering one location; kind 'ub' | 'host' | 'acc'.
     history(kind, addr, row, col) {
       const dim = this.dim;
       const out = [];

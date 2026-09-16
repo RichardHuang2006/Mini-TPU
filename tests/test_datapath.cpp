@@ -1,11 +1,7 @@
-// Datapath tests: the foundational types and arithmetic of src/datapath.h and
-// the runtime configuration of src/config.h. Tensor views, strides and tile
-// subviews; fixed-point requantization with round-half-away-from-zero in both
-// signs; saturation at both int8 ends; and the peak-MAC and roofline
-// ridge-point arithmetic.
+// Tests for src/datapath.h and src/config.h.
 
 #include "test_support.h"
-// ------------------------------------------------------- @section("types") ---
+
 SECTION("types") {
     static_assert(std::is_same_v<i8,  int8_t>);
     static_assert(std::is_same_v<i32, int32_t>);
@@ -39,12 +35,10 @@ SECTION("types") {
     static_assert(static_cast<int>(ActFn::RELU)   != static_cast<int>(ActFn::RELU6));
     static_assert(static_cast<int>(Pool::MAX)     != static_cast<int>(Pool::AVG));
 
-    // HALT is the last opcode; the decoder's illegal-encoding check relies on
-    // it, so a new opcode appended after it would silently break that test.
+    // HALT is the last opcode, which the decoder's illegal-encoding check needs.
     static_assert(static_cast<uint32_t>(Op::HALT) == isa::MAX_OPCODE);
 }
 
-// ------------------------------------------------------ @section("config") ---
 SECTION("config") {
     Config c;
 
@@ -57,16 +51,14 @@ SECTION("config") {
     REQUIRE(c.double_buffer       == true);
     REQUIRE(c.dma_bytes_per_cycle == 16);
 
-    // A 32x32 array is 1024 MACs per cycle, so the ridge point is 1024/16 = 64
-    // MACs per byte moved.
+    // 1024 MACs per cycle, so the ridge point is 1024/16 = 64 MACs per byte.
     REQUIRE(c.peak_macs_per_cycle() == 1024u);
     REQUIRE(c.dma_bound(1000, 100));        // 10 MACs/byte: memory bound
     REQUIRE(!c.dma_bound(12800, 100));      // 128 MACs/byte: compute bound
     REQUIRE(!c.dma_bound(6400, 100));       // exactly at the ridge is not below it
     REQUIRE(c.dma_bound(6399, 100));        // one MAC under, and it tips over
 
-    // A bigger array moves the ridge point up: the same workload that saturated
-    // a small array becomes memory bound on a large one.
+    // A bigger array moves the ridge point up.
     Config big = c;
     big.dim = 256;
     REQUIRE(big.peak_macs_per_cycle() == 65536u);
@@ -75,7 +67,6 @@ SECTION("config") {
     static_assert(std::is_trivially_copyable_v<Config>);
 }
 
-// ------------------------------------------------------ @section("tensor") ---
 SECTION("tensor") {
     // A strided window must alias the parent, not copy it.
     I8Tensor t(6, 6);
@@ -101,8 +92,7 @@ SECTION("tensor") {
     const I8View sub2 = sub.tile(0, 1, 1, 2);
     REQUIRE(sub2.at(0, 0) == v.at(1, 3));
 
-    // Partial tile: a 2x3 source into a 4x4 tile zero-pads the remainder, which
-    // is what makes an undersized matmul produce the right answer.
+    // A 2x3 source into a 4x4 tile zero-pads the remainder.
     I8Tensor src(2, 3);
     src.view().fill(7);
     I8Tensor dst(4, 4);
@@ -134,7 +124,6 @@ SECTION("tensor") {
     REQUIRE(cv.at(2, 4) == 99);
 }
 
-// ------------------------------------------------------- @section("quant") ---
 SECTION("quant") {
     using namespace quant;
 
@@ -151,8 +140,7 @@ SECTION("quant") {
     REQUIRE(round_shift(-6, 2) == -2);
     REQUIRE(round_shift(-10, 2) == -3);
 
-    // Average pooling's divisor is a window area, not a power of two, and it
-    // follows the same rule through the same helper.
+    // Average pooling's divisor is a window area, not a power of two.
     REQUIRE(round_div(5, 2) == 3);
     REQUIRE(round_div(-5, 2) == -3);
     REQUIRE(round_div(1, 3) == 0);
@@ -176,8 +164,7 @@ SECTION("quant") {
     // A bias large enough to overflow int32 if it were added there.
     REQUIRE(requantize_biased(2147483647, 2147483647, 1, 8) == 127);
 
-    // Sweep against an independently written rounding rule: this one compares
-    // twice the remainder against the divisor instead of adding half first.
+    // An independent rounding rule: compare twice the remainder to the divisor.
     auto expect_rq = [](i32 acc, i32 mult, uint32_t shift) -> int {
         const int64_t num = static_cast<int64_t>(acc) * mult;
         const int64_t den = int64_t{1} << shift;

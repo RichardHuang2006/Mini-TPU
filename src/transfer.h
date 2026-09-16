@@ -10,17 +10,6 @@
 #include "datapath.h"
 #include "storage.h"
 
-// Data movement: the weight FIFO that stages tiles from weight memory (DDR)
-// toward the array, and the host DMA engine that moves byte ranges between
-// host memory and the Unified Buffer. Both are timed units -- a tile takes
-// ddr_tile_latency cycles to arrive, a transfer takes ceil(bytes / bandwidth)
-// cycles to complete -- and both overlap with the compute units under the
-// sequencer's scoreboard.
-
-// ============================================================================
-// Weight FIFO
-// ============================================================================
-
 // A staged weight tile on its way from weight memory (DDR) to the array.
 struct WeightTile {
     uint32_t        ddr_addr = 0;
@@ -32,12 +21,7 @@ struct WeightTile {
     ConstI8View view() const { return ConstI8View(data.data(), rows, cols); }
 };
 
-// A bounded FIFO of weight tiles with a background refill.
-//
-// A tile takes ddr_tile_latency cycles to arrive from DDR, so a program that
-// stages tiles ahead of the matmuls needing them hides that latency, while one
-// requesting a tile at the point of use pays it in full. Popping an empty FIFO is
-// the weight_fifo_empty stall.
+// A bounded FIFO of weight tiles, each arriving ddr_tile_latency cycles late.
 class WeightFifo {
 public:
     struct Stats {
@@ -56,9 +40,7 @@ public:
     uint32_t latency() const { return latency_; }
     const Stats& stats() const { return stats_; }
 
-    // Slots held, whether the tile has arrived or is still in flight. A refill
-    // occupies its slot from the moment it is requested, so a 1-deep FIFO
-    // serializes back-to-back loads.
+    // Slots held, whether the tile has arrived or is still in flight.
     std::size_t occupancy() const { return q_.size(); }
     bool full() const { return q_.size() >= depth_; }
 
@@ -88,8 +70,7 @@ public:
     // Advance the clock, letting in-flight refills land.
     void tick(uint64_t now) { now_ = now; }
 
-    // Pop the oldest ready tile. False means the FIFO had nothing ready and the
-    // instruction must stall.
+    // Pop the oldest ready tile; false means the caller must stall.
     bool pop(WeightTile& out) {
         if (empty()) {
             ++stats_.empty_stalls;
@@ -101,8 +82,7 @@ public:
         return true;
     }
 
-    // When the oldest in-flight tile arrives, so a caller can size its wait
-    // instead of polling.
+    // When the oldest in-flight tile arrives, so a caller can size its wait.
     uint64_t next_ready_cycle() const {
         return q_.empty() ? now_ : q_.front().ready_cycle;
     }
@@ -120,10 +100,6 @@ private:
     Stats             stats_;
 };
 
-// ============================================================================
-// Host DMA engine
-// ============================================================================
-
 enum class DmaDir : uint8_t {
     HOST_TO_UB,   // Read_Host_Memory
     UB_TO_HOST,   // Write_Host_Memory
@@ -136,13 +112,7 @@ struct DmaRequest {
     uint32_t bytes = 0;
 };
 
-// The host DMA engine: moves byte ranges between host memory and the Unified
-// Buffer at a configurable bandwidth.
-//
-// start() copies the bytes while the timing is accounted separately, so a reader
-// peeking mid-transfer would see finished data. That is sound only because the
-// scoreboard interlock stalls every consumer until the DMA retires; the split
-// leaves the schedule as the only thing the timing model has to get right.
+// Moves byte ranges between host memory and the Unified Buffer.
 class Dma {
 public:
     struct Stats {
@@ -159,8 +129,7 @@ public:
     uint32_t bytes_per_cycle() const { return bw_; }
     const Stats& stats() const { return stats_; }
 
-    // Cycles a transfer occupies the engine. A zero-byte transfer is free, and
-    // any nonzero one costs at least a cycle however wide the bus is.
+    // Cycles a transfer occupies the engine; a zero-byte transfer is free.
     uint64_t transfer_cycles(uint32_t bytes) const {
         if (bytes == 0) return 0;
         return (static_cast<uint64_t>(bytes) + bw_ - 1) / bw_;
@@ -169,15 +138,10 @@ public:
     bool busy() const { return active_ && now_ < finish_; }
     uint64_t finish_cycle() const { return finish_; }
 
-    // The UB address the transfer is touching, so the sequencer can charge it a
-    // bank port for the duration.
+    // The UB address the transfer is touching, for the sequencer's port budget.
     UbAddr ub_endpoint() const { return ub_; }
 
-    // Reserve the engine and account for the transfer without moving any bytes.
-    // The sequencer uses this one: it reads the source at issue and commits the
-    // destination at retire, so a consumer that issued too early sees the old
-    // bytes. A missing interlock therefore surfaces as a wrong answer, not only
-    // as a wrong schedule.
+    // Reserve and time the transfer without moving bytes; the sequencer does that.
     bool begin(const DmaRequest& r, uint64_t now, std::size_t host_bytes,
                const UnifiedBuffer& ub) {
         now_ = now;
@@ -202,8 +166,7 @@ public:
         return true;
     }
 
-    // Reserve the engine and move the bytes immediately, for a caller driving the
-    // machine by hand with nothing else in flight to observe the difference.
+    // Reserve the engine and move the bytes immediately, for a hand-driven caller.
     bool start(const DmaRequest& r, uint64_t now, std::vector<uint8_t>& host,
                UnifiedBuffer& ub) {
         if (!begin(r, now, host.size(), ub)) return false;

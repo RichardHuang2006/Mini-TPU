@@ -14,12 +14,6 @@
 #include "systolic_array.h"
 #include "transfer.h"
 
-// ---------------------------------------------------------------------------
-// The scoreboard's view of an instruction: which Unified Buffer bytes it reads
-// and writes, which accumulator bank, and whether it touches the resident
-// weights. Everything the interlock needs, computed once at issue.
-// ---------------------------------------------------------------------------
-
 struct UbRegion {
     UbAddr lo = 0;
     UbAddr hi = 0;   // exclusive
@@ -30,6 +24,7 @@ struct UbRegion {
     }
 };
 
+// The scoreboard's view of an instruction, computed once at issue.
 struct Reservation {
     UbRegion ub_read;
     UbRegion ub_write;
@@ -39,8 +34,7 @@ struct Reservation {
     bool     writes_weights = false;   // Read_Weights replaces it
 };
 
-// One instruction can be in flight per unit; that is the whole of the
-// concurrency model. SEQ covers the instructions with no unit of their own.
+// One instruction in flight per unit; SEQ covers those with no unit of their own.
 enum class Unit : uint8_t { DMA, WEIGHT, MXU, ACT, SEQ, COUNT };
 
 inline const char* unit_name(Unit u) {
@@ -55,8 +49,7 @@ inline const char* unit_name(Unit u) {
     return "?";
 }
 
-// Why one issue attempt failed. Each value names the StallStats counter that
-// moved; a trace records one of these per cycle that issued nothing.
+// Why one issue attempt failed; each value names the StallStats counter it moves.
 enum class StallReason : uint8_t {
     NONE,
     DRAIN,
@@ -86,10 +79,7 @@ inline const char* stall_reason_name(StallReason r) {
     return "?";
 }
 
-// An instruction reads its inputs at issue and commits its outputs at retire.
-// The gap makes the scoreboard matter for data as well as for the schedule: a
-// consumer allowed to issue too early reads state its producer has not replaced
-// yet, so a missing interlock is a wrong answer, not just a wrong cycle count.
+// Outputs staged at issue, committed at retire.
 struct PendingWrite {
     UbAddr          ub_at = 0;
     std::vector<i8> ub_data;
@@ -112,8 +102,7 @@ struct InFlight {
     uint64_t     done_cycle  = 0;
 };
 
-// Why issue could not proceed, per cycle. A slow program is slow for one of
-// these reasons and the counters say which.
+// Why issue could not proceed, per cycle.
 struct StallStats {
     uint64_t ub_raw       = 0;   // reader waiting on the writer of its region
     uint64_t ub_war       = 0;   // writer waiting on a reader of its region
@@ -127,8 +116,7 @@ struct StallStats {
     uint64_t ub_bank_conflict  = 0;   // no free Unified Buffer port this cycle
     uint64_t drain             = 0;   // Sync, Halt, or a trap waiting for quiet
 
-    // Cycles the array stood idle for a weight load because there was no shadow
-    // plane to hide it in.
+    // Cycles the array stood idle for a weight load with no shadow plane.
     uint64_t weight_load_bubble = 0;
 
     uint64_t total() const {
@@ -137,21 +125,13 @@ struct StallStats {
     }
 };
 
-// Raw per-cycle tallies of what the array was doing and what it was waiting on.
-// src/stats.h derives utilization, TOPS and the stall-cause breakdown from these,
-// so the machine never has to know how a number will be presented.
-//
-// The idle buckets partition `cycles - array_busy` exactly: every cycle the array
-// stands still bumps precisely one of them. Without that, a dominant cause would
-// only reflect what got double counted.
+// Raw per-cycle tallies; the idle buckets partition `cycles - array_busy`.
 struct RunProfile {
     uint64_t array_busy    = 0;   // cycles the MXU had a matmul in flight
     uint64_t stream_cycles = 0;   // of those, cycles spent streaming rows
     uint64_t matmuls       = 0;
 
-    // MACs the array actually performed, padding included: one per PE per
-    // streaming cycle. The useful subset is a property of the workload rather
-    // than of the machine, so the caller supplies it.
+    // MACs the array performed, padding included: one per PE per streaming cycle.
     uint64_t macs_performed = 0;
 
     uint64_t dma_bytes = 0;
@@ -173,7 +153,7 @@ struct RunProfile {
     }
 };
 
-// Every accumulator bank, flattened, as of one Sync. The mirror of ref::Snapshot.
+// Every accumulator bank, flattened, as of one Sync.
 struct TpuSnapshot {
     std::vector<i32> acc;
 };
@@ -194,9 +174,7 @@ struct TpuResult {
     bool done() const { return halted || trapped; }
 };
 
-// Structured trace observer and its per-cycle record, defined in src/trace.h.
-// A null sink means no tracing, and every hook site is guarded on that, so a
-// run without a sink is the same run as before the hooks existed.
+// Defined in src/trace.h; a null sink means no tracing.
 struct TraceSink;
 struct CycleInfo;
 
@@ -207,12 +185,7 @@ struct TpuOptions {
     TraceSink* sink       = nullptr;
 };
 
-// The machine: the MXU, the Unified Buffer, the accumulator banks, the weight
-// FIFO, the DMA engine, host and weight memory, and a program counter.
-//
-// The units are independently drivable, one call per operation, with tick()
-// advancing time. run() layers the sequencer on top, turning a decoded
-// instruction stream into those same calls.
+// The whole machine; run() layers the sequencer over its drivable units.
 class Tpu {
 public:
     explicit Tpu(const Config& cfg, std::size_t host_bytes = 1u << 16,
@@ -244,17 +217,13 @@ public:
     const InFlight& unit(Unit u) const { return slot(u); }
     std::size_t     prefetch_pc() const { return prefetch_pc_; }
 
-    // How many in-flight instructions hold a Unified Buffer read stream and how
-    // many a write stream: the quantities the port model budgets.
+    // In-flight instructions holding a Unified Buffer read / write stream.
     void ub_streams(uint32_t& readers, uint32_t& writers) const;
 
-    // One cycle. Stages are evaluated in reverse pipeline order so each observes
-    // the previous cycle's output of its producer, making the inter-stage
-    // registers behave as latches.
+    // One cycle, with stages evaluated in reverse pipeline order.
     void tick();
 
-    // Run tick() until `pred` holds or `limit` cycles pass. Returns false if the
-    // limit ran out, so a test cannot hang on a unit that never completes.
+    // Run tick() until `pred` holds; false means `limit` cycles ran out.
     template <typename Pred>
     bool run_until(Pred pred, uint64_t limit = 1u << 20) {
         for (uint64_t i = 0; i < limit; ++i) {
@@ -264,28 +233,20 @@ public:
         return pred();
     }
 
-    // ---- hand-driven operations ------------------------------------------
-    // Each is one decoded instruction's worth of work. The sequencer calls
-    // these; tests can also drive them directly.
-
+    // Hand-driven operations, one decoded instruction's worth of work each.
     bool dma_to_ub(HostAddr host_addr, UbAddr ub_addr, uint32_t bytes);
     bool dma_to_host(UbAddr ub_addr, HostAddr host_addr, uint32_t bytes);
 
-    // Request a rows x cols weight tile from weight memory into the FIFO. The
-    // tile lands ddr_tile_latency cycles later.
+    // Request a weight tile into the FIFO; it lands ddr_tile_latency cycles later.
     bool stage_weights(uint32_t ddr_addr, uint32_t rows, uint32_t cols, TileId tile = 0);
 
-    // Pop a staged tile into the array's load plane. False means the FIFO had
-    // nothing ready, which is the weight_fifo_empty stall.
+    // Pop a staged tile into the array's load plane; false is weight_fifo_empty.
     bool load_weights_from_fifo();
 
     // Stream `len` activation rows at `ub_addr` through the array into a bank.
     bool matmul(UbAddr ub_addr, uint32_t len, BankId bank, bool accumulate);
 
-    // ---- the sequencer ----------------------------------------------------
-    // Fetch, decode, and issue in order, one instruction per cycle, with the
-    // scoreboard gating issue and issued instructions overlapping in different
-    // units. Runs until Halt, a trap, or the cycle budget.
+    // Issue in order, one instruction per cycle, until Halt, a trap, or budget.
     TpuResult run(const std::vector<RawInst>& prog, const TpuOptions& opts = TpuOptions{});
 
     const StallStats& stalls() const { return stalls_; }
@@ -295,10 +256,8 @@ public:
     bool quiet() const;
 
 private:
-    // What the instruction touches, plus whether its operands are in range. A
-    // false return fills `why` with the same text the oracle uses: a trap reason
-    // is a contract between the two models rather than an independent guess, the
-    // same exception made for requantization.
+    // What it touches and whether its operands are in range; `why` matches the
+    // oracle's wording, which the differential tests compare.
     bool validate(const Decoded& d, Reservation& res, std::string& why) const;
 
     // Cycles the instruction occupies its unit.
@@ -308,29 +267,16 @@ private:
     InFlight& slot(Unit u) { return units_[static_cast<std::size_t>(u)]; }
     const InFlight& slot(Unit u) const { return units_[static_cast<std::size_t>(u)]; }
 
-    // Does anything in flight conflict with this reservation? Bumps the matching
-    // stall counter, names the reason and the unit that held the conflicting
-    // reservation, and returns true.
+    // Does anything in flight conflict? Bumps the matching stall counter.
     bool interlocked(const Reservation& r, StallReason& why, Unit& blocker);
 
-    // Is there a free Unified Buffer port for this instruction's stream?
-    //
-    // A bank exposes one read and one write port per cycle, and an instruction
-    // touching the buffer holds the port of its direction for its whole duration,
-    // so the bank count budgets how many same-direction transfers can be in flight
-    // at once. The model tracks streams rather than the individual byte each one
-    // reaches in a given cycle: a tile row spans every bank at these sizes, so a
-    // byte-exact check would forbid a matmul and a DMA from ever overlapping.
-    // bank_of() remains the byte-exact primitive for the single-cycle
-    // multi-address case.
+    // Is a Unified Buffer port free? The bank count budgets same-direction streams.
     bool ub_port_available(const Reservation& r);
 
-    // Read the instruction's inputs and stage its outputs, returning how long it
-    // occupies its unit.
+    // Read the instruction's inputs and stage its outputs; returns its duration.
     uint64_t execute(const Decoded& d, PendingWrite& pw);
 
-    // The activation pipeline: bias, requantize, activation function, optional
-    // pool. Reads the accumulator bank and stages the int8 tile it produces.
+    // Bias, requantize, activation function, optional pool.
     void stage_activate(const Decoded& d, PendingWrite& pw);
 
     // Commit the staged outputs.
@@ -340,12 +286,10 @@ private:
     void retire_completed(TpuResult& st);
     void reset_pipeline();
 
-    // Read ahead for upcoming Read_Weights and keep their tiles arriving from DDR;
-    // the FIFO depth then decides how much of the latency is hidden.
+    // Read ahead for upcoming Read_Weights and keep their tiles arriving from DDR.
     void prefetch_weights(const std::vector<RawInst>& prog);
 
-    // Charge one array-idle cycle to a cause, given the stall counters as they
-    // stood before this cycle's issue attempt.
+    // Charge one array-idle cycle to a cause, given the stall counters before it.
     void charge_idle_cycle(const StallStats& before);
 
     // The per-cycle trace record, sampled after the accounting step.
@@ -365,15 +309,14 @@ private:
     uint64_t    cycle_ = 0;
     std::size_t pc_    = 0;
 
-    // How far the weight prefetcher has read ahead. Always at or ahead of pc_.
+    // How far the weight prefetcher has read ahead; always at or ahead of pc_.
     std::size_t prefetch_pc_ = 0;
 
     InFlight   units_[static_cast<std::size_t>(Unit::COUNT)];
     StallStats stalls_;
     RunProfile profile_;
 
-    // Tracing. The sink is set for the duration of run(); the rest records the
-    // outcome of the current cycle's issue attempt for the per-cycle hook.
+    // Set for the duration of run(), plus this cycle's issue outcome for the hook.
     TraceSink*  sink_            = nullptr;
     bool        last_issued_     = false;
     bool        last_trapped_    = false;

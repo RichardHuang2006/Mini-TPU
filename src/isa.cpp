@@ -13,9 +13,7 @@ Decoded decode(const RawInst& raw) {
     }
     d.op = static_cast<Op>(opcode);
 
-    // Flag fields are extracted unconditionally; they are only *meaningful* for
-    // the opcodes that define them, and leaving them at their encoded value
-    // keeps the decode branch-free apart from the operand switch below.
+    // Extracted unconditionally; only meaningful for the opcodes that define them.
     d.accumulate  = ((raw.word[0] >> isa::ACC_SHIFT) & 1u) != 0;
     d.act         = static_cast<ActFn>((raw.word[0] >> isa::ACTFN_SHIFT) & isa::ACTFN_MASK);
     d.pool        = static_cast<Pool>((raw.word[0] >> isa::POOL_SHIFT) & isa::POOL_MASK);

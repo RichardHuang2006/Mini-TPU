@@ -1,12 +1,5 @@
-// Logical matrices A (M×K), B (K×N) and C (M×N) for a dense layer, with the
-// tiler's tile grid, the tiles in use at the current cycle, and for C the
-// progress state of every element derived from the trace's issue/retire
-// records: untouched → in the PE array → landed in the staged rows →
-// committed partial (j of kt K-tiles) → complete int32 in a bank → requantized
-// (staged by Activate) → int8 in the UB staging tile → captured by Write_Host
-// → written to host memory. Click an element to inspect it.
-//
-// Classic script: defines window.MTV.views.matrices.
+// Logical matrices A, B and C for a dense layer, with the tiler's tile grid and
+// each element of C's progress, derived from the issue and retire records.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});

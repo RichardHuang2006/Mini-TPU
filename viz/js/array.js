@@ -1,11 +1,5 @@
-// The systolic array view: one cell per PE, drawn from the recorded PE
-// registers after each step of the MatMul in flight (mm.<i>.act / psum in the
-// container). Cells are coloured by role (fill / useful / drain, derived from
-// r = s - k - c), by |psum| or by act. The left strip shows the values that
-// entered the left edge this step and the bottom strip what left the bottom
-// edge. Click a PE to inspect its arithmetic.
-//
-// Classic script: defines window.MTV.views.array.
+// The systolic array view: one cell per PE, drawn from the recorded registers
+// after each step of the MatMul in flight (mm.<i>.act / psum in the container).
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -70,8 +64,7 @@
       return { W, H, cell, ox: margin + this.pan.x, oy: margin + this.pan.y, margin, gridW };
     },
 
-    // True when the PE frames of the MatMul in flight are in hand; otherwise
-    // starts loading them and re-renders when they arrive.
+    // True when the PE frames are in hand; otherwise loads and re-renders.
     ensureFrame() {
       const st = this.app.state;
       const mx = st.mxu;

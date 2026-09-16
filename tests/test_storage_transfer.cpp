@@ -1,12 +1,7 @@
-// Storage and transfer tests: the Unified Buffer and accumulator banks of
-// src/storage.h, and the weight FIFO and DMA engine of src/transfer.h. Bank
-// selection and per-cycle port conflicts, accumulator overwrite, accumulation
-// and locking, FIFO capacity against DDR refill latency, DMA bandwidth and
-// completion timing, bounds violations, and the units wired together and
-// driven by hand through Tpu::tick().
+// Tests for src/storage.h and src/transfer.h, ending with the units wired
+// together and driven by hand through Tpu::tick().
 
 #include "test_support.h"
-// ---------------------------------------------------------- @section("ub") ---
 SECTION("ub") {
     Config cfg = small_cfg();
     cfg.ub_bytes = 256;
@@ -16,8 +11,7 @@ SECTION("ub") {
     REQUIRE(ub.bytes() == 256);
     REQUIRE(ub.banks() == 4);
 
-    // Low-order interleaving: consecutive bytes land in consecutive banks, so a
-    // contiguous row spreads across every port rather than piling into one.
+    // Consecutive bytes land in consecutive banks, spreading a row over ports.
     REQUIRE(ub.bank_of(0) == 0);
     REQUIRE(ub.bank_of(1) == 1);
     REQUIRE(ub.bank_of(3) == 3);
@@ -46,12 +40,10 @@ SECTION("ub") {
     REQUIRE(ub.read_tile(16, 8, after.view()));
     REQUIRE(after.view().at(1, 1) == 99);
 
-    // Bounds. The last row needs only `cols` bytes, so a tile ending flush
-    // against the top of the buffer fits.
+    // A tile ending flush against the top of the buffer fits.
     REQUIRE(ub.tile_fits(0, 4, 4, 4));
     REQUIRE(ub.tile_fits(252, 1, 4, 4));
-    // 2 rows at pitch 8 span 8 + 4 = 12 bytes, not 16: the last row needs only
-    // its own columns, so this tile ends exactly at 256 and fits.
+    // 2 rows at pitch 8 span 8 + 4 = 12 bytes, not 16, so this ends at 256.
     REQUIRE(ub.tile_fits(244, 2, 4, 8));
     REQUIRE(!ub.tile_fits(245, 2, 4, 8));
     REQUIRE(!ub.tile_fits(248, 2, 4, 8));
@@ -64,8 +56,7 @@ SECTION("ub") {
     REQUIRE(!ub.write_tile(250, 9, big.view()));
     REQUIRE(!ub.read_tile(250, 9, big.view()));
 
-    // Port budget. Two reads to one bank collide; two reads to different banks
-    // do not.
+    // Two reads to one bank collide; two reads to different banks do not.
     using Port   = UnifiedBuffer::Port;
     using Access = UnifiedBuffer::Access;
 
@@ -75,15 +66,13 @@ SECTION("ub") {
     REQUIRE(!ub.port_conflict(std::vector<UbAddr>{7}));
     REQUIRE(ub.port_conflict(std::vector<UbAddr>{0, 1, 2, 3, 8}));
 
-    // A read and a write to the same bank proceed together: each bank has one
-    // port of each. This is the distinction that makes the buffer able to feed
-    // the array and take activation output in the same cycle.
+    // A read and a write to one bank proceed together, one port of each, so the
+    // buffer can feed the array and take activation output in the same cycle.
     REQUIRE(!ub.port_conflict(std::vector<Access>{{0, Port::READ}, {4, Port::WRITE}}));
     REQUIRE(ub.port_conflict(std::vector<Access>{{0, Port::WRITE}, {4, Port::WRITE}}));
     REQUIRE(!ub.port_conflict(std::vector<Access>{{0, Port::READ}, {1, Port::WRITE}}));
 
-    // A dim-wide row read is conflict-free exactly when the row spans no more
-    // banks than there are: this is the property the interleaving exists for.
+    // A row read is conflict-free exactly when it spans no more banks than exist.
     {
         std::vector<UbAddr> row;
         for (uint32_t i = 0; i < 4; ++i) row.push_back(i);
@@ -101,7 +90,6 @@ SECTION("ub") {
     REQUIRE(ub.stats().bytes_written == 15);
 }
 
-// ------------------------------------------------ @section("accumulators") ---
 SECTION("accumulators") {
     Config cfg = small_cfg(4, 3);
 
@@ -149,8 +137,7 @@ SECTION("accumulators") {
     REQUIRE(acc.bank(0).at(1, 1) == 5);
     REQUIRE(acc.bank(0).at(2, 2) == 0);
 
-    // A locked bank refuses reads and accumulates until unlocked, and each
-    // refusal is counted as a hazard.
+    // A locked bank refuses access and counts each refusal as a hazard.
     const uint64_t before = acc.stats().hazards;
     acc.lock(1);
     REQUIRE(acc.locked(1));
@@ -163,24 +150,19 @@ SECTION("accumulators") {
     REQUIRE(!acc.locked(1));
     REQUIRE(acc.read(1, got.view()));
 
-    // Locking one bank leaves the others alone, which is what makes a bank the
-    // unit of the interlock.
+    // Locking one bank leaves the others alone.
     acc.lock(0);
     REQUIRE(!acc.read(0, got.view()));
     REQUIRE(acc.read(2, got.view()));
     acc.unlock(0);
 
-    // An invalid bank is refused but is not a hazard: it is a malformed
-    // instruction, not a stall.
+    // An invalid bank is a malformed instruction, not a hazard.
     const uint64_t h = acc.stats().hazards;
     REQUIRE(!acc.read(9, got.view()));
     REQUIRE(acc.stats().hazards == h);
 
-    // ---- K-tiling ---------------------------------------------------------
-    // A matmul with K four times the array width is split into four tiles that add
-    // into one bank, and the result must equal the full-K product. The expectation
-    // comes from a direct triple loop over the whole of K, a different computation
-    // from the one the array and the banks perform between them.
+    // K four times the array width, split into four tiles accumulating into one
+    // bank, against a direct triple loop over the whole of K.
     {
         const uint32_t dim = 4;
         const uint32_t tiles = 4;
@@ -237,7 +219,6 @@ SECTION("accumulators") {
     }
 }
 
-// ------------------------------------------------- @section("weight_fifo") ---
 SECTION("weight_fifo") {
     Config cfg = small_cfg();
     cfg.weight_fifo_depth = 4;
@@ -262,8 +243,7 @@ SECTION("weight_fifo") {
     REQUIRE(!fifo.pop(out));
     REQUIRE(fifo.stats().empty_stalls == 1);
 
-    // A refill occupies its slot immediately but is not poppable until the
-    // latency has elapsed: that gap is the whole reason to stage tiles early.
+    // A refill takes its slot at once but is poppable only after the latency.
     REQUIRE(fifo.push_refill(make_tile(0, 1), 0));
     REQUIRE(fifo.occupancy() == 1);
     REQUIRE(fifo.empty());
@@ -316,9 +296,8 @@ SECTION("weight_fifo") {
         REQUIRE(f.stats().full_rejects == 1);
     }
 
-    // ---- a 1-deep FIFO serializes back-to-back weight loads ---------------
-    // With depth 1 the second refill cannot start until the first tile has been
-    // popped, so two loads cost two full latencies instead of overlapping into one.
+    // With depth 1 the second refill waits for the first pop, so two loads cost
+    // two full latencies instead of overlapping into one.
     {
         Config deep = cfg;
         deep.weight_fifo_depth = 4;
@@ -352,7 +331,6 @@ SECTION("weight_fifo") {
     }
 }
 
-// --------------------------------------------------------- @section("dma") ---
 SECTION("dma") {
     Config cfg = small_cfg();
     cfg.ub_bytes = 1024;
@@ -409,8 +387,7 @@ SECTION("dma") {
     REQUIRE(dma.stats().transfers == 2);
     REQUIRE(dma.stats().bytes_moved == 128);
 
-    // One transfer at a time: a second start while busy is refused rather than
-    // silently interleaving.
+    // One transfer at a time; a second start while busy is refused.
     {
         Dma d(cfg);
         UnifiedBuffer u(cfg);
@@ -439,9 +416,8 @@ SECTION("dma") {
         REQUIRE(d.stats().rejects == 2);
     }
 
-    // ---- a slow bus makes a small transfer the bottleneck -----------------
-    // The same 256-byte load that hides under one matmul at full bandwidth
-    // dominates it at one byte per cycle, and Config::dma_bound agrees.
+    // The 256-byte load that hides under a matmul at full bandwidth dominates
+    // it at one byte per cycle, and Config::dma_bound agrees.
     {
         const uint32_t dim = 8, len = 8, bytes = 256;
         const uint64_t compute = len + 2ull * dim - 1ull;      // 23 cycles
@@ -456,19 +432,16 @@ SECTION("dma") {
         REQUIRE(Dma(fast).transfer_cycles(bytes) < compute);
         REQUIRE(Dma(slow).transfer_cycles(bytes) > compute);
 
-        // The roofline check reaches the same verdict from arithmetic intensity
-        // alone: len*dim*dim MACs against `bytes` moved.
+        // The same verdict from arithmetic intensity: len*dim*dim MACs per byte.
         const std::size_t macs = static_cast<std::size_t>(len) * dim * dim;
         REQUIRE(!fast.dma_bound(macs, bytes));
         REQUIRE(slow.dma_bound(macs, bytes));
     }
 }
 
-// --------------------------------------------------- @section("tpu_units") ---
 SECTION("tpu_units") {
-    // The units wired together, driven by hand and stepped through tick(): DMA
-    // the activations in, stage and load a weight tile, matmul, read the bank.
-    // The answer has to match the oracle running the equivalent program.
+    // The units wired together and stepped through tick(): DMA in, stage and
+    // load a weight tile, matmul, read the bank, all against the oracle.
     const uint32_t dim = 4;
     const uint32_t len = 4;
 
@@ -507,8 +480,7 @@ SECTION("tpu_units") {
     }
     REQUIRE(dma_ok);
 
-    // Stage the weight tile. It is not poppable until the DDR latency elapses,
-    // so a load attempted immediately fails -- that is weight_fifo_empty.
+    // Not poppable until the DDR latency elapses, so an immediate load fails.
     REQUIRE(tpu.stage_weights(0, dim, dim));
     REQUIRE(tpu.weight_fifo().empty());
     REQUIRE(!tpu.load_weights_from_fifo());
@@ -518,8 +490,7 @@ SECTION("tpu_units") {
     REQUIRE(tpu.cycle() == 4 + 6);
     REQUIRE(tpu.load_weights_from_fifo());
 
-    // Without double buffering the load costs the array dim cycles, and the
-    // machine's clock reflects it.
+    // Without double buffering the load costs the array dim cycles.
     REQUIRE(tpu.cycle() == 4 + 6 + dim);
     REQUIRE(tpu.mxu().cycle() == tpu.cycle());
 
@@ -539,8 +510,7 @@ SECTION("tpu_units") {
     const std::vector<int> want = ref_matmul(cfg, weights, acts, len);
     REQUIRE_MSG(flat == want, diff_vec("hand-driven tile", flat, want));
 
-    // DMA the result's bytes back out to prove the return path is wired: write
-    // the bank's low byte per element into the buffer, then out to the host.
+    // The return path: the bank's low byte per element, then out to the host.
     for (uint32_t i = 0; i < len * dim; ++i) {
         tpu.ub().at(static_cast<UbAddr>(64 + i)) = static_cast<i8>(flat[i] & 0xFF);
     }
@@ -552,12 +522,8 @@ SECTION("tpu_units") {
     }
     REQUIRE(out_ok);
 
-    // The array's clock never lags the machine's, across every kind of operation.
-    // Tpu::matmul and load_weights_from_fifo each idle the array up to the machine
-    // clock before using it, which the current API cannot violate since tick() keeps
-    // the two in step. The guards exist because the sequencer advances the clock
-    // while the array waits on a hazard; this assertion catches it if that stops
-    // holding.
+    // The array's clock never lags the machine's, which matters because the
+    // sequencer advances the clock while the array waits on a hazard.
     {
         Tpu t(cfg);
         REQUIRE(t.mxu().cycle() == t.cycle());
@@ -584,14 +550,13 @@ SECTION("tpu_units") {
         REQUIRE(t.matmul(0, len, 0, false));
         REQUIRE(t.mxu().cycle() == t.cycle());
 
-        // Idling is counted, so time the array spent waiting on the DMA and the
-        // weight refill shows up as lost utilization rather than vanishing.
+        // Idling is counted, so waiting on DMA shows up as lost utilization.
         REQUIRE(t.mxu().stats().cycles == t.cycle());
         REQUIRE(t.mxu().utilization() < 1.0);
         REQUIRE(t.mxu().stats().useful_macs == static_cast<uint64_t>(len) * dim * dim);
     }
 
-    // ---- rejections, so a malformed operation stalls rather than corrupts ---
+    // rejections, so a malformed operation stalls rather than corrupts
     {
         Tpu t2(cfg);
         REQUIRE(!t2.matmul(0, dim + 1, 0, false));      // len exceeds bank rows
@@ -606,9 +571,7 @@ SECTION("tpu_units") {
         t2.acc().unlock(0);
     }
 
-    // ---- K-tiling through the machine -------------------------------------
-    // Two accumulating matmuls into one bank, driven by hand, against the oracle
-    // doing the same thing eagerly.
+    // Two accumulating matmuls into one bank, driven by hand, against the oracle.
     {
         Config c = cfg;
         Tpu t3(c);

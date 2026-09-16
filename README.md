@@ -115,9 +115,20 @@ One layer of a quantized network flows through the machine like this:
   host memory
 ```
 
-A multi-layer network is this loop repeated; the tiler in `tests/workloads.h`
-chains layers with no repacking, because a layer's tile-major output is already
-the layout the next layer's activations want.
+Tensors cross the host interface in **tile-major** order -- every `dim x dim`
+block contiguous, blocks in row-major order -- so one tile is one DMA. A row of
+a row-major matrix is not contiguous, so feeding one tile from that layout would
+take one DMA per row. Shapes that do not divide by `dim` are zero padded once at
+pack time rather than special-cased in the program; a padded activation column
+multiplies a padded weight row, contributing nothing to the sum.
+
+A multi-layer network is this loop repeated, and the tiler in
+`tests/workloads.h` chains layers with no repacking, because a layer's
+tile-major output is already the layout the next layer's activations want. That
+holds even when a width does not divide the array: the padding columns of a
+packed output carry whatever the activation produced from an all-zero
+accumulator, which need not be zero, but they only ever meet the zero-filled
+padding rows of the next layer's packed weights.
 
 ## 4. Repository structure
 
@@ -210,6 +221,15 @@ Weights are loaded per-plane by `load_weights()`; a tile smaller than the array
 is zero-padded so an undersized matmul is still exactly correct (the padded
 products are zero), with the wasted MAC slots counted as `partial_tile_waste`.
 
+The layout `tests/ref.h` fixes, which every model matches:
+
+```
+resident weights   dim x dim int8, W[k][c]
+activations        len x dim int8 at ub_addr, row-major, stride dim: A[r][k]
+accumulator bank   dim x dim int32: acc[r][c] = sum_k A[r][k] * W[k][c]
+activation output  int8 at ub_dst, row-major, stride = output columns
+```
+
 ## 8. Activation skew and fill/drain
 
 Row `r`'s element for PE row `k` enters `k` cycles after the row starts -- the
@@ -218,7 +238,7 @@ meet the descending partial sum in the right PE on the right cycle, given the
 one-cycle-per-hop registers.
 
 The consequence is the central timing formula, asserted across shapes by
-`tests/test_systolic_array.cpp` and re-derived in `src/systolic_array.h`:
+`tests/test_systolic_array.cpp`:
 
 ```
 matmul over len rows  =  len + 2*dim - 1 cycles
@@ -229,10 +249,25 @@ matmul over len rows  =  len + 2*dim - 1 cycles
                          +-- streaming: one input row admitted per cycle
 ```
 
-Since a matmul's results land in one accumulator bank and a bank is `dim` rows
-deep, `len <= dim`, so a single matmul can never do better than
-`dim / (3*dim - 1)` busy utilization -- about a third. The array is draining,
-not stalling; deeper accumulator banks, not more bandwidth, would move that.
+Deriving it: one input row is admitted per cycle, and row `r`'s partial sum for
+column `c` takes `dim` hops to descend the column plus `c` hops of skew to
+reach it, so its last element (column `dim-1`) leaves the bottom edge at cycle
+`r + (dim-1) + dim`. The final row is `r = len-1`, whose last element lands
+after `len - 1 + 2*dim - 1` complete cycles, so the array is occupied for
+`len + 2*dim - 1` cycles.
+
+An input vector is sometimes called an "activation column" because it enters
+the array as a skewed vertical slice; in the row-major layout `tests/ref.h`
+fixes, that vector is a *row* of the `len x dim` activation block, so `len`
+counts rows throughout the code.
+
+Utilization is amortized over the stream: `len` cycles of work for
+`len + 2*dim - 1` cycles of occupancy. A long stream would amortize the fill
+away, but `len` cannot exceed `dim`, because a matmul's results land in one
+accumulator bank and a bank is `dim` rows deep. A single matmul therefore
+cannot do better than `dim / (3*dim - 1)` busy utilization -- about a third,
+falling towards it as the array grows. The array is draining, not stalling;
+deeper accumulator banks, not more bandwidth, would move that number.
 
 ## 9. Dual weight planes
 
@@ -338,13 +373,33 @@ opcode per whole-tensor operation:
 | `Nop` | sequencer | nothing |
 | `Halt` | sequencer | exit code |
 
-Every instruction is six 32-bit words: word 0 carries the opcode and flag
-fields (accumulate bit, activation function, pooling mode/window/stride,
-requantization shift), words 1-5 carry operands, and no field straddles a word
-boundary, so a hex dump is legible. `encode()`, `decode()` and `disasm()` live
-next to the field layout so they cannot drift apart. An opcode outside the
-defined set decodes to a trapping `Halt`: a malformed program stops the
-machine, with the same trap reason the oracle reports.
+Every instruction is six 32-bit words, and no field straddles a word boundary,
+so a hex dump is legible:
+
+```
+word 0   flags and opcode
+  [7:0]    opcode (Op)
+  [8]      accumulate           (MatMul)
+  [10:9]   activation function  (Activate)
+  [12:11]  pooling mode         (Activate)
+  [20:13]  requantization shift (Activate)
+  [26:21]  pooling window       (Activate)
+  [31:27]  pooling stride       (Activate)
+
+words 1..5   operands, per opcode
+  Read_Host_Memory    host_addr, ub_addr, bytes
+  Write_Host_Memory   ub_addr, host_addr, bytes
+  Read_Weights        ddr_addr, tile
+  MatMul              ub_src, len, acc_bank
+  Activate            acc_bank, ub_dst, len, bias, multiplier
+  Halt                code
+  Sync / Nop          none
+```
+
+`encode()`, `decode()` and `disasm()` live next to the field layout so they
+cannot drift apart. An opcode outside the defined set decodes to a trapping
+`Halt`: a malformed program stops the machine, with the same trap reason the
+oracle reports.
 
 ## 14. Scoreboard interlocks
 
@@ -396,6 +451,24 @@ overlaps; dependent work serializes; the answer is identical either way:
            ~ cost of the longest unit             ~ cost of the sum of the units
 ```
 
+One iteration of `Tpu::run` is one cycle, and performs, in order:
+
+1. **completion** -- `retire_completed()` finishes any unit whose work is done,
+   committing its staged outputs;
+2. **scoreboard** -- retiring clears that unit's reservation, so the hazards it
+   imposed vanish here;
+3. **weight prefetch** -- `prefetch_weights()` reads ahead for upcoming
+   `Read_Weights` and keeps their DDR refills in flight;
+4. **decode** -- `issue_step()` decodes the instruction at the PC;
+5. **hazard checks** -- `validate()`, `interlocked()` and `ub_port_available()`
+   decide whether it may issue this cycle;
+6. **issue** -- at most one instruction issues per cycle;
+7. **unit launch** -- `execute()` computes the instruction's effect, stages its
+   writes, and occupies its unit for the duration;
+8. **statistics** -- the array-busy / idle-cause tallies for this cycle;
+9. **advance** -- the PC moved if the instruction issued, otherwise the stall
+   counter that blocked it moved; either way the clock ticks.
+
 The tiler in `tests/workloads.h` is written against this machine model: it
 alternates accumulator banks, double-buffers its output staging tiles, and
 defers each output tile's `Write_Host` past the next tile's matmuls, because
@@ -425,6 +498,31 @@ exactly one cause), and `streaming + fill/drain = array_busy`. Starvation
 experiments then check the breakdown *diagnoses*: take away the DMA and
 `dma_bound` grows by the slowdown; slow DDR behind a 1-deep FIFO and
 `weight_fifo_empty` does.
+
+A starved resource is checked as a *delta* rather than as the dominant cause,
+because on these workloads the largest bucket is nearly always
+`array_fill_drain` -- a property of a small systolic array, not a provisioning
+problem. What makes the breakdown a diagnosis is that removing a resource puts
+the extra cycles in that resource's bucket and nowhere else.
+
+Two mechanisms are worth stating precisely, because their size is not obvious:
+
+- **The activation pipeline, not the array, is what binds.** The throughput-1
+  pipeline emits one requantized element per cycle, so an `Activate` over a
+  full bank costs `dim*dim + act_pipeline_depth` cycles while the matmul that
+  filled that bank cost only `3*dim - 1`. The ratio grows linearly with `dim`,
+  and there is no crossover at any array size, so past a small array the
+  machine spends most of its time requantizing rather than multiplying. That is
+  why `activation` is the dominant stall on the 32x32 and 256x256
+  configurations.
+- **Unified Buffer port contention is real but small.** A bank carries one read
+  and one write per cycle, so the bank count limits how many same-direction
+  streams may be in flight -- but at most one instruction per unit is ever in
+  flight, so the only same-direction pairs possible are a `MatMul` and a
+  `Write_Host` reading, or a `Read_Host` and an `Activate` writing. One bank
+  serializes at most one such pair; above one bank no contention remains to
+  find at any depth. On the shipped workloads it is worth tens of cycles, not
+  thousands.
 
 ## 17. Differential validation
 

@@ -9,24 +9,7 @@
 #include "tpu.h"
 #include "transfer.h"
 
-// Structured tracing of a run: an observer the sequencer calls at every point
-// where state changes or an issue attempt is decided. The sink only reads; it
-// never touches the machine, and every hook site in tpu.cpp is guarded on the
-// sink being non-null, so a run without a sink is the same run.
-//
-// The hooks follow the order of one iteration of Tpu::run, which is one cycle:
-//
-//   on_retire / on_weight_load    retire_completed(): staged outputs commit
-//   on_prefetch                    prefetch_weights(): a tile enters the FIFO
-//   on_stall | on_issue | on_trap | on_halt   issue_step(): one outcome per cycle
-//   on_sync                        with an issue of Sync
-//   MxuObserver hooks              inside execute() of a MatMul, one per step
-//   on_cycle_end                   after the busy/idle accounting
-//
-// tools/tracegen.cpp implements this to write the trace container the
-// visualizer under viz/ reads.
-
-// Everything the per-cycle record needs, sampled after the cycle's accounting.
+// The per-cycle record, sampled after the cycle's accounting.
 struct CycleInfo {
     std::size_t pc         = 0;      // the instruction the sequencer attempted
     bool        issued     = false;
@@ -36,8 +19,7 @@ struct CycleInfo {
     Unit        blocker    = Unit::COUNT;   // unit whose reservation blocked issue
     std::size_t blocker_pc = 0;
 
-    // 0 = array busy, else the RunProfile idle bucket charged: 1 weights,
-    // 2 bank, 3 accum, 4 dma, 5 act, 6 other.
+    // 0 = array busy, else idle bucket 1..6: weights, bank, accum, dma, act, other.
     uint8_t idle_bucket = 0;
 
     uint8_t     units_active = 0;    // bitmask by Unit, after issue
@@ -49,6 +31,7 @@ struct CycleInfo {
     bool        pending      = false;
 };
 
+// A read-only observer of a run, implemented by tools/tracegen.cpp.
 struct TraceSink : MxuObserver {
     ~TraceSink() override = default;
 
@@ -82,8 +65,7 @@ struct TraceSink : MxuObserver {
         (void)tpu; (void)cycle; (void)pc; (void)d; (void)reason; (void)blocker; (void)blocker_pc;
     }
 
-    // After execute(): inputs were read (they are still readable through `tpu`,
-    // since nothing commits until retire) and outputs are staged in `pw`.
+    // After execute(): inputs were read and outputs are staged in `pw`.
     virtual void on_issue(const Tpu& tpu, uint64_t cycle, std::size_t pc, const Decoded& d,
                           Unit unit, const Reservation& res, uint64_t duration,
                           const PendingWrite& pw) {

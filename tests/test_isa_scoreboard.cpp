@@ -1,14 +1,9 @@
-// ISA and sequencer tests: instruction encoding, decoding and program file
-// formats (src/isa.h/.cpp, src/loader.h), the CLI surface of src/main.cpp,
-// and the in-order scoreboarded sequencer of src/tpu.cpp -- RAW, WAR and WAW
-// interlocks on the Unified Buffer, accumulator and weight-tile hazards,
-// Sync, overlap across independent units, halt and trap behavior, and
-// stall-cause accounting.
+// Tests for the ISA (src/isa.h/.cpp), the program loaders (src/loader.h), the
+// CLI (src/main.cpp), and the scoreboarded sequencer of src/tpu.cpp.
 
 #include "test_support.h"
 
-// Include the driver TU so parse_args / print_help are unit-testable without
-// shelling out. Its own int main() is guarded off.
+// The driver TU, with its own int main() guarded off, so the CLI is testable.
 #define MINI_TPU_NO_ENTRY
 #include "main.cpp"
 
@@ -31,10 +26,8 @@ int run_parse(std::vector<std::string> args, CliOpts& out) {
 
 }  // namespace
 
-// ------------------------------------------------------ @section("decode") ---
 SECTION("decode") {
-    // Hand-checked word 0: ACTIVATE(3) | relu(1)<<9 | avg(2)<<11 | shift 7<<13
-    //                      | window 3<<21 | stride 2<<27
+    // Word 0: ACTIVATE(3) | relu<<9 | avg<<11 | 7<<13 | 3<<21 | 2<<27.
     Decoded a;
     a.op          = Op::ACTIVATE;
     a.act         = ActFn::RELU;
@@ -128,7 +121,6 @@ SECTION("decode") {
     }
 }
 
-// ------------------------------------------------------ @section("loader") ---
 SECTION("loader") {
     tpuasm::Program p;
     p.read_host(0x10, 0x20, 64).matmul(0x20, 8, 0).halt(7);
@@ -233,10 +225,8 @@ SECTION("loader") {
     REQUIRE(threw);
 }
 
-// --------------------------------------------------------- @section("cli") ---
 SECTION("cli") {
-    // The parser reports errors on stderr, so a few "minitpu: ..." lines below
-    // are expected output, not failures.
+    // The "minitpu: ..." lines below are expected stderr, not failures.
     {
         CliOpts o;
         REQUIRE(run_parse({"--prog", "p.hex", "--dump"}, o) == 0);
@@ -305,10 +295,8 @@ SECTION("cli") {
     }
 }
 
-// ------------------------------------------------------ @section("tpuasm") ---
 SECTION("tpuasm") {
-    // The builder is the only thing the later tests use to make programs, so it
-    // has to encode exactly what it claims to.
+    // Every later test builds its programs with this, so it must encode exactly.
     tpuasm::Program p;
     p.read_host(0x100, 0x200, 64)
      .read_weights(0x300, 2)
@@ -413,7 +401,6 @@ SECTION("tpuasm") {
     REQUIRE(decode(b.code()[0]).trap);
 }
 
-// --------------------------------------------------- @section("sequencer") ---
 SECTION("sequencer") {
     const uint32_t dim = 4, len = 4;
     Config cfg = small_cfg(dim, 2);
@@ -435,13 +422,11 @@ SECTION("sequencer") {
      .write_host(out, 0x400, len * dim)
      .halt(5);
 
-    // A straight-line program runs to Halt and agrees with the oracle on every
-    // comparand. This is the first time the timed machine is checked against it.
+    // A straight-line program runs to Halt and agrees with the oracle.
     const std::string diff = diff_tpu(p.code(), cfg, ref_setup(in), tpu_setup(in));
     REQUIRE_MSG(diff.empty(), diff);
 
-    // The retired count equals the instruction count, and the exit code comes
-    // back from Halt.
+    // The retired count equals the instruction count.
     {
         Tpu t(cfg);
         tpu_setup(in)(t);
@@ -479,7 +464,7 @@ SECTION("sequencer") {
         REQUIRE(r.cycles == 11);
     }
 
-    // ---- traps agree with the oracle, reason included ---------------------
+    // traps agree with the oracle, reason included
     {
         struct Case {
             const char* name;
@@ -548,7 +533,6 @@ SECTION("sequencer") {
     }
 }
 
-// -------------------------------------------------- @section("scoreboard") ---
 SECTION("scoreboard") {
     const uint32_t dim = 4, len = 4;
     Config cfg = small_cfg(dim, 2);
@@ -559,7 +543,7 @@ SECTION("scoreboard") {
     const Inputs in = random_inputs(777, dim, len);
     const uint32_t bytes = len * dim;
 
-    // ---- a MatMul reading a region a DMA is still filling must wait --------
+    // a MatMul reading a region a DMA is still filling must wait
     {
         tpuasm::Program p;
         p.read_host(in.host_at, 0, bytes)     // 16 bytes at 1/cycle = 16 cycles
@@ -572,8 +556,7 @@ SECTION("scoreboard") {
         const TpuResult r = t.run(p.code());
         REQUIRE(r.halted);
 
-        // The MatMul could not have issued before the DMA retired, so the RAW
-        // counter has to have fired.
+        // The MatMul could not issue before the DMA retired, so RAW must fire.
         REQUIRE(t.stalls().ub_raw > 0);
 
         // And the answer is right, which is the point of the interlock.
@@ -596,7 +579,7 @@ SECTION("scoreboard") {
         REQUIRE(t.stalls().ub_raw == 0);
     }
 
-    // ---- an Activate reading an accumulator waits for its MatMul -----------
+    // an Activate reading an accumulator waits for its MatMul
     {
         tpuasm::Program p;
         p.read_weights(0)
@@ -628,14 +611,8 @@ SECTION("scoreboard") {
         REQUIRE(t.stalls().accum_hazard == 0);
     }
 
-    // ---- write-after-read: a DMA must not overwrite what a MatMul is still
-    // streaming out of the buffer.
-    //
-    // This can only ever be a timing property. An instruction reads its inputs at
-    // issue, so by the time a later writer could commit, the reader already has what
-    // it needed and no answer can change. A real array streams activations over many
-    // cycles and would be corrupted, so the stall belongs in the model, but the
-    // stall counter is the only thing that can witness it.
+    // Write-after-read is a timing property only: inputs are read at issue, so no
+    // answer can change, and the stall counter is the only thing that witnesses it.
     {
         tpuasm::Program p;
         p.read_weights(0)
@@ -649,8 +626,8 @@ SECTION("scoreboard") {
         REQUIRE(t.stalls().ub_war > 0);
     }
 
-    // Two DMAs to one region cannot overlap, though the single engine would have
-    // serialized them regardless of the region.
+    // Two DMAs to one region cannot overlap, though one engine would serialize
+    // them regardless of the region.
     {
         tpuasm::Program p;
         p.read_host(in.host_at, 0, bytes)
@@ -663,12 +640,8 @@ SECTION("scoreboard") {
         REQUIRE(t.stalls().unit_busy > 0 || t.stalls().ub_waw > 0);
     }
 
-    // ---- write-after-write across two different units -----------------------
-    // The case needing the WAW check on its own merits: an Activate and a DMA live
-    // in different units, so nothing structural stops them overlapping. The Activate
-    // is the slower of the two, so overlapping would let the DMA commit first and
-    // the Activate overwrite it, leaving the region holding whichever finished last
-    // rather than what the program said.
+    // Write-after-write across two units, where nothing structural stops the
+    // overlap: the slower Activate would otherwise overwrite the DMA's bytes.
     {
         tpuasm::Program p;
         p.read_weights(0)
@@ -686,8 +659,7 @@ SECTION("scoreboard") {
         REQUIRE_MSG(diff.empty(), diff);
     }
 
-    // Accumulating into a bank waits for the matmul already producing into it,
-    // and the K-tiled result still matches the oracle.
+    // Accumulating into a bank waits for the matmul already producing into it.
     {
         const Inputs two = random_inputs(31, dim, len, 2);
         tpuasm::Program p;
@@ -700,11 +672,8 @@ SECTION("scoreboard") {
     }
 }
 
-// ----------------------------------------------------- @section("overlap") ---
 SECTION("overlap") {
-    // Independent work in different units runs concurrently; a dependent chain
-    // does not. Same instructions in both programs, so the only difference is
-    // whether the operands collide.
+    // The same instructions twice, differing only in whether the operands collide.
     const uint32_t dim = 4, len = 4;
     Config cfg = small_cfg(dim, 4);
     cfg.ub_bytes = 2048;
@@ -720,8 +689,7 @@ SECTION("overlap") {
 
     const Inputs in = random_inputs(999, dim, len);
 
-    // Independent: the DMA writes a region nobody reads, the MatMul reads a
-    // different region into bank 0, the Activate reads bank 1.
+    // Independent: three different regions and two different banks.
     tpuasm::Program indep;
     indep.read_weights(0)
          .matmul(0, len, 0)             // reads UB [0, 16)
@@ -729,8 +697,7 @@ SECTION("overlap") {
          .activate(1, 512, len, ActFn::RELU, 1, 0)
          .halt();
 
-    // Dependent: the DMA fills what the MatMul reads, and the Activate reads the
-    // bank the MatMul writes.
+    // Dependent: each stage consumes what the one before it produced.
     tpuasm::Program dep;
     dep.read_weights(0)
        .read_host(in.host_at, 0, bytes)
@@ -746,15 +713,13 @@ SECTION("overlap") {
     REQUIRE(ri.halted);
     REQUIRE(rd.halted);
 
-    // The dependent chain pays the sum of its stages; the independent one pays
-    // roughly the longest.
+    // The chain pays the sum of its stages; the independent run pays the longest.
     const uint64_t sum = dma_dur + mm_dur + act_dur;
     REQUIRE(ri.cycles < sum);
     REQUIRE(rd.cycles >= sum);
     REQUIRE(ri.cycles < rd.cycles);
 
-    // More precisely: the independent version finishes within a few issue slots
-    // of its longest stage, since the three run side by side.
+    // Within a few issue slots of its longest stage, since the three run together.
     const uint64_t longest = std::max(dma_dur, std::max(mm_dur, act_dur));
     REQUIRE(ri.cycles <= longest + cfg.ddr_tile_latency + indep.code().size());
 
@@ -772,8 +737,7 @@ SECTION("overlap") {
         REQUIRE_MSG(dd.empty(), dd);
     }
 
-    // Two DMAs cannot overlap however independent their regions, because there is
-    // one engine: a structural limit, not a data one.
+    // One engine, so two DMAs cannot overlap however independent their regions.
     {
         tpuasm::Program p;
         p.read_host(in.host_at, 0, bytes)
@@ -788,11 +752,8 @@ SECTION("overlap") {
     }
 }
 
-// ---------------------------------------------- @section("weight_overlap") ---
 SECTION("weight_overlap") {
-    // Through the full sequencer: the second tile's weight load hides under the
-    // first tile's matmul when there is a shadow plane, and is fully exposed
-    // when there is not.
+    // The second tile's load hides under the first matmul only with a shadow plane.
     const uint32_t dim = 4, len = 4;
     const uint32_t latency = 6;
 
@@ -814,8 +775,7 @@ SECTION("weight_overlap") {
 
         Tpu t(cfg);
         tpu_setup(in)(t);
-        // Activations come from the buffer directly, so the timing is only about
-        // weights and compute.
+        // Activations come straight from the buffer, so no DMA blurs the timing.
         for (uint32_t i = 0; i < len * dim; ++i) {
             t.ub().at(i) = in.host_bytes[i];
         }
@@ -834,17 +794,14 @@ SECTION("weight_overlap") {
     // Without one, each of the two loads costs dim exposed cycles.
     REQUIRE(nodb.second.weight_load_bubble == 2ull * dim);
 
-    // Only one DDR latency is ever exposed. The prefetcher requested both tiles
-    // before the program issued anything, so the second was already on its way while
-    // the first was being waited for; what remains is the first tile, which has
-    // nothing to hide behind.
+    // Only one DDR latency is exposed: the prefetcher had both tiles in flight
+    // before issue, so only the first has nothing to hide behind.
     REQUIRE_MSG(db.first == latency + 2 * mm + 2,
                 "    double-buffered: " + std::to_string(db.first) + " cycles, want " +
                     std::to_string(latency + 2 * mm + 2) + "\n");
 
-    // Without a shadow plane each load also costs dim exposed cycles shifting into
-    // the array, and the second cannot start until the first matmul has finished
-    // with the weight plane it is about to overwrite.
+    // Without a shadow plane each load costs dim exposed cycles, and the second
+    // waits for the first matmul to finish with the plane it will overwrite.
     REQUIRE_MSG(nodb.first == latency + 2 * dim + 2 * mm + 1,
                 "    single-plane:    " + std::to_string(nodb.first) + " cycles, want " +
                     std::to_string(latency + 2 * dim + 2 * mm + 1) + "\n");
@@ -854,8 +811,7 @@ SECTION("weight_overlap") {
     REQUIRE(db.second.weight_fifo_empty == latency);
     REQUIRE(nodb.second.weight_fifo_empty == latency);
 
-    // The array itself confirms it: with a shadow plane it switches planes on
-    // every matmul, and it never stood idle for a load.
+    // With a shadow plane the array switches every matmul and never idles for one.
     {
         Config cfg = small_cfg(dim, 2);
         cfg.ub_bytes = 1024;
@@ -867,21 +823,13 @@ SECTION("weight_overlap") {
         REQUIRE(t.run(p.code()).halted);
         REQUIRE(t.mxu().stats().plane_switches == 2);
         REQUIRE(t.mxu().stats().weight_load_bubble == 0);
-        // The wait is on DDR, not on the weight plane: with a shadow plane to load into,
-        // nothing ever blocks on the resident tile itself.
+        // The wait is on DDR, not on the resident tile.
         REQUIRE(t.stalls().weight_fifo_empty > 0);
         REQUIRE(t.stalls().weight_stall == 0);
     }
 
-    // ---- FIFO depth is what decides how much latency is hidden --------------
-    // Four tiles, so a deep FIFO can have them all in flight at once and pay the DDR
-    // latency once, while a 1-deep FIFO cannot start a fetch until the previous tile
-    // has been consumed and pays it four times over.
-    //
-    // The latency is deliberately longer than a matmul. A shallow FIFO still starts
-    // its next fetch while the array works, so with a short latency the wait hides
-    // behind the compute and depth costs nothing measurable; depth only buys
-    // something once DDR is slower than the work available to cover it.
+    // Four tiles: a deep FIFO pays the DDR latency once, a 1-deep FIFO four
+    // times. The latency exceeds a matmul, or depth would buy nothing.
     {
         const uint32_t slow_ddr = 40;      // longer than mm
         REQUIRE(slow_ddr > mm);
@@ -920,8 +868,7 @@ SECTION("weight_overlap") {
         REQUIRE_MSG(deep.second == slow_ddr,
                     "    depth 4 waited " + std::to_string(deep.second) +
                         " cycles on DDR, want " + std::to_string(slow_ddr) + "\n");
-        // Shallow: the FIFO holds one tile, so every load waits on DDR again, and
-        // the waits are too long to hide behind the matmuls.
+        // One tile at a time, so every load waits on DDR again.
         REQUIRE(shallow.second > deep.second);
         REQUIRE_MSG(shallow.first > deep.first,
                     "    depth 1: " + std::to_string(shallow.first) + " cycles, depth 4: " +
@@ -962,7 +909,6 @@ SECTION("weight_overlap") {
     }
 }
 
-// -------------------------------------------------------- @section("sync") ---
 SECTION("sync") {
     const uint32_t dim = 4, len = 4;
     Config cfg = small_cfg(dim, 2);
@@ -973,9 +919,7 @@ SECTION("sync") {
     const Inputs in = random_inputs(4242, dim, len, 2);
     const uint32_t tile_bytes = dim * dim;
 
-    // A barrier between two K-tiles: the snapshot at each Sync must match the
-    // oracle, which is what makes a timing bug bisectable to the interval between
-    // two barriers rather than merely visible at Halt.
+    // A barrier between two K-tiles, so a timing bug bisects to one interval.
     tpuasm::Program p;
     p.read_host(in.host_at, 0, len * dim)
      .read_weights(0)
@@ -1000,21 +944,17 @@ SECTION("sync") {
         REQUIRE(r.syncs.size() == 3);
         REQUIRE(r.retired == p.code().size());
 
-        // A barrier only issues once the machine is quiet, so it has to have
-        // waited for the work in front of it.
+        // A barrier only issues once quiet, so it waited for the work ahead of it.
         REQUIRE(t.stalls().drain > 0);
 
-        // The snapshots are distinct: the second K-tile really did add to the
-        // first, so the barriers are observing progress rather than a static
-        // bank.
+        // Distinct snapshots, so the barriers observe progress, not a static bank.
         REQUIRE(r.syncs[0].acc != r.syncs[1].acc);
 
         // Activate does not touch the accumulators, so the last two agree.
         REQUIRE(r.syncs[1].acc == r.syncs[2].acc);
     }
 
-    // Every Phase-2 workload shape, with and without barriers, and under
-    // configurations that change the schedule but must not change the result.
+    // Every workload shape, with and without barriers, across configurations.
     {
         tpuasm::Program bare;
         bare.read_host(in.host_at, 0, len * dim)
@@ -1044,8 +984,7 @@ SECTION("sync") {
         }
     }
 
-    // A Sync with nothing in flight still snapshots, and back-to-back barriers
-    // agree with each other.
+    // A Sync with nothing in flight still snapshots.
     {
         Tpu t(cfg);
         tpuasm::Program q;
@@ -1058,11 +997,10 @@ SECTION("sync") {
     }
 }
 
-// --------------------------------------------- @section("activate_timing") ---
 SECTION("activate_timing") {
     const uint32_t dim = 4;
 
-    // ---- M + act_pipeline_depth, over several shapes and depths ------------
+    // M + act_pipeline_depth, over several shapes and depths
     for (const uint32_t depth : {0u, 1u, 4u, 16u}) {
         Config cfg = small_cfg(dim, 4);
         cfg.ub_bytes = 1024;
@@ -1075,8 +1013,7 @@ SECTION("activate_timing") {
             const TpuResult r = t.run(p.code());
             REQUIRE(r.halted);
 
-            // The Activate issues at cycle 0 and occupies its unit for
-            // len*dim + depth cycles; Halt waits for it and spends one more.
+            // len*dim + depth cycles, plus the one Halt spends waiting for it.
             const uint64_t expect = static_cast<uint64_t>(len) * dim + depth + 1;
             REQUIRE_MSG(r.cycles == expect,
                         "    depth " + std::to_string(depth) + " len " + std::to_string(len) +
@@ -1085,9 +1022,7 @@ SECTION("activate_timing") {
         }
     }
 
-    // Pooling does not make an Activate cheaper: the cost is one cycle per
-    // accumulator element read, and every element is still read before the window
-    // reduction sees it.
+    // Pooling is not cheaper: every accumulator element is still read.
     {
         Config cfg = small_cfg(dim, 4);
         cfg.ub_bytes = 1024;
@@ -1109,7 +1044,7 @@ SECTION("activate_timing") {
         REQUIRE(time_it(Pool::NONE) == dim * dim + 4 + 1);
     }
 
-    // ---- an Activate overlaps a following MatMul on an independent bank -----
+    // an Activate overlaps a following MatMul on an independent bank
     {
         Config cfg = small_cfg(dim, 4);
         cfg.ub_bytes = 2048;
@@ -1122,14 +1057,12 @@ SECTION("activate_timing") {
         const uint64_t act_dur = static_cast<uint64_t>(len) * dim + cfg.act_pipeline_depth;
         const uint64_t mm_dur  = len + 2ull * dim - 1ull;
 
-        // The premise of the comparison: the activation is the longer of the two, so
-        // an overlapping matmul has room to finish inside it.
+        // The activation is the longer of the two, so a matmul fits inside it.
         REQUIRE(act_dur > mm_dur);
 
         const Inputs in = random_inputs(6200, dim, len);
 
-        // Independent: the Activate drains bank 0 while the next matmul fills
-        // bank 1 from a different buffer region.
+        // Independent: the Activate drains bank 0 while the matmul fills bank 1.
         tpuasm::Program indep;
         indep.read_weights(0)
              .matmul(0, len, 0)
@@ -1137,8 +1070,7 @@ SECTION("activate_timing") {
              .matmul(256, len, 1)                        // reads [256,272), writes bank 1
              .halt();
 
-        // Serializing: the second matmul accumulates into the very bank the
-        // Activate is draining.
+        // Serializing: the second matmul accumulates into the draining bank.
         tpuasm::Program serial;
         serial.read_weights(0)
               .matmul(0, len, 0)
@@ -1146,17 +1078,15 @@ SECTION("activate_timing") {
               .matmul(256, len, 0, /*accumulate=*/true)
               .halt();
 
-        // The same program with the second matmul removed, as the baseline the
-        // overlapped run is measured against.
+        // The baseline: the same program without the second matmul.
         tpuasm::Program alone;
         alone.read_weights(0)
              .matmul(0, len, 0)
              .activate(0, 512, len, ActFn::RELU, 1, 4)
              .halt();
 
-        // Both matmuls read a buffer region, so seed the UB directly rather than
-        // spending DMA cycles that would blur the comparison.
-        // Both matmuls read a region, at 0 and at 256.
+        // Seeded directly rather than by DMA, whose cycles would blur the
+        // comparison; the two matmuls read at 0 and at 256.
         Inputs seeded = in;
         seeded.ub_at = 0;
         seeded.ub_bytes.assign(256 + len * dim, 0);
@@ -1177,21 +1107,18 @@ SECTION("activate_timing") {
         const TpuResult rs = run_prog(serial.code(), ts);
         const TpuResult ra = run_prog(alone.code(), ta);
 
-        // Overlapped, the extra matmul is free: it hides entirely inside the
-        // activation, and even the cycle it spends issuing was one the machine would
-        // have spent waiting at the Halt anyway.
+        // Overlapped, the extra matmul is free: it hides inside the activation,
+        // and its issue cycle was one the machine would have waited at Halt.
         REQUIRE_MSG(ri.cycles == ra.cycles,
                     "    alone " + std::to_string(ra.cycles) + " indep " +
                         std::to_string(ri.cycles) + " serial " + std::to_string(rs.cycles) +
                         " mm_dur " + std::to_string(mm_dur) + "\n");
 
-        // Serialized, it cannot start until the activation retires, so it costs its
-        // whole duration on top.
+        // Serialized, it starts only once the activation retires.
         REQUIRE(rs.cycles == ra.cycles + mm_dur);
         REQUIRE(rs.cycles > ri.cycles);
 
-        // Both programs stall on the accumulator, because the Activate waits for the
-        // matmul feeding it either way -- but only the serializing one stalls twice.
+        // Both stall on the accumulator, but only the serializing one stalls twice.
         REQUIRE(ti.stalls().accum_hazard > 0);
         REQUIRE(ts.stalls().accum_hazard > ti.stalls().accum_hazard);
 
@@ -1202,8 +1129,7 @@ SECTION("activate_timing") {
         REQUIRE_MSG(d2.empty(), d2);
     }
 
-    // An Activate whose output a following MatMul reads must serialize, since the
-    // buffer region is the dependence.
+    // An Activate whose output a later MatMul reads must serialize.
     {
         Config cfg = small_cfg(dim, 4);
         cfg.ub_bytes = 2048;

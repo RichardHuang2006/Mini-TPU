@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Embed a small .mtpt container into a classic-script JS file.
-
-The visualizer is a static page that also works from file://, where fetch() of
-sibling files is blocked, so the small teaching workload ships inside the page
-as base64. Usage:
-
-    python3 viz/embed_small.py viz/traces/matmul_8.mtpt viz/traces/matmul_8.js
-"""
+"""Embed a small .mtpt container as base64, so the page works from file://."""
 import base64
 import sys
 

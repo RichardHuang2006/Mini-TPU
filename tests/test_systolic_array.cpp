@@ -1,9 +1,4 @@
-// Systolic array tests: the processing element and matrix unit of
-// src/systolic_array.h. Stationary weights, int32 accumulation, registered
-// activation and partial-sum propagation, activation skew, the
-// len + 2*dim - 1 fill/drain formula, dual weight planes and free plane
-// switches, double-buffered versus exposed weight loads, overwrite and
-// accumulate modes, across several array dimensions.
+// Tests for the processing element and matrix unit of src/systolic_array.h.
 
 #include "test_support.h"
 
@@ -30,7 +25,6 @@ std::vector<int> mxu_matmul(const Config& cfg, const std::vector<i8>& weights,
 
 }  // namespace
 
-// ---------------------------------------------------------- @section("pe") ---
 SECTION("pe") {
     Pe p;
     p.set_weight(3, 0);
@@ -38,8 +32,7 @@ SECTION("pe") {
     REQUIRE(p.weight(0) == 3);
     REQUIRE(p.weight(1) == -5);
 
-    // Nothing is visible until commit: this is the property that keeps the order
-    // PEs are visited in out of the results.
+    // Nothing is visible until commit, so PE visit order cannot leak out.
     p.tick(7, 100, 0);
     REQUIRE(p.act_out() == 0);
     REQUIRE(p.psum_out() == 0);
@@ -71,8 +64,7 @@ SECTION("pe") {
     q.commit();
     REQUIRE(q.psum_out() == -16256);
 
-    // clear_pipeline drops data in flight but keeps the weights, because weights
-    // are loaded by their own instruction and outlive any one matmul.
+    // clear_pipeline drops data in flight but keeps the weights.
     q.tick(5, 999, 0);
     q.commit();
     REQUIRE(q.psum_out() != 0);
@@ -81,9 +73,7 @@ SECTION("pe") {
     REQUIRE(q.act_out() == 0);
     REQUIRE(q.weight(0) == 127);
 
-    // A chain of PEs delays by exactly one cycle per hop. Driving three in a row
-    // for three cycles, the value entering the first should be leaving the third
-    // only on the third commit.
+    // A chain of PEs delays by exactly one cycle per hop.
     Pe chain[3];
     for (Pe& c : chain) c.set_weight(1, 0);
     for (int cycle = 0; cycle < 3; ++cycle) {
@@ -96,7 +86,6 @@ SECTION("pe") {
     }
 }
 
-// ------------------------------------------------- @section("mxu_weights") ---
 SECTION("mxu_weights") {
     Config cfg = small_cfg();        // dim 4
     cfg.double_buffer = false;       // load straight into the active plane
@@ -106,8 +95,7 @@ SECTION("mxu_weights") {
     REQUIRE(mxu.active_plane() == 0);
     REQUIRE(mxu.load_plane() == 0);
 
-    // A full tile: PE[k][c] must hold W[k][c] and not its transpose, which is the
-    // single easiest thing to get backwards in the whole array.
+    // PE[k][c] must hold W[k][c] and not its transpose.
     I8Tensor w(4, 4);
     for (uint32_t k = 0; k < 4; ++k) {
         for (uint32_t c = 0; c < 4; ++c) w.view().at(k, c) = static_cast<i8>(k * 10 + c);
@@ -144,8 +132,7 @@ SECTION("mxu_weights") {
     REQUIRE(part.plane_rows(0) == 2);
     REQUIRE(part.plane_cols(0) == 3);
 
-    // Loading again must overwrite the padding too, or a small tile would leave
-    // a previous large one's values lying around to corrupt the next matmul.
+    // Loading again must overwrite the padding a larger tile left behind.
     part.load_weights(w.view());
     REQUIRE(part.weight_at(3, 3, 0) == 33);
     I8Tensor tiny(1, 1);
@@ -155,8 +142,7 @@ SECTION("mxu_weights") {
     REQUIRE(part.weight_at(3, 3, 0) == 0);
     REQUIRE(part.weight_at(0, 1, 0) == 0);
 
-    // With double buffering the load goes to the shadow plane and leaves the
-    // active one untouched.
+    // With double buffering the load leaves the active plane untouched.
     Config db = small_cfg();
     db.double_buffer = true;
     Mxu two(db);
@@ -167,11 +153,8 @@ SECTION("mxu_weights") {
     REQUIRE(two.switch_pending());
 }
 
-// -------------------------------------------------- @section("mxu_matmul") ---
 SECTION("mxu_matmul") {
-    // The first differential pass: the cycle-accurate array against the eager
-    // oracle, over a spread of shapes and data covering both int8 extremes. Nothing
-    // here recomputes the matmul locally; the expectation comes from ref.h.
+    // The array against the oracle, over shapes covering both int8 extremes.
     Lcg rng(12345);
     int shapes = 0, disagreements = 0;
     std::string first_bad;
@@ -203,8 +186,7 @@ SECTION("mxu_matmul") {
     REQUIRE(shapes > 0);
     REQUIRE_MSG(disagreements == 0, first_bad);
 
-    // Saturating inputs everywhere: every product is 16384 and every column sums
-    // dim of them, so this is the widest the int32 chain gets in these tests.
+    // Every product is 16384, the widest the int32 chain gets in these tests.
     {
         Config cfg = small_cfg(8, 2);
         cfg.double_buffer = false;
@@ -216,8 +198,7 @@ SECTION("mxu_matmul") {
         REQUIRE(want[0] == 8 * 16384);
     }
 
-    // The hand-checked case from the ref section, now through the array: row
-    // [1 0 0 0] selects W row 0 and [0 1 1 0] sums W rows 1 and 2.
+    // Row [1 0 0 0] selects W row 0; [0 1 1 0] sums W rows 1 and 2.
     {
         Config cfg = small_cfg();
         cfg.double_buffer = false;
@@ -247,8 +228,7 @@ SECTION("mxu_matmul") {
         REQUIRE_MSG(got == want, diff_vec("hand-checked", got, want));
     }
 
-    // A zero-padded partial tile is correct, not merely plausible: a real 2x3 by
-    // 3x2 problem in a 4x4 array.
+    // A real 2x3 by 3x2 problem, zero padded into a 4x4 array.
     {
         Config cfg = small_cfg();
         cfg.double_buffer = false;
@@ -305,8 +285,7 @@ SECTION("mxu_matmul") {
     }
 
     // Back-to-back matmuls must not leak: the de-skew window has to reject the
-    // previous stream's data still draining through the array. Large values
-    // first, so a leak would be unmistakable.
+    // previous stream still draining. Large values first, so a leak is obvious.
     {
         Config cfg = small_cfg(4, 2);
         cfg.double_buffer = false;
@@ -334,7 +313,6 @@ SECTION("mxu_matmul") {
     }
 }
 
-// -------------------------------------------------- @section("mxu_timing") ---
 SECTION("mxu_timing") {
     // The occupancy formula, over several shapes.
     for (const uint32_t dim : std::initializer_list<uint32_t>{1u, 2u, 4u, 8u}) {
@@ -359,8 +337,7 @@ SECTION("mxu_timing") {
             REQUIRE(t.end == t.start + t.cycles);
             REQUIRE(mxu.cycle() == t.end);
 
-            // Each output row completes once its last column drains out, which is
-            // r + 2*dim - 1 cycles after the stream began.
+            // A row completes r + 2*dim - 1 cycles after the stream began.
             REQUIRE(t.row_valid.size() == len);
             bool valid_ok = true;
             for (uint32_t r = 0; r < len; ++r) {
@@ -369,17 +346,14 @@ SECTION("mxu_timing") {
             }
             REQUIRE(valid_ok);
 
-            // The last row lands on the final cycle of the occupancy window, so
-            // no result is claimed after the array reports itself free.
+            // The last row lands on the final cycle of the occupancy window.
             REQUIRE(t.row_valid.back() == t.end - 1);
             REQUIRE(t.row_valid.front() >= t.start);
         }
     }
 
-    // Fill and drain is pure overhead, so utilization is len / (len + 2*dim - 1) and
-    // only a long stream amortizes it away. Double buffering is on to keep
-    // weight-load bubbles out of the clock, leaving fill and drain as the only thing
-    // measured.
+    // Utilization is len / (len + 2*dim - 1), with double buffering on so that
+    // fill and drain is the only thing measured.
     {
         Config cfg = small_cfg(4, 2);
         cfg.double_buffer = true;
@@ -397,8 +371,7 @@ SECTION("mxu_timing") {
         REQUIRE(one.stats().useful_macs == 16);
         REQUIRE(one.utilization() < 0.2);        // 16 / (16 * 8)
 
-        // Four rows through the same weights: four times the work in less than
-        // twice the time.
+        // Four times the work in less than twice the time.
         Mxu four(cfg);
         I8Tensor a4(4, 4);
         a4.view().fill(1);
@@ -408,8 +381,7 @@ SECTION("mxu_timing") {
         REQUIRE(four.stats().cycles == 4 + 7);
         REQUIRE(four.utilization() > one.utilization());
 
-        // Weight-load bubbles belong to the clock too, so a stalled load shows up
-        // as lost utilization rather than disappearing from the accounting.
+        // A stalled load shows up as lost utilization, not as missing time.
         Config slow = cfg;
         slow.double_buffer = false;
         Mxu stalled(slow);
@@ -421,8 +393,7 @@ SECTION("mxu_timing") {
         REQUIRE(stalled.utilization() < four.utilization());
     }
 
-    // Padding is attributed rather than hidden: a real 2x3 tile in a 4x4 array
-    // does 2*2*3 = 12 useful MACs out of 2*16 = 32 slots.
+    // A real 2x3 tile in a 4x4 array: 2*2*3 = 12 useful MACs of 2*16 = 32 slots.
     {
         Config cfg = small_cfg(4, 2);
         cfg.double_buffer = false;
@@ -452,11 +423,8 @@ SECTION("mxu_timing") {
     }
 }
 
-// ------------------------------------------- @section("mxu_double_buffer") ---
 SECTION("mxu_double_buffer") {
-    // The marquee property of this phase. Two matmuls on different weight tiles:
-    // the second tile's load is free when it can shift into the shadow plane, and
-    // costs a full dim cycles when it cannot.
+    // The second tile's load is free into the shadow plane, dim cycles without.
     const uint32_t dim = 4;
 
     I8Tensor w0(dim, dim), w1(dim, dim);
@@ -471,8 +439,7 @@ SECTION("mxu_double_buffer") {
         for (uint32_t c = 0; c < dim; ++c) a.view().at(r, c) = static_cast<i8>(r + c);
     }
 
-    // Runs the two-matmul sequence and reports the bubble charged to the *second*
-    // weight load, along with both results.
+    // Reports the bubble charged to the second weight load, plus both results.
     auto run_pair = [&](bool double_buffer, uint64_t& second_load_bubble,
                         std::vector<int>& r0, std::vector<int>& r1) {
         Config cfg = small_cfg(dim, 2);
@@ -511,20 +478,16 @@ SECTION("mxu_double_buffer") {
     REQUIRE(db.weight_load_bubble == 0);
     REQUIRE(nodb.weight_load_bubble == 2ull * dim);   // both loads are exposed
 
-    // Two matmuls of dim rows each, and the whole difference between the two
-    // configurations is the weight bubbles.
+    // The whole difference between the two configurations is the weight bubbles.
     const uint64_t compute = 2ull * (dim + 2ull * dim - 1ull);
     REQUIRE(db.cycles == compute);
     REQUIRE(nodb.cycles == compute + 2ull * dim);
 
-    // Speed must not change the answer. This is the assertion that makes the
-    // bubble counts above worth having: an array that skipped the weight load
-    // entirely would also report a zero bubble.
+    // Speed must not change the answer; a skipped load would also report no bubble.
     REQUIRE_MSG(db_r0 == nodb_r0, diff_vec("first matmul", db_r0, nodb_r0));
     REQUIRE_MSG(db_r1 == nodb_r1, diff_vec("second matmul", db_r1, nodb_r1));
 
-    // And both agree with the oracle, so switching planes really did make the
-    // second tile resident instead of leaving the first one in place.
+    // Both agree with the oracle, so the second tile really did become resident.
     {
         Config cfg = small_cfg(dim, 2);
         std::vector<i8> fw0, fw1, fa;
@@ -542,8 +505,7 @@ SECTION("mxu_double_buffer") {
         REQUIRE(want0 != want1);      // the two tiles really do differ
     }
 
-    // Plane bookkeeping: with double buffering the active plane alternates, one
-    // switch per load; without it, everything stays in plane 0.
+    // Double buffered, the active plane alternates; otherwise it stays at 0.
     REQUIRE(db.plane_switches == 2);
     REQUIRE(nodb.plane_switches == 0);
 
@@ -572,8 +534,7 @@ SECTION("mxu_double_buffer") {
         REQUIRE(mxu.weight_at(0, 0, 1) == w0.view().at(0, 0));
     }
 
-    // Two matmuls with no load in between reuse the resident tile and switch
-    // nothing, so a plane switch is charged to a load and not to every matmul.
+    // A plane switch is charged to a load, not to every matmul.
     {
         Config cfg = small_cfg(dim, 2);
         cfg.double_buffer = true;

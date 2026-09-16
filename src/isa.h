@@ -6,34 +6,7 @@
 
 #include "datapath.h"
 
-// The CISC instruction set: the opcode enum, the fixed six-word encoding and
-// its field layout, the encoder, the decoder, and the disassembler.
-//
-// Fixed-width instructions: one opcode/flag word plus five operand words. No
-// field straddles a word boundary, so an encoding is legible in a hex dump and a
-// decode is a field extraction rather than bit-stitching. Instructions are whole
-// tensor operations, so six words leave room to spare and nothing needs packing.
-//
-// word 0   flags and opcode
-//   [7:0]    opcode (Op)
-//   [8]      accumulate           (MATMUL)
-//   [10:9]   activation function  (ACTIVATE)
-//   [12:11]  pooling mode         (ACTIVATE)
-//   [20:13]  requantization shift (ACTIVATE)
-//   [26:21]  pooling window       (ACTIVATE)
-//   [31:27]  pooling stride       (ACTIVATE)
-//
-// words 1..5  operands, per opcode
-//   READ_HOST     host_addr, ub_addr, bytes
-//   WRITE_HOST    ub_addr, host_addr, bytes
-//   READ_WEIGHTS  ddr_addr, tile
-//   MATMUL        ub_src, len, acc_bank
-//   ACTIVATE      acc_bank, ub_dst, len, bias, multiplier
-//   HALT          code
-//   SYNC / NOP    none
-
-// One opcode per whole-tensor operation; this class drives every dispatch
-// decision from the sequencer onward.
+// One opcode per whole-tensor operation; README section 13 has the encoding.
 enum class Op : uint8_t {
     READ_HOST,      // DMA host -> Unified Buffer
     READ_WEIGHTS,   // stage a weight tile into the weight FIFO / shadow plane
@@ -74,8 +47,7 @@ inline constexpr uint32_t MAX_OPCODE = static_cast<uint32_t>(Op::HALT);
 
 }  // namespace isa
 
-// An instruction in field form. Every immediate is sign- or zero-extended once,
-// here, and never re-derived at a use site.
+// An instruction in field form, with every immediate extended exactly once.
 struct Decoded {
     Op   op   = Op::NOP;
     bool trap = false;    // illegal encoding; halts the machine
@@ -107,9 +79,7 @@ struct Decoded {
     uint32_t code = 0;
 };
 
-// Encode a decoded instruction back to its wire form. Kept next to the field
-// layout so encoder and decoder cannot drift apart, and so the test program
-// builder has one way to emit an instruction.
+// Encode a decoded instruction back to its wire form.
 inline RawInst encode(const Decoded& d) {
     assert(d.shift       <= isa::SHIFT_MASK);
     assert(d.pool_window <= isa::WINDOW_MASK);
@@ -161,13 +131,10 @@ inline RawInst encode(const Decoded& d) {
     return r;
 }
 
-// Wire form to field form. The only failure mode is an opcode outside the
-// defined set, which decodes to a trapping HALT: a malformed program stops the
-// machine rather than running on undefined state.
+// Wire form to field form; an undefined opcode decodes to a trapping HALT.
 Decoded decode(const RawInst& raw);
 
-// One line per instruction, operands named rather than positional so a listing
-// can be read without the encoding table.
+// One line per instruction, with operands named rather than positional.
 std::string disasm(const Decoded& d);
 
 inline const char* op_name(Op op) {

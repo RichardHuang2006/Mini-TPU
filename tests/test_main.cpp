@@ -1,15 +1,11 @@
-// Test driver. Each test_*.cpp translation unit registers its SECTION()s in
-// the shared registry (tests/test_support.h); this file only runs them all
-// and reports the totals.
+// Runs every SECTION() the test_*.cpp files registered in tests/test_support.h.
 
 #include <cstdio>
 
 #include "test_support.h"
 
 int main() {
-    // Line-buffered, so a section header, its assertion failures and anything a
-    // test writes to stderr stay in the order they happened even when the output
-    // is piped to a file or a CI log.
+    // Line-buffered, so stdout and stderr stay interleaved in order when piped.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
     int passes = 0, fails = 0;

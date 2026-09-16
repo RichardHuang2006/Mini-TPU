@@ -1,17 +1,12 @@
-// The controller: loads a container (the embedded small example or a file),
-// owns the cycle/phase/selection state, drives every view from the same
-// materialized state, and handles playback and keyboard navigation. Playback
-// speed changes only the timer between steps.
-//
-// Classic script; runs on DOMContentLoaded.
+// The controller: owns the cycle, phase and selection state, drives every view
+// from it, and handles playback and keyboard navigation.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
   const { fmt } = MTV;
   const SPEEDS = [1, 2, 4, 16, 64, 256, 1024, 4096];
 
-  // Named cycles worth looking at. Every line is a pointer to trace records at
-  // that cycle; the visualizer shows the records, not this text, as the fact.
+  // Pointers to trace records; the views show the records, not this text.
   const BOOKMARKS = {
     matmul_128: [
       [0, 'DMA preamble: Read_Host A(0,0) issues; the prefetcher has already filled the FIFO'],
@@ -139,7 +134,8 @@
       this.el.cycle.max = String(model.cycles - 1);
       const ck = model.m.checks;
       const okAll = ck && ck.all;
-      this.el.badge.textContent = okAll ? 'trace verified: run unchanged by tracing · oracle · golden · PE identity (' + fmt(ck.pe_checked) + ') · commit replay · requantize · partitions' : 'trace checks FAILED';
+      this.el.badge.textContent = okAll ? 'trace verified ✓' : 'trace checks FAILED';
+      this.el.badge.title = 'tools/tracegen checks: run unchanged by tracing, oracle, golden loops, PE identity (' + fmt(ck.pe_checked) + ' steps), landings, commit replay, requantize, stall and idle partitions, unit intervals';
       this.el.badge.className = 'badge ' + (okAll ? 'ok' : 'bad');
       const bm = BOOKMARKS[model.workload.name] || [];
       this.el.bookmarks.innerHTML = '<option value="">jump to…</option>' + bm.filter(([t]) => t < model.cycles).map(([t, text]) => '<option value="' + t + '">' + t + ' · ' + text + '</option>').join('');

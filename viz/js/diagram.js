@@ -1,10 +1,5 @@
-// The microarchitecture diagram (SVG): the blocks the simulator implements and
-// the paths data takes between them. A wire lights up only in the phase where
-// the trace records a transfer on it: green for a read at issue, violet for a
-// commit at retire, copper for a prefetch push, dashed amber when the
-// instruction at pc wants the path but was stalled.
-//
-// Classic script: defines window.MTV.views.diagram.
+// The microarchitecture diagram (SVG). A wire lights up only in the phase whose
+// trace records a transfer on it: green read, violet commit, copper prefetch.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -143,7 +138,7 @@
       const ev = st.events;
       const o = st.outcome;
 
-      // ---- wires ----
+      // wires
       const ws = {};
       const set = (id, status, detail, pc, cls) => { ws[id] = { status, detail, pc, cls }; };
       if (afterRetire) {
@@ -190,7 +185,7 @@
         this.cls('wire-' + id, 'wire' + (w ? ' ' + w.cls : '') + (selected ? ' selected' : ''));
       }
 
-      // ---- blocks ----
+      // blocks
       const unitBlk = { DMA: 'dma', WEIGHT: 'fifo', MXU: 'mxu', ACT: 'act' };
       const retiredUnits = new Set(afterRetire ? ev.retires.map((r) => r.unit) : []);
       const stalledUnit = afterIssue && o.kind === 'stall' && m.program[o.pc] ? MTV.UNIT_OF_OP[m.program[o.pc].op] : null;

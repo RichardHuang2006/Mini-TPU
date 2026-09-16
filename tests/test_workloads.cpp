@@ -1,17 +1,10 @@
-// Workload tests: whole layers lowered by tests/workloads.h and run end to
-// end on the machine. Quantized activation and pooling programs, dense and
-// tiled matmuls, K larger than the physical array, convolution lowering via
-// im2col, and multi-layer MLPs -- each held against plain nested-loop golden
-// implementations that never see a tile or an instruction, across
-// configuration and scheduling variations.
+// Whole layers lowered by tests/workloads.h, run end to end on the machine and
+// held against plain nested-loop golden implementations.
 
 #include "test_support.h"
-// ---------------------------------------------------- @section("activate") ---
 SECTION("activate") {
-    // A matmul-then-activate layer, byte-for-byte against the oracle, across every
-    // activation function and a spread of requantization scales. The arithmetic was
-    // pinned exhaustively in the quant section; under test here is that the machine
-    // feeds it the right accumulator and puts the result in the right place.
+    // The quant section pinned the arithmetic; what is under test here is that the
+    // machine feeds it the right accumulator and stores the result in the right place.
     const uint32_t dim = 4, len = 4;
 
     Config cfg = small_cfg(dim, 2);
@@ -26,9 +19,8 @@ SECTION("activate") {
         i32      multiplier;
         uint32_t shift;
     };
-    // Shift 0 saturates hard, large shifts crush everything toward zero, and the
-    // middle ones land on ties. A negative bias pushes values through the ReLU
-    // boundary rather than leaving every element on one side of it.
+    // Shift 0 saturates, large shifts crush toward zero, middle ones land on ties;
+    // the negative bias pushes values through the ReLU boundary.
     const std::vector<Scale> scales = {
         {0, 1, 0}, {0, 1, 4}, {0, 1, 8}, {0, 3, 7}, {0, 127, 14},
         {100, 1, 6}, {-100, 1, 6}, {0, 1, 31}, {2000000, 1000000, 20},
@@ -62,8 +54,7 @@ SECTION("activate") {
     }
     REQUIRE(checked == static_cast<int>(fns.size() * scales.size()));
 
-    // The three functions do not all produce the same bytes, so the sweep above is
-    // actually discriminating between them.
+    // The three functions differ, so the sweep above discriminates between them.
     {
         auto run_with = [&](ActFn fn) {
             Tpu t(cfg);
@@ -85,8 +76,7 @@ SECTION("activate") {
         REQUIRE(ident != relu);
         REQUIRE(relu != relu6);
 
-        // ReLU never emits a negative, ReLU6 never exceeds 6, and identity did
-        // produce something out of both ranges or the comparison above was luck.
+        // Identity must produce something outside both ranges, or this proves nothing.
         bool relu_nonneg = true, relu6_bounded = true, ident_negative = false;
         for (std::size_t i = 0; i < ident.size(); ++i) {
             if (relu[i] < 0) relu_nonneg = false;
@@ -98,13 +88,8 @@ SECTION("activate") {
         REQUIRE(ident_negative);
     }
 
-    // ---- the clamp boundaries, one requantized value at a time --------------
-    // Random matmul products land on small integers too rarely to pin down where
-    // each function turns over: a ReLU clamping everything below 2 rather than below
-    // 0 passed the sweep above, because nothing in it ever requantized to exactly 1.
-    // Planting the accumulator directly and walking it across the interesting range,
-    // with multiplier 1 and shift 0, requantizes each planted value to itself and
-    // hits every boundary exactly.
+    // The clamp boundaries one value at a time, planted in the bank directly:
+    // random products land on small integers too rarely to pin the turnover.
     {
         Inputs planted;
         planted.acc_at = 0;
@@ -130,8 +115,7 @@ SECTION("activate") {
             }
         }
 
-        // Spot-check the turnover points directly, so the sweep is anchored to
-        // stated values and not only to the oracle agreeing with itself.
+        // Anchored to stated values, not only to the oracle agreeing with itself.
         for (std::size_t i = 0; i < planted.acc_vals.size(); ++i) {
             planted.acc_vals[i] = static_cast<i32>(i) - 4;   // -4 .. dim*dim-5
         }
@@ -160,8 +144,7 @@ SECTION("activate") {
         REQUIRE(id[11] == 7 && r6[11] == 6);
     }
 
-    // Activating a bank a K-tiled sequence built up, so the pipeline reads a sum
-    // rather than a single matmul's output.
+    // Activating a K-tiled bank, so the pipeline reads a sum, not one matmul.
     {
         const Inputs two = random_inputs(6002, dim, len, 2);
         tpuasm::Program p;
@@ -175,8 +158,7 @@ SECTION("activate") {
         REQUIRE_MSG(diff.empty(), diff);
     }
 
-    // Fewer rows than the array: the pipeline must read `len` rows and leave the
-    // rest of the bank alone.
+    // Fewer rows than the array: the rest of the bank must be left alone.
     for (uint32_t rows = 1; rows <= dim; ++rows) {
         tpuasm::Program p;
         p.read_host(in.host_at, 0, len * dim)
@@ -189,11 +171,8 @@ SECTION("activate") {
     }
 }
 
-// -------------------------------------------------------- @section("pool") ---
 SECTION("pool") {
-    // Pooling on the requantized stream, against the oracle, over every window and
-    // stride that fits -- including the ones that do not divide the input evenly and
-    // so drop a ragged edge.
+    // Every window and stride that fits, including those that drop a ragged edge.
     const uint32_t dim = 6;
 
     Config cfg = small_cfg(dim, 2);
@@ -244,8 +223,7 @@ SECTION("pool") {
     REQUIRE(shapes > 50);
     REQUIRE(uneven > 0);        // the ragged-edge cases really were exercised
 
-    // Pooling changes the output, so the sweep is not comparing two identical
-    // things, and max is not the same as average.
+    // Pooling changes the output, and max is not the same as average.
     {
         auto run_pool = [&](Pool mode, uint32_t w, uint32_t s) {
             Tpu t(cfg);
@@ -330,19 +308,12 @@ SECTION("pool") {
     }
 }
 
-// ------------------------------------------------------ tiling helpers -------
+// tiling helpers
 
 namespace {
 
-// Everything one lowered layer produced: what the program computed, what plain
-// nested loops say it should be, and whether the machine and the oracle agreed
-// along the way.
-//
-// The two checks answer different questions. The oracle diff cannot catch a
-// mis-lowered layer, because the oracle runs the same program: if the tiler emits
-// the wrong instructions, both models faithfully execute the wrong thing and agree.
-// Only the golden comparison, which never sees a tile or an instruction, can tell
-// that the program does not compute the layer it claims to.
+// What a lowered layer produced, what golden loops say it should be, and
+// whether the two models agreed; only the first can catch a mis-lowered layer.
 struct LayerRun {
     std::vector<i8> got;
     std::vector<i8> want;
@@ -353,8 +324,7 @@ struct LayerRun {
     StallStats      stalls;
 };
 
-// Lower a layer, run it on the machine, and hold the result against both the
-// oracle and the golden loops.
+// Lower a layer, run it, and check it against the oracle and the golden loops.
 LayerRun run_layer(const wl::Layer& l, const Config& cfg, uint32_t seed,
                    const wl::Placement& at = {}, const wl::Sched& sched = {}) {
     Lcg rng(seed);
@@ -392,11 +362,8 @@ LayerRun run_layer(const wl::Layer& l, const Config& cfg, uint32_t seed,
 
 }  // namespace
 
-// ------------------------------------------------------ @section("tiling") ---
 SECTION("tiling") {
-    // ---- packing round-trips, including ragged shapes ----------------------
-    // The tiler leans on pack/unpack being inverses, so pin that before anything
-    // depends on it.
+    // The tiler leans on pack/unpack being inverses, ragged shapes included.
     {
         for (const uint32_t dim : {1u, 2u, 4u, 8u}) {
             for (uint32_t rows = 1; rows <= 9; ++rows) {
@@ -412,9 +379,7 @@ SECTION("tiling") {
             }
         }
 
-        // Padding is zero, which is what makes a ragged tile harmless: a padded
-        // activation column meets a padded weight row, so the product is zero and
-        // the sum is unchanged.
+        // Padding is zero, which is what makes a ragged tile harmless.
         {
             const std::vector<i8> src(3 * 3, 5);
             const std::vector<i8> packed = wl::pack(src, 3, 3, 4);
@@ -437,7 +402,7 @@ SECTION("tiling") {
         REQUIRE(wl::tiles_of(5, 4) == 2);
     }
 
-    // ---- the headline case: 128x128 x 128x128 on a 32x32 array -------------
+    // the headline case: 128x128 x 128x128 on a 32x32 array
     {
         Config cfg;                       // the default configuration
         cfg.dim = 32;
@@ -455,8 +420,7 @@ SECTION("tiling") {
         REQUIRE(r.low.tiles == 4 * 4 * 4);
         REQUIRE(r.low.macs == 128ull * 128 * 128);
 
-        // The result is not trivially all one value, or the comparison proves
-        // nothing. ReLU should leave roughly half of it clamped to zero.
+        // Not trivially one repeated value, or the comparison proves nothing.
         std::size_t zeros = 0, distinct_hi = 0;
         for (const i8 v : r.got) {
             if (v == 0) ++zeros;
@@ -466,10 +430,8 @@ SECTION("tiling") {
         REQUIRE(distinct_hi > r.got.size() / 8);
     }
 
-    // ---- K tiling accumulates across four tiles ----------------------------
-    // Isolated from M and N tiling: one output tile, four K tiles piling into one
-    // bank. If accumulate-in-place were wrong, only the last K tile would survive and
-    // the answer would be off by three quarters of the sum.
+    // One output tile and four K tiles into one bank, isolated from M and N
+    // tiling: a broken accumulate-in-place would keep only the last tile.
     {
         Config cfg;
         cfg.dim = 8;
@@ -485,8 +447,7 @@ SECTION("tiling") {
         REQUIRE_MSG(r.got == r.want, tensor_mismatch(r.got, r.want, l.M, l.N));
         REQUIRE(r.low.tiles == 4);          // one output tile, four K tiles
 
-        // The same shape with K truncated to a single tile must give a different
-        // answer, so the extra three tiles demonstrably contributed.
+        // Truncating K to one tile must change the answer.
         wl::Layer one = l;
         one.K = 8;
         const LayerRun r1 = run_layer(one, cfg, 7200);
@@ -495,9 +456,7 @@ SECTION("tiling") {
         REQUIRE(r.got != r1.got);
     }
 
-    // ---- shapes that do not divide the array ------------------------------
-    // Every combination of ragged M, N and K, on a small array so the sweep is cheap.
-    // Zero padding and the short-`len` last row block have to agree with plain loops.
+    // Every combination of ragged M, N and K, on a small array so it stays cheap.
     {
         Config cfg;
         cfg.dim = 4;
@@ -530,11 +489,8 @@ SECTION("tiling") {
         REQUIRE(ragged > 100);
     }
 
-    // ---- the last row block is short, not padded out ----------------------
-    // A short final block is expressed with a smaller `len`, not by processing padding
-    // rows and discarding them afterwards. Padding rows would give the same answer,
-    // since unpack drops them, so only the instruction stream and the cycle count can
-    // tell the difference; both are checked here.
+    // A short final block uses a smaller `len` rather than padding rows that are
+    // discarded later; only the instruction stream and the cycle count show it.
     {
         Config cfg;
         cfg.dim = 8;
@@ -568,9 +524,7 @@ SECTION("tiling") {
         REQUIRE(ragged.cycles < padded.cycles);
     }
 
-    // ---- the requantization operands survive lowering ---------------------
-    // A layer spec carries bias, multiplier, shift and activation function; the
-    // tiler has to put each on every Activate it emits.
+    // Bias, multiplier, shift and function must reach every Activate emitted.
     {
         Config cfg;
         cfg.dim = 4;
@@ -592,9 +546,7 @@ SECTION("tiling") {
         }
     }
 
-    // ---- the lowering is deterministic ------------------------------------
-    // Bundled examples are only reproducible if the same spec lowers to the same
-    // bytes every time.
+    // Bundled examples are reproducible only if lowering is deterministic.
     {
         Config cfg;
         cfg.dim = 8;
@@ -613,10 +565,8 @@ SECTION("tiling") {
         REQUIRE(identical);
     }
 
-    // ---- tiling actually overlaps ----------------------------------------
-    // Alternating accumulator banks and double buffering the output staging tile let
-    // the drain of one output tile hide under the next tile's arithmetic. With a
-    // single bank there is nowhere to hide.
+    // Alternating banks and a double-buffered staging tile let one tile's drain
+    // hide under the next tile's arithmetic; with one bank there is nowhere to hide.
     {
         Config cfg;
         cfg.dim = 8;
@@ -654,11 +604,8 @@ SECTION("tiling") {
                     "    1 bank:  " + brk(a) + "\n    4 banks: " + brk(b) + "\n");
         REQUIRE(a.stalls.accum_hazard > b.stalls.accum_hazard);
 
-        // ---- the output staging tile is double buffered ---------------------
-        // Consecutive Activates have to write different buffers. Sharing one stays
-        // correct, since the scoreboard would stall the Activate until the drain it
-        // collides with finished, so the only trace of the choice is in the addresses
-        // the tiler emits.
+        // Consecutive Activates write different buffers. Sharing one would still be
+        // correct, so only the emitted addresses record the choice.
         {
             const wl::Lowering low = wl::lower_layer(l, four_bank);
             std::vector<UbAddr> dsts;
@@ -673,8 +620,7 @@ SECTION("tiling") {
             distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
             REQUIRE(distinct.size() == 2);
 
-            // Strictly alternating, so no Activate ever waits on the drain of the
-            // one immediately before it.
+            // Strictly alternating, so no Activate waits on the drain before it.
             bool alternates = true;
             for (std::size_t i = 1; i < dsts.size(); ++i) {
                 if (dsts[i] == dsts[i - 1]) alternates = false;
@@ -682,11 +628,8 @@ SECTION("tiling") {
             REQUIRE(alternates);
         }
 
-        // ---- and the deferred drain is what makes the banks reachable -------
-        // Emitting each Write_Host right after its Activate costs nothing in
-        // correctness and a great deal in cycles: issue is in order, so the drain
-        // stalls on its own activation and the next tile's MatMuls queue behind it,
-        // unable to reach the idle banks waiting for them.
+        // The deferred drain is what makes the extra banks reachable: in-order
+        // issue would queue the next tile's MatMuls behind an undeferred drain.
         wl::Sched naive;
         naive.defer_drain = false;
 
@@ -696,8 +639,7 @@ SECTION("tiling") {
         REQUIRE_MSG(b.cycles < c.cycles,
                     "    deferred: " + brk(b) + "\n    naive:    " + brk(c) + "\n");
 
-        // With the naive order the extra banks buy nothing at all, because the
-        // schedule never lets two tiles be in flight to use them.
+        // With the naive order the extra banks buy nothing.
         const LayerRun d = run_layer(l, one_bank, 7500, wl::Placement{}, naive);
         REQUIRE(d.got == b.got);
         REQUIRE_MSG(d.cycles == c.cycles,
@@ -705,10 +647,8 @@ SECTION("tiling") {
     }
 }
 
-// -------------------------------------------------------- @section("conv") ---
 SECTION("conv") {
-    // Run a convolution by lowering it to im2col plus the dense tiler, and hold the
-    // result against a direct convolution that knows nothing about either.
+    // im2col plus the dense tiler, against a direct convolution knowing neither.
     auto run_conv = [](const wl::Conv& c, const Config& cfg, uint32_t seed) {
         REQUIRE(c.valid());
         const wl::Layer l = c.as_layer();
@@ -745,9 +685,7 @@ SECTION("conv") {
         out.got  = wl::unpack(packed, l.M, l.N, cfg.dim);
         out.diff = diff_tpu(out.low.code, cfg, ref_setup(tensors), tpu_setup(tensors));
 
-        // im2col has to reproduce the direct convolution's accumulators exactly,
-        // checked before requantization so a padding or stride error cannot hide
-        // inside a rounding step.
+        // Checked before requantization, so a stride error cannot hide in rounding.
         const std::vector<i32> via_cols = wl::golden_matmul(cols, w, l.M, l.K, l.N);
         REQUIRE(via_cols == wl::golden_conv_acc(c, in, w));
         return out;
@@ -757,7 +695,7 @@ SECTION("conv") {
     cfg.dim = 8;
     cfg.ub_bytes = 32 * 1024;
 
-    // ---- the shapes that make padding and stride matter --------------------
+    // the shapes that make padding and stride matter
     int cases = 0;
     for (const uint32_t pad : {0u, 1u}) {
         for (const uint32_t stride : {1u, 2u}) {
@@ -785,7 +723,7 @@ SECTION("conv") {
     }
     REQUIRE(cases == 8);
 
-    // ---- the output shape follows from padding and stride ------------------
+    // the output shape follows from padding and stride
     {
         wl::Conv c;
         c.H = 7; c.W = 7; c.Cin = 1; c.R = 3; c.S = 3; c.Cout = 1;
@@ -804,11 +742,8 @@ SECTION("conv") {
         REQUIRE(!c.valid());
     }
 
-    // ---- padding really is zero -------------------------------------------
-    // With an all-ones input and an all-ones 3x3 kernel, each output counts the input
-    // pixels the window covered: four at the corners of a padded convolution, six at
-    // the edges, nine in the interior. Padding contributing anything other than zero
-    // would show up as a wrong border.
+    // All-ones input and kernel, so each output counts the pixels its window
+    // covered: four at the corners, six at the edges, nine in the interior.
     {
         wl::Conv c;
         c.H = 5; c.W = 5; c.Cin = 1;
@@ -830,9 +765,7 @@ SECTION("conv") {
         REQUIRE(wl::golden_matmul(wl::im2col(c, in), w, 25, 9, 1) == acc);
     }
 
-    // ---- a layer whose K needs several tiles -------------------------------
-    // A 3x3x16 kernel flattens to K = 144, eighteen tiles on an 8-wide array, so the
-    // convolution exercises K accumulation as well as im2col.
+    // A 3x3x16 kernel flattens to K = 144, eighteen tiles on an 8-wide array.
     {
         wl::Conv c;
         c.H = 6; c.W = 6; c.Cin = 16;
@@ -850,8 +783,7 @@ SECTION("conv") {
         REQUIRE_MSG(r.diff.empty(), r.diff);
         REQUIRE_MSG(r.got == r.want, tensor_mismatch(r.got, r.want, l.M, l.N));
 
-        // ReLU6 means every output sits in [0, 6]; without that the comparison
-        // above could be passing on a saturated constant.
+        // ReLU6 keeps every output in [0, 6], not on a saturated constant.
         bool bounded = true, varied = false;
         for (const i8 v : r.got) {
             if (v < 0 || v > 6) bounded = false;
@@ -862,10 +794,8 @@ SECTION("conv") {
     }
 }
 
-// --------------------------------------------------------- @section("mlp") ---
 SECTION("mlp") {
-    // Run a shipped workload and hold it against the golden answer and the oracle.
-    // This is the only place the two are checked on a program nobody wrote by hand.
+    // A shipped workload, the only program here nobody wrote by hand.
     auto run_workload = [](const wl::Workload& w) {
         Inputs tensors;
         tensors.host_at    = w.a_host;
@@ -892,7 +822,7 @@ SECTION("mlp") {
         return out;
     };
 
-    // ---- a three-layer network chained with no repacking -------------------
+    // a three-layer network chained with no repacking
     {
         Config cfg;
         cfg.dim = 8;
@@ -918,8 +848,7 @@ SECTION("mlp") {
         REQUIRE_MSG(r.got == r.want,
                     tensor_mismatch(r.got, r.want, w.out_rows, w.out_cols));
 
-        // Three stages really ran: the program is the concatenation of three
-        // lowerings plus one Halt, and exactly one Halt.
+        // Three lowerings concatenated, plus exactly one Halt.
         std::size_t halts = 0, matmuls = 0;
         for (const RawInst& inst : w.code) {
             const Decoded d = decode(inst);
@@ -940,12 +869,8 @@ SECTION("mlp") {
         REQUIRE(r2.got.size() != r.got.size());
     }
 
-    // ---- chaining survives widths that do not divide the array -------------
-    // A layer's packed output has padding columns holding whatever the activation made
-    // of an all-zero accumulator, and the next layer reads those bytes as activations.
-    // They stay harmless only because they meet the zero rows of the next layer's
-    // packed weights. A non-zero bias makes that padding non-zero, so this is the
-    // shape that would catch it.
+    // Chaining across widths that do not divide the array, with a non-zero bias
+    // so the padding columns of a packed output are themselves non-zero.
     {
         Config cfg;
         cfg.dim = 8;
@@ -971,13 +896,11 @@ SECTION("mlp") {
         REQUIRE_MSG(r.got == r.want,
                     tensor_mismatch(r.got, r.want, w.out_rows, w.out_cols));
 
-        // The bias really did make the padding non-zero, so the case above is not
-        // passing by accident. An all-zero accumulator plus this bias requantizes to
-        // something positive, and every padding column holds it.
+        // The bias really did make the padding non-zero, so the case above is real.
         REQUIRE(quant::requantize_biased(0, 400, 1, 6) > 0);
     }
 
-    // ---- a mismatched network is rejected ---------------------------------
+    // a mismatched network is rejected
     {
         auto make = [](uint32_t M, uint32_t K, uint32_t N) {
             wl::Layer l;
@@ -997,9 +920,7 @@ SECTION("mlp") {
         REQUIRE(!wl::Mlp{}.chains());
     }
 
-    // ---- every shipped workload ------------------------------------------
-    // The bundled examples are exactly these, so a green run here is what makes a
-    // file in examples/ trustworthy.
+    // The bundled examples are exactly these, so a green run here vouches for them.
     {
         const std::vector<wl::Workload> all = wl::corpus();
         REQUIRE(all.size() == 4);
@@ -1018,8 +939,7 @@ SECTION("mlp") {
                         "    " + w.name + "\n" +
                             tensor_mismatch(r.got, r.want, w.out_rows, w.out_cols));
 
-            // A workload whose output is one repeated value would satisfy the
-            // comparison without exercising anything.
+            // One repeated value would satisfy the comparison without exercising it.
             bool varied = false;
             for (const i8 v : r.got) {
                 if (v != r.got.front()) varied = true;
@@ -1033,9 +953,8 @@ SECTION("mlp") {
         std::sort(names.begin(), names.end());
         REQUIRE(std::unique(names.begin(), names.end()) == names.end());
 
-        // A shipped workload survives the round trip through the formats
-        // gen_examples writes and the CLI reads. Done in memory rather than against
-        // examples/ so the check does not depend on the generator having been run.
+        // The round trip through the formats gen_examples writes and the CLI
+        // reads, in memory so the check does not need the generator to have run.
         {
             const wl::Workload& w = all.back();
 

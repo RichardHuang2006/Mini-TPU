@@ -13,14 +13,7 @@
 #include "datapath.h"
 #include "isa.h"
 
-// Program and tensor input. Each entry point takes a stream so tests can drive
-// it from a string and the CLI from a file.
-//
-// Three tensor formats: the MTPU container carries its own shape, so a bundled
-// example is self-describing, while raw and hex do not, so a tensor dumped by an
-// external framework can be fed in with the shape given on the command line. All
-// three must land the same bytes.
-
+// Program and tensor input, each entry point taking a stream.
 namespace loader_detail {
 
 inline std::vector<uint8_t> read_all_bytes(std::istream& in) {
@@ -28,8 +21,7 @@ inline std::vector<uint8_t> read_all_bytes(std::istream& in) {
                                 std::istreambuf_iterator<char>());
 }
 
-// One hex value per line. `#` and `//` start a comment, blank lines are
-// skipped, an optional 0x prefix is accepted.
+// One hex value per line; `#` and `//` start a comment, `0x` is optional.
 inline std::vector<uint32_t> read_hex_values(std::istream& in, const char* who) {
     std::vector<uint32_t> out;
     std::string line;
@@ -72,8 +64,6 @@ inline void wr_u32_le(std::ostream& out, uint32_t v) {
 }
 
 }  // namespace loader_detail
-
-// ---- programs -------------------------------------------------------------
 
 // One hex word per line, ISA_WORDS consecutive words per instruction.
 inline std::vector<RawInst> load_program_hex(std::istream& in) {
@@ -127,10 +117,7 @@ inline void save_program_hex(std::ostream& out, const std::vector<RawInst>& prog
     }
 }
 
-// ---- tensors --------------------------------------------------------------
-
-// A loaded tensor. `wide` selects which vector is populated: activations and
-// weights are int8, a dumped accumulator is int32.
+// A loaded tensor; `wide` selects int32 over int8 and which vector is populated.
 struct TensorBlob {
     uint32_t rows = 0;
     uint32_t cols = 0;
@@ -147,8 +134,7 @@ struct TensorBlob {
     I32View      i32_view()       { return I32View(i32v.data(), rows, cols); }
 };
 
-// Self-describing container: "MTPU", version, dtype, rows, cols, then elements
-// little-endian.
+// Self-describing: "MTPU", version, dtype, rows, cols, then little-endian data.
 inline constexpr uint32_t MTPU_VERSION = 1;
 
 inline void save_tensor_mtpu(std::ostream& out, const TensorBlob& t) {

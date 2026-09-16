@@ -23,17 +23,11 @@ with itself and with the arithmetic the machine defines:
   9. golden: for a dense layer, A and B unpacked from the initial memories,
      multiplied and requantized here, equal the output the trace wrote to host.
 
-Exit status 0 when everything passes. Numpy is used when present; the pure
-Python path is the same arithmetic, only slower.
+Exit status 0 when everything passes.
 """
 import json
 import struct
 import sys
-
-try:
-    import numpy as np
-except Exception:  # pragma: no cover
-    np = None
 
 DTYPE_SIZE = {"u8": 1, "i8": 1, "u32": 4, "i32": 4}
 STALL_NAMES = ["issued", "drain", "unit_busy", "weight_fifo_empty", "ub_raw", "ub_war", "ub_waw",
@@ -61,13 +55,10 @@ class Trace:
         return self.data[off:off + s["len"]]
 
     def sec(self, name):
-        """Section as a list (or numpy array) of numbers."""
+        """Section as a list of numbers."""
         s = self.sections[name]
-        raw = self.sec_bytes(name)
         fmt = {"u8": "B", "i8": "b", "u32": "I", "i32": "i"}[s["dtype"]]
-        if np is not None:
-            return np.frombuffer(raw, dtype={"u8": np.uint8, "i8": np.int8, "u32": np.uint32, "i32": np.int32}[s["dtype"]])
-        return list(struct.unpack("<%d%s" % (s["count"], fmt), raw))
+        return list(struct.unpack("<%d%s" % (s["count"], fmt), self.sec_bytes(name)))
 
 
 class Checker:
@@ -84,7 +75,7 @@ class Checker:
             print("  FAIL %-12s %s" % (name, detail))
             self.failures.append(name)
 
-    # ------------------------------------------------------------------ 1 --
+    # 1
     def layout(self):
         t = self.t
         total = len(t.data)
@@ -97,7 +88,7 @@ class Checker:
                 ok = False
         self.check("layout", ok, "%d sections, %d bytes" % (len(self.man["sections"]), total))
 
-    # ------------------------------------------------------------------ 2 --
+    # 2
     def cycles(self):
         m = self.man
         cycles = m["result"]["cycles"]
@@ -122,7 +113,7 @@ class Checker:
         self.check("cycles", ok, "%d cycles: %s" % (cycles, ", ".join(
             "%s %d" % (STALL_NAMES[i], hist[i]) for i in range(12) if hist[i])))
 
-    # ------------------------------------------------------------------ 3 --
+    # 3
     def lifetimes(self):
         m = self.man
         ok = True
@@ -169,7 +160,7 @@ class Checker:
         self.check("lifetimes", ok, "%d issues, %d retires, %d stall spans covering %d cycles" % (
             len(m["issues"]), len(m["retires"]), len(m["stalls"]), covered))
 
-    # ------------------------------------------------------------------ 4/5 --
+    # 4/5
     def replay(self):
         m = self.man
         cfg = m["config"]
@@ -197,8 +188,7 @@ class Checker:
         for ri, r in enumerate(m["reads"]):
             events.append((r["cycle"], 0, ri, r))   # reads happen at issue, after that cycle's retires
         events.sort(key=lambda e: (e[0], e[1], e[2]))
-        # Within a cycle, retires (commits) precede issue (reads): sort key puts
-        # commits (1) after reads (0), so order commits first explicitly.
+        # Retires precede issue within a cycle, so order commits first.
         events.sort(key=lambda e: (e[0], 0 if e[1] == 1 else 1, e[2]))
 
         ok_before = True
@@ -232,7 +222,7 @@ class Checker:
         self.final_ub = bytes(ub)
         self.final_acc = bytes(acc)
 
-    # ------------------------------------------------------------------ 6 --
+    # 6
     def array(self):
         m = self.man
         dim = m["config"]["dim"]
@@ -255,54 +245,28 @@ class Checker:
             land = self.t.sec("mm.%d.land" % i)
             steps = mm["steps"]
             ln = mm["len"]
-            if np is not None:
-                W = w.reshape(dim, dim).astype(np.int32)
-                A = act.reshape(steps, dim, dim)
-                P = psum.reshape(steps, dim, dim)
-                L = left.reshape(steps, dim)
-                prev_act = np.zeros((dim, dim), dtype=np.int8)
-                prev_psum = np.zeros((dim, dim), dtype=np.int32)
-                for s in range(steps):
-                    act_in = np.empty((dim, dim), dtype=np.int8)
-                    act_in[:, 0] = L[s]
-                    act_in[:, 1:] = prev_act[:, :-1]
-                    psum_in = np.zeros((dim, dim), dtype=np.int32)
-                    psum_in[1:, :] = prev_psum[:-1, :]
-                    with np.errstate(over="ignore"):
-                        want = (psum_in + act_in.astype(np.int32) * W).astype(np.int32)
-                    checked += n
-                    bad += int(np.count_nonzero(P[s] != want)) + int(np.count_nonzero(A[s] != act_in))
-                    prev_act, prev_psum = A[s], P[s]
-                # landings
-                Lnd = land.reshape(ln, dim)
-                for row in range(ln):
+            prev_act = [0] * n
+            prev_psum = [0] * n
+            for s in range(steps):
+                a_s = act[s * n:(s + 1) * n]
+                p_s = psum[s * n:(s + 1) * n]
+                l_s = left[s * dim:(s + 1) * dim]
+                for k in range(dim):
                     for c in range(dim):
-                        s = row + dim - 1 + c
-                        if int(P[s][dim - 1][c]) != int(Lnd[row][c]):
-                            land_ok = False
-            else:
-                prev_act = [0] * n
-                prev_psum = [0] * n
-                for s in range(steps):
-                    a_s = act[s * n:(s + 1) * n]
-                    p_s = psum[s * n:(s + 1) * n]
-                    l_s = left[s * dim:(s + 1) * dim]
-                    for k in range(dim):
-                        for c in range(dim):
-                            act_in = l_s[k] if c == 0 else prev_act[k * dim + c - 1]
-                            psum_in = 0 if k == 0 else prev_psum[(k - 1) * dim + c]
-                            want = (psum_in + act_in * w[k * dim + c]) & 0xFFFFFFFF
-                            if want >= 1 << 31:
-                                want -= 1 << 32
-                            checked += 1
-                            if p_s[k * dim + c] != want or a_s[k * dim + c] != act_in:
-                                bad += 1
-                    prev_act, prev_psum = a_s, p_s
-                for row in range(ln):
-                    for c in range(dim):
-                        s = row + dim - 1 + c
-                        if psum[s * n + (dim - 1) * dim + c] != land[row * dim + c]:
-                            land_ok = False
+                        act_in = l_s[k] if c == 0 else prev_act[k * dim + c - 1]
+                        psum_in = 0 if k == 0 else prev_psum[(k - 1) * dim + c]
+                        want = (psum_in + act_in * w[k * dim + c]) & 0xFFFFFFFF
+                        if want >= 1 << 31:
+                            want -= 1 << 32
+                        checked += 1
+                        if p_s[k * dim + c] != want or a_s[k * dim + c] != act_in:
+                            bad += 1
+                prev_act, prev_psum = a_s, p_s
+            for row in range(ln):
+                for c in range(dim):
+                    s = row + dim - 1 + c
+                    if psum[s * n + (dim - 1) * dim + c] != land[row * dim + c]:
+                        land_ok = False
             # staged rows committed at retire == (acc_in +) landings
             c = commits_by.get((mm["pc"], mm["retire"]))
             if c is None:
@@ -324,7 +288,7 @@ class Checker:
         self.check("pe_identity", bad == 0, "%d PE steps checked, %d bad" % (checked, bad))
         self.check("landings", land_ok, "%d matmuls: bottom row == landing, staged == bank + landing" % len(m["matmuls"]))
 
-    # ------------------------------------------------------------------ 7 --
+    # 7
     @staticmethod
     def round_shift(v, shift):
         if shift == 0:
@@ -380,7 +344,7 @@ class Checker:
                 ok = False
         self.check("activation", ok, "%d Activates re-derived from their bank rows" % len(m["activates"]))
 
-    # ------------------------------------------------------------------ 8 --
+    # 8
     def weights(self):
         m = self.man
         cfg = m["config"]
@@ -402,9 +366,7 @@ class Checker:
                 pi += 1
 
         for pop in pops:
-            # Within a cycle the retire (pop) precedes the prefetch (push), so
-            # pushes of earlier cycles enter first, then the pop, then this
-            # cycle's pushes.
+            # The retire (pop) precedes the prefetch (push) within a cycle.
             push_through(pop["cycle"] - 1)
             if not q:
                 ok = False
@@ -421,7 +383,7 @@ class Checker:
         self.check("weights", ok, "%d pushes, %d plane loads, depth %d, latency %d" % (
             len(pushes), len(pops), cfg["weight_fifo_depth"], cfg["ddr_tile_latency"]))
 
-    # ------------------------------------------------------------------ 9 --
+    # 9
     def golden(self):
         m = self.man
         w = m["workload"]

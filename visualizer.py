@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the Mini-TPU cycle visualizer (viz/index.html) in a browser.
-
-Serves viz/ over local HTTP (needed so ?trace=... can fetch a container by
-URL) and opens the page. With no arguments it opens the small embedded
-example; --trace picks a container to load immediately; --build regenerates
-the trace containers first (equivalent to `make trace`) if they are missing
-or stale.
-
-    python3 visualizer.py                          # embedded small example
-    python3 visualizer.py --trace matmul_128        # or a full path/.mtpt
-    python3 visualizer.py --build                   # regenerate traces first
-    python3 visualizer.py --port 0 --no-browser      # print the URL only
-"""
+"""Serve viz/ over local HTTP and open the Mini-TPU cycle visualizer."""
 import argparse
 import http.server
 import os
@@ -20,6 +8,13 @@ import subprocess
 import sys
 import threading
 import webbrowser
+
+EXAMPLES = """examples:
+  python3 visualizer.py                        # embedded small example
+  python3 visualizer.py --trace matmul_128     # or a full path/.mtpt
+  python3 visualizer.py --build                # regenerate traces first
+  python3 visualizer.py --port 0 --no-browser  # print the URL only
+"""
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 VIZ = os.path.join(REPO, "viz")
@@ -52,8 +47,7 @@ def build_traces():
     env = dict(os.environ)
     make_cmd = ["make", "trace"]
     if sys.platform == "darwin" and os.path.isdir(sdk):
-        # This machine's system clang++ is blocked by an unaccepted Xcode
-        # license; the Command Line Tools compiler works directly.
+        # The system clang++ may be blocked by an unaccepted Xcode license.
         clt_clang = "/Library/Developer/CommandLineTools/usr/bin/clang++"
         if os.path.isfile(clt_clang):
             env["SDKROOT"] = sdk
@@ -68,7 +62,8 @@ def free_port():
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, epilog=EXAMPLES,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--trace", metavar="NAME", help="workload name or path of a .mtpt container to open immediately")
     p.add_argument("--build", action="store_true", help="run `make trace` first to (re)generate the containers")
     p.add_argument("--port", type=int, default=8765, help="local port to serve on (0 = pick a free one; default 8765)")

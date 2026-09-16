@@ -1,9 +1,5 @@
-// The right-hand inspector: the "What happened this cycle?" list and the
-// details of whatever is selected (a unit, an instruction, a PE, a matrix
-// element, a FIFO slot, a bank, a memory address, a wire). Every number shown
-// is read from a trace record; derivations carry a chip saying so.
-//
-// Classic script: defines window.MTV.Inspector.
+// The right-hand inspector: "What happened this cycle?" and the selection's
+// details. Every number comes from a trace record; derivations say so.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -69,7 +65,7 @@
       this.body.innerHTML = html;
     }
 
-    // ------------------------------------------------------------ panels --
+    // panels
     kv(rows) {
       return '<dl class="kv">' + rows.map(([k, v, mono]) => '<dt>' + k + '</dt><dd' + (mono ? ' class="mono"' : '') + '>' + v + '</dd>').join('') + '</dl>';
     }
@@ -185,8 +181,73 @@
       }
       let html = this.kv(rows);
       html += '<div class="btnrow">' + (p.first_attempt !== null ? link('cycle:' + p.first_attempt, '⇥ first attempt') : '') + ' ' + (p.issue !== null ? link('cycle:' + p.issue, '⇥ issue') : '') + ' ' + (p.retire !== null ? link('cycle:' + p.retire, '⇥ retire') : '') + '</div>';
+      html += this.chainHtml(model, pc);
       html += '<h3>Decoded fields</h3><div class="vals">' + esc(JSON.stringify(p.fields, null, 1).replace(/[{}]/g, '').trim()) + '</div>';
       return html;
+    }
+
+    // Why this instruction issued when it did (Model.blockerChain).
+    chainHtml(model, pc) {
+      if (!model.blockerChain) return '';
+      const hops = model.blockerChain(pc);
+      if (!hops.length) return '';
+      const p = model.program[pc];
+      const root = hops[hops.length - 1];
+      let html = '<h3>Blocker chain ' + chip('der', 'derived') + '</h3>';
+      html += '<p class="note">Why ' + esc(instrLabel(model, pc)) + (p.issue !== null ? ' issued at cycle ' + fmt(p.issue) : ' never issued') +
+        '. Each hop follows the blocker the sequencer recorded for that instruction’s last wait (the first conflicting unit in scan order), ' +
+        'or the previous instruction when the hop issued on its first attempt (in-order issue). ' +
+        hops.length + ' hop' + (hops.length === 1 ? '' : 's') + ' to the root, ' + esc(instrLabel(model, root.pc)) + '.</p>';
+      const items = hops.map((h) => this.hopHtml(model, h));
+      const SHOW = 12;
+      html += '<ol class="chain">' + items.slice(0, SHOW).join('') + '</ol>';
+      if (items.length > SHOW) {
+        html += '<details><summary>' + (items.length - SHOW) + ' more hops to the root</summary><ol class="chain">' + items.slice(SHOW).join('') + '</ol></details>';
+      }
+      return html;
+    }
+
+    hopHtml(model, h) {
+      const lines = [];
+      if (h.issue !== null && h.first !== null && h.issue > h.first) {
+        const spans = h.spans.map((s) => cyLink(s.from, fmt(s.from)) + '–' + cyLink(s.to, fmt(s.to)) + ' ' + esc(s.reason) +
+          (s.blocker_pc !== null ? ' (' + pcLink(model, s.blocker_pc) + ')' : '')).join('; ');
+        lines.push('waited ' + fmt(h.issue - h.first) + ' cycles: ' + spans);
+      } else if (h.issue !== null) {
+        lines.push('issued on its first attempt, ' + cyLink(h.issue));
+      } else if (h.spans.length) {
+        lines.push('waited from ' + cyLink(h.spans[0].from) + ' and never issued');
+      }
+      if (h.issue !== null && h.retire !== null && h.retire > h.issue) {
+        lines.push('in flight on ' + esc(h.unit) + ' ' + cyLink(h.issue, fmt(h.issue)) + '–' + cyLink(h.retire - 1, fmt(h.retire - 1)) +
+          ' (' + fmt(h.retire - h.issue) + ' cycles) holding its reservation; retired at ' + cyLink(h.retire));
+      }
+      let why = '';
+      switch (h.kind) {
+        case 'blocked': {
+          const b = model.program[h.next];
+          why = '↓ last wait ' + esc(h.reason) + ': blocked by ' + pcLink(model, h.next) + (h.nextUnit ? ' on ' + esc(h.nextUnit) : '') +
+            ', released when it retired at ' + cyLink(b.retire);
+          break;
+        }
+        case 'in_order': {
+          const prev = model.program[h.next];
+          why = '↓ in-order issue: ' + pcLink(model, h.next) + ' issued the cycle before, ' + cyLink(prev.issue);
+          break;
+        }
+        case 'resource':
+          why = h.reason === 'weight_fifo_empty'
+            ? 'root: no blocking instruction; the tile was on its way from DDR' + (h.prefetch ? ' (pushed ' + cyLink(h.prefetch.cycle) + ', ready ' + cyLink(h.prefetch.ready) + ')' : '')
+            : 'root: no blocking instruction recorded for ' + esc(h.reason);
+          break;
+        case 'root': why = 'root: issued on its first attempt with nothing before it'; break;
+        case 'unissued': why = 'never issued (the run ended first)'; break;
+        case 'loop': why = 'the chain revisits this instruction: the trace is inconsistent'; break;
+        default: why = '';
+      }
+      return '<li class="' + h.kind + '"><div class="hop-head">' + pcLink(model, h.pc) + '</div>' +
+        lines.map((l) => '<div class="hop-spans">' + l + '</div>').join('') +
+        '<div class="hop-why">' + why + '</div></li>';
     }
 
     fifo(model, st, slot) {
@@ -246,7 +307,7 @@
         ['Attempting', model.program[o.pc] ? '<span class="mono">' + esc(model.program[o.pc].asm) + '</span>' : 'past end of program'],
         ['Outcome', o.kind === 'stall' ? o.reason : o.kind],
         ['Blocker', o.blockerPc !== null ? pcLink(model, o.blockerPc) + ' on ' + o.blockerUnit + ' (first conflicting unit in scan order DMA, WEIGHT, MXU, ACT, SEQ)' : '—'],
-        ['Prefetch pc', 'see FIFO'],
+        ['Blocker chain', model.program[o.pc] ? link('instr:' + o.pc, 'walk back from pc ' + o.pc) + ' ' + chip('der', 'derived') : '—'],
         ['Retired so far', fmt(model.retires.filter((r) => r.cycle <= st.t).length)],
       ];
       // Other conflicts, derived: re-run the overlap rules over the in-flight set.
@@ -290,7 +351,7 @@
       return this.kv(rows);
     }
 
-    // ---- PE ----
+    // PE
     pe(model, st, sel) {
       const dim = model.dim;
       const mx = st.mxu;
@@ -346,7 +407,7 @@
       return html;
     }
 
-    // ---- matrix elements ----
+    // matrix elements
     aelem(model, st, sel) {
       const e = model.aElement(sel.i, sel.k);
       const dim = model.dim;

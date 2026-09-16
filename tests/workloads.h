@@ -1,20 +1,7 @@
 #pragma once
 
-// Layer lowering: turns a layer spec into a Mini-TPU program, plus the host-side
-// tensor layout that program expects. Shared by the test suite and by
-// tools/gen_examples.cpp, so a bundled example cannot drift away from what was
-// verified.
-//
-// Two distinct things live here:
-//
-//   * the tiler, which emits instructions, and
-//   * the golden functions, which compute the answer with plain nested loops.
-//
-// The golden functions know nothing about tiles, banks, or the ISA. ref.h validates
-// the machine against the oracle, but both run the same program, so neither can
-// catch a tiler that lowers a layer wrongly; only an independently computed answer
-// can. Every workload here is therefore checked twice: machine against oracle, and
-// program output against golden.
+// The tiler, which lowers a layer spec to a Mini-TPU program, and the golden
+// functions, which compute the same answer with plain nested loops.
 
 #include <algorithm>
 #include <cassert>
@@ -30,9 +17,8 @@
 
 namespace wl {
 
-// A fixed generator rather than the standard library's, because a bundled example
-// must be byte-identical on every machine and toolchain. std::mt19937 would do, but
-// the distributions that shape its output are not portable.
+// A fixed generator, because a bundled example must be byte-identical on every
+// toolchain and the standard distributions are not portable.
 struct Rng {
     uint32_t s;
     explicit Rng(uint32_t seed) : s(seed) {}
@@ -50,19 +36,7 @@ inline std::vector<i8> random_tensor(uint32_t seed, std::size_t n) {
     return v;
 }
 
-// ---------------------------------------------------------------- packing ---
-//
-// A MatMul reads a `len x dim` activation tile as `len` contiguous rows of `dim`
-// bytes. A row of a wider matrix is not contiguous in a row-major buffer, so feeding
-// one tile from a row-major tensor would take one DMA per row.
-//
-// The host instead hands over tensors already in tile-major order: every `dim x dim`
-// block contiguous, blocks in row-major order. One tile is then one DMA, and the
-// ragged edges of a shape that does not divide by `dim` are zero padded once at pack
-// time rather than special-cased in the program. Zero padding is safe because a
-// padded activation column multiplies a padded weight row, contributing nothing to
-// the sum.
-
+// Tile-major packing, described in README section 3.
 inline uint32_t tiles_of(uint32_t n, uint32_t dim) {
     return dim == 0 ? 0 : (n + dim - 1) / dim;
 }
@@ -108,10 +82,7 @@ inline std::vector<i8> unpack(const std::vector<i8>& packed, uint32_t rows, uint
     return out;
 }
 
-// ----------------------------------------------------------------- golden ---
-//
-// Nested loops, no tiling, no timing: the independent answer every workload is held
-// against.
+// The golden functions below use nested loops, with no tiling and no timing.
 
 // C[M,N] = A[M,K] * B[K,N], int8 in, int32 out.
 inline std::vector<i32> golden_matmul(const std::vector<i8>& a, const std::vector<i8>& b,
@@ -149,8 +120,6 @@ inline std::vector<i8> golden_requantize(const std::vector<i32>& acc, i32 bias, 
     return out;
 }
 
-// ------------------------------------------------------------------ specs ---
-
 // One dense layer: C = act(requantize(A[M,K] * B[K,N])).
 struct Layer {
     uint32_t M = 0, K = 0, N = 0;
@@ -167,16 +136,8 @@ inline std::vector<i8> golden_layer(const Layer& l, const std::vector<i8>& a,
                              l.fn);
 }
 
-// ------------------------------------------------------------------- conv ---
-//
-// A convolution becomes a matmul by im2col: each output pixel's receptive field is
-// flattened into one row, so the layer is (out_h*out_w) x (R*S*Cin) times
-// (R*S*Cin) x Cout. The array never sees a convolution; the lowering is a host-side
-// rearrangement plus the dense tiler above.
-//
-// Tensors are NHWC (channels innermost), which makes the receptive field contiguous
-// in the channel direction and the flattening a copy rather than a gather.
-
+// im2col flattens each output pixel's receptive field into one row, making the
+// layer (out_h*out_w) x (R*S*Cin) times (R*S*Cin) x Cout. Tensors are NHWC.
 struct Conv {
     uint32_t H = 0, W = 0, Cin = 0;      // input, NHWC
     uint32_t R = 0, S = 0;               // kernel
@@ -232,8 +193,7 @@ inline std::vector<i8> im2col(const Conv& c, const std::vector<i8>& in) {
                     for (uint32_t ci = 0; ci < c.Cin; ++ci) {
                         const std::size_t o = row + (static_cast<std::size_t>(r) * c.S + s) *
                                                         c.Cin + ci;
-                        // Outside the input reads as zero, so no special case
-                        // reaches the array.
+                        // Outside the input reads as zero.
                         out[o] = inside
                                    ? in[((static_cast<std::size_t>(iy) * c.W) +
                                          static_cast<std::size_t>(ix)) * c.Cin + ci]
@@ -246,8 +206,8 @@ inline std::vector<i8> im2col(const Conv& c, const std::vector<i8>& in) {
     return out;
 }
 
-// Direct convolution, no im2col and no tiles: the independent answer im2col is held
-// against. Weights are [(r*S + s)*Cin + ci][cout], matching the matmul's B.
+// Direct convolution, the independent answer im2col is held against; weights
+// are [(r*S + s)*Cin + ci][cout], matching the matmul's B.
 inline std::vector<i32> golden_conv_acc(const Conv& c, const std::vector<i8>& in,
                                         const std::vector<i8>& w) {
     const uint32_t oh = c.out_h(), ow = c.out_w();
@@ -286,8 +246,6 @@ inline std::vector<i8> golden_conv(const Conv& c, const std::vector<i8>& in,
     return golden_requantize(golden_conv_acc(c, in, w), c.bias, c.multiplier, c.shift, c.fn);
 }
 
-// -------------------------------------------------------------- the tiler ---
-
 // Where a lowered layer expects its tensors to live, and what it produces.
 struct Lowering {
     std::vector<RawInst> code;
@@ -313,27 +271,18 @@ struct Placement {
     UbAddr   ub_base = 0;
 };
 
-// Scheduling choices, exposed so a test can turn one off and measure what it was
-// worth. Both orders compute the same layer; only the cycle count moves.
+// Scheduling choices a test can turn off to measure what each was worth; both
+// orders compute the same layer, only the cycle count moves.
 struct Sched {
-    // Defer each output tile's Write_Host past the next tile's MatMuls, instead of
-    // emitting it right after the Activate that produced it.
+    // Defer each output tile's Write_Host past the next tile's MatMuls.
     bool defer_drain = true;
 
-    // Emit the closing Halt. Off when this layer is one stage of a larger program.
+    // Emit the closing Halt; off when this layer is one stage of a larger program.
     bool terminate = true;
 };
 
-// Lower one dense layer onto a `dim x dim` array.
-//
-// The loop order is m, n, k with the activation tiles for one row-block hoisted out
-// of the n loop, so a row-block of A is read from the host once and reused by every
-// output column block. Reloading it per n would multiply DMA traffic by the number
-// of column blocks and turn an array-bound layer into a DMA-bound one.
-//
-// K tiling accumulates in place: the first k tile overwrites the bank and the rest
-// add into it, so a K larger than the array costs bank residency rather than a
-// second pass.
+// Lower one dense layer in m, n, k order, with one row-block of A hoisted out
+// of the n loop so it is read once. K tiling accumulates in place.
 inline Lowering lower_layer(const Layer& l, const Config& cfg, const Placement& at = {},
                             const Sched& sched = {}) {
     const uint32_t dim = cfg.dim;
@@ -350,26 +299,16 @@ inline Lowering lower_layer(const Layer& l, const Config& cfg, const Placement& 
     out.c_bytes = packed_bytes(l.M, l.N, dim);
     out.macs    = static_cast<std::size_t>(l.M) * l.K * l.N;
 
-    // One activation row-block (every k tile of it), plus two output tiles.
-    //
-    // The output is double buffered because a single staging tile would put the next
-    // Activate behind the previous Write_Host, overwriting bytes the DMA had not
-    // finished reading. Alternating two tiles costs dim*dim bytes and lets the drain
-    // overlap the next tile's arithmetic.
+    // One activation row-block, plus two output tiles: a single staging tile
+    // would put the next Activate behind the previous Write_Host.
     tpuasm::UbAlloc alloc(at.ub_base);
     std::vector<tpuasm::Region> a_ub(kt);
     for (uint32_t k = 0; k < kt; ++k) a_ub[k] = alloc.tile(dim, dim);
     const tpuasm::Region c_ub[2] = {alloc.tile(dim, dim), alloc.tile(dim, dim)};
     out.ub_used = alloc.next() - at.ub_base;
 
-    // The drain of one output tile is deferred past the next tile's arithmetic.
-    //
-    // Issue is in order, so a stalled instruction blocks everything behind it: a
-    // Write_Host placed immediately after its Activate stalls for the whole
-    // activation and takes the next tile's MatMuls with it. Deferring the drain by
-    // one tile lets those MatMuls issue while the activation is still draining,
-    // which is also what makes alternating accumulator banks worth anything. Overlap
-    // on this machine is the tiler's job as much as the hardware's.
+    // One output tile's drain, held back past the next tile's arithmetic because
+    // in-order issue would otherwise stall those MatMuls behind it.
     struct Drain {
         bool     live  = false;
         UbAddr   src   = 0;
@@ -387,12 +326,10 @@ inline Lowering lower_layer(const Layer& l, const Config& cfg, const Placement& 
 
     uint32_t stage = 0;   // which output staging tile the next Activate uses
     for (uint32_t m = 0; m < mt; ++m) {
-        // Rows this block covers. The last one may be short, which the `len` operand
-        // expresses directly with no padding.
+        // The last block may be short, which `len` expresses with no padding.
         const uint32_t rows = std::min(dim, l.M - m * dim);
 
-        // The previous row-block's last drain has to be out of the way before the
-        // incoming tiles overwrite the buffer it reads from.
+        // Out of the way before the incoming tiles overwrite what it reads.
         flush();
         for (uint32_t k = 0; k < kt; ++k) {
             p.read_host(static_cast<HostAddr>(at.a_host + tile_off(m, k, l.K, dim)), a_ub[k],
@@ -410,8 +347,7 @@ inline Lowering lower_layer(const Layer& l, const Config& cfg, const Placement& 
                 ++out.tiles;
             }
 
-            // The previous tile is drained here, after this tile's MatMuls have been
-            // issued, so they overlap its activation.
+            // After this tile's MatMuls, so they overlap the previous activation.
             flush();
 
             tpuasm::ActArgs act;
@@ -439,23 +375,12 @@ inline Lowering lower_layer(const Layer& l, const Config& cfg, const Placement& 
     return out;
 }
 
-// -------------------------------------------------------------------- MLP ---
-//
-// Layers chained end to end in one program, with no repacking between them: a
-// layer's packed output is already in the tile-major layout the next layer's
-// activations want, so stage i+1 reads exactly the bytes stage i wrote.
-//
-// That holds even when a width does not divide the array. The padding columns of a
-// packed output carry whatever the activation produced from an all-zero accumulator,
-// which need not be zero, but they only ever meet the padded rows of the next
-// layer's packed weights, and pack() fills those with zeros. The junk multiplies
-// zero and the sum is unchanged.
-
+// Layers chained end to end in one program with no repacking, as README
+// section 3 describes.
 struct Mlp {
     std::vector<Layer> layers;
 
-    // Consecutive layers must agree on the batch size and on the width between
-    // them, or the chaining above is meaningless.
+    // Consecutive layers must agree on the batch size and the width between them.
     bool chains() const {
         if (layers.empty()) return false;
         for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
@@ -528,12 +453,7 @@ inline std::vector<i8> golden_mlp(const Mlp& net, const std::vector<i8>& a,
     return x;
 }
 
-// ----------------------------------------------------------------- corpus ---
-//
-// The shipped workloads. One definition serves the test suite and
-// tools/gen_examples.cpp, so every bundled example is a program the suite has
-// verified against golden loops.
-
+// The shipped workloads, defined once for both the suite and gen_examples.
 struct Workload {
     std::string name;
     std::string note;
@@ -640,8 +560,7 @@ inline Workload mlp_workload(std::string name, std::string note, const Mlp& net,
     w.y_host  = low.y_host;
     w.y_bytes = low.y_bytes;
 
-    // Each stage's weights sit where its lowering expects them, end to end from
-    // b_ddr, so one blob carries them all.
+    // End to end from b_ddr, where each stage's lowering expects them.
     for (std::size_t i = 0; i < net.layers.size(); ++i) {
         const Layer&          l = net.layers[i];
         const std::vector<i8> p = pack(weights[i], l.K, l.N, cfg.dim);
@@ -655,8 +574,7 @@ inline Workload mlp_workload(std::string name, std::string note, const Mlp& net,
     return w;
 }
 
-// A configuration small enough that an example is quick to run yet still tiles in
-// every direction.
+// Small enough to run quickly, large enough to tile in every direction.
 inline Config example_config() {
     Config c;
     c.dim       = 16;
@@ -665,10 +583,8 @@ inline Config example_config() {
     return c;
 }
 
-// What a workload is, separately from the array it was lowered for. The
-// configuration sweep needs this: running the same layer on an 8x8 and a 256x256
-// array means lowering it twice, not replaying instructions that assume a different
-// tile size.
+// A workload independent of the array it is lowered for, so the configuration
+// sweep can lower the same layer again for a different tile size.
 struct Spec {
     enum class Kind : uint8_t { DENSE, CONV, MLP };
 
