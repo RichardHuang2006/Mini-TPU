@@ -193,7 +193,127 @@
     return out;
   }
 
+  // ---- The cycle strip: five fixed lines, one per run-loop step ----
+  // Each line: {phase, kind, text, full, action, state}. text is short; full is
+  // the untruncated form for a title attribute. state is done | now | pending
+  // relative to st.phase, and the array line follows the issue step.
+  const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+  const shortTile = (p) => tileLabel(p).replace(' K-tile ', ' K');
+  const instrShort = (model, pc) => {
+    const p = model.program[pc];
+    if (!p) return 'pc ' + pc;
+    const tl = shortTile(p);
+    return 'pc ' + pc + ' ' + OP_SHORT[p.op] + (tl ? ' ' + tl : '');
+  };
+  function commitShort(model, c) {
+    switch (c.kind) {
+      case 'ub': return 'UB ' + hex(c.addr) + ' ←' + fmt(c.len) + ' B';
+      case 'host': return 'host ' + hex(c.addr) + ' ←' + fmt(c.len) + ' B';
+      case 'acc': return 'bank ' + c.addr + ' ←' + c.rows + ' rows';
+      case 'plane': return 'plane ' + c.addr + ' ← tile';
+      default: return '?';
+    }
+  }
+
+  function brief(model, st) {
+    const t = st.t;
+    const ev = st.events;
+    const o = ev.outcome;
+    const dim = model.dim;
+    const LIMIT = 52;
+    const cur = PHASE_INDEX[st.phase];
+    const stateOf = (i) => (i < cur ? 'done' : i === cur ? 'now' : 'pending');
+    const line = (phase, idx, kind, full, action) => ({ phase, kind, full, text: clip(full, LIMIT), action, state: stateOf(idx) });
+    const out = [];
+
+    // 1. retire
+    if (ev.retires.length === 0) out.push(line('retire', 1, 'none', 'nothing retired', 'sel:cycle'));
+    else {
+      const r = ev.retires[0];
+      const commits = r.commits.map((ci) => model.commits[ci]);
+      const wl = ev.wloads.find((w) => w.pc === r.pc);
+      let full = instrShort(model, r.pc) + ' → ' + (commits.length ? commits.map((c) => commitShort(model, c)).join(', ') : wl ? 'plane ' + wl.plane : 'done');
+      if (ev.retires.length > 1) full += ' · +' + (ev.retires.length - 1) + ' more';
+      out.push(line('retire', 1, 'retire', full, 'instr:' + r.pc));
+    }
+
+    // 2. prefetch
+    if (ev.prefetches.length) {
+      const p = ev.prefetches[0];
+      const tl = shortTile(model.program[p.for_pc]);
+      let full = 'push ' + (tl || 'DDR ' + hex(p.ddr)) + ' for pc ' + p.for_pc + ' → slot ' + (p.occ - 1) + ' · ready ' + fmt(p.ready);
+      if (ev.prefetches.length > 1) full += ' · +' + (ev.prefetches.length - 1);
+      out.push(line('prefetch', 2, 'prefetch', full, 'sel:fifo'));
+    } else {
+      const occ = model.cyc.focc[t];
+      const why = occ >= model.cfg.weight_fifo_depth ? 'FIFO full ' + occ + '/' + model.cfg.weight_fifo_depth : 'nothing ahead · FIFO ' + occ + '/' + model.cfg.weight_fifo_depth;
+      out.push(line('prefetch', 2, 'none', 'idle · ' + why, 'sel:fifo'));
+    }
+
+    // 3. issue
+    if (o.kind === 'issued' || o.kind === 'halt') {
+      const iss = ev.issue;
+      const p = model.program[iss.pc];
+      let full;
+      if (p.op === 'Halt') full = 'pc ' + iss.pc + ' Halt · run ends';
+      else {
+        full = instrShort(model, iss.pc);
+        if (p.op === 'MatMul') { const mm = model.matmuls[iss.mm]; full += ' · plane ' + mm.plane + (mm.accumulate ? ' · +bank ' + mm.bank : ' · bank ' + mm.bank); }
+        else if (p.op === 'Activate') full += ' · ' + p.fields.act + ' → UB ' + hex(p.fields.ub_addr);
+        else if (p.op === 'Read_Host_Memory' || p.op === 'Write_Host_Memory') full += ' · ' + fmt(p.fields.bytes) + ' B';
+        if (p.first_attempt !== null && p.first_attempt < iss.cycle) full += ' · waited ' + fmt(iss.cycle - p.first_attempt);
+        full += ' · ' + fmt(iss.duration) + ' cyc';
+      }
+      out.push(line('issue', 3, p.op === 'Halt' ? 'halt' : 'issue', full, 'instr:' + iss.pc));
+    } else if (o.kind === 'stall') {
+      const b = o.blockerPc !== null ? model.program[o.blockerPc] : null;
+      const bIss = b ? model.issueByPc.get(b.pc) : null;
+      let full = instrShort(model, o.pc) + ' · ' + o.reason;
+      if (o.blockerPc !== null) full += ' ← pc ' + o.blockerPc + (bIss ? ' →' + fmt(bIss.done) : '');
+      else if (o.reason === 'weight_fifo_empty' && st.fifo[0]) full += ' · ready ' + fmt(st.fifo[0].push.ready);
+      out.push(line('issue', 3, 'stall', full, 'sel:seq'));
+    } else {
+      out.push(line('issue', 3, 'trap', 'trap at pc ' + o.pc, 'sel:seq'));
+    }
+
+    // 4. array step
+    const mx = st.mxu;
+    if (mx.mm && mx.step >= 0) {
+      const mm = mx.mm, s = mx.step;
+      let nIn = 0;
+      for (let k = 0; k < dim; k++) if (s - k >= 0 && s - k < mm.len) nIn++;
+      const landed = [];
+      for (let c = 0; c < dim; c++) { const r = s + 1 - dim - c; if (r >= 0 && r < mm.len) landed.push(r); }
+      const done = Math.max(0, Math.min(mm.len, s + 3 - 2 * dim));
+      const full = (cur < 3 ? 'after step ' : 'step ') + s + '/' + mm.steps + ' · in ×' + nIn +
+        ' · land ' + (landed.length ? 'r' + landed[landed.length - 1] + (landed.length > 1 ? '…r' + landed[0] : '') : '—') +
+        ' · done ' + done + '/' + mm.len;
+      out.push({ phase: 'array', kind: 'step', full, text: clip(full, LIMIT), action: 'view:array', state: cur < 3 ? 'done' : stateOf(3) });
+    } else {
+      const next = model.unitIv.MXU.find((iv) => iv.issue > t);
+      const busy = st.units.MXU;
+      let full;
+      if (busy) full = 'pc ' + busy.pc + ' issues this cycle · step 0 after issue';
+      else if (ev.retires.some((r) => r.unit === 'MXU') && cur >= 1) full = 'retired · grid empty';
+      else full = 'idle · ' + (next ? 'next pc ' + next.pc + ' at ' + fmt(next.issue) : 'no more MatMuls');
+      out.push({ phase: 'array', kind: 'idle', full, text: clip(full, LIMIT), action: 'view:array', state: cur < 3 ? 'done' : stateOf(3) });
+    }
+
+    // 5. account
+    if (o.idle === 'busy') out.push(line('account', 4, 'busy', 'busy · MXU active', 'sel:cycle'));
+    else {
+      const ib = model.idleBlockerAt(t);
+      const who = ib.pc !== null && ib.via !== 'stalled' ? ' · ' + instrShort(model, ib.pc) : '';
+      out.push(line('account', 4, 'idle', 'idle → ' + o.idle + who, 'sel:cycle'));
+    }
+    return out;
+  }
+  const PHASE_INDEX = { start: 0, retire: 1, prefetch: 2, issue: 3, account: 4 };
+
   MTV.narrate = narrate;
+  MTV.brief = brief;
+  MTV.instrShort = instrShort;
+  MTV.commitShort = commitShort;
   MTV.hex = hex;
   MTV.fmt = fmt;
   MTV.OP_SHORT = OP_SHORT;

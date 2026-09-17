@@ -1,5 +1,5 @@
-// The right-hand inspector: "What happened this cycle?" and the selection's
-// details. Every number comes from a trace record; derivations say so.
+// The right-hand inspector: the cycle strip (five fixed lines per cycle) and
+// the selection's details. Every number comes from a trace record; derivations say so.
 (function () {
   'use strict';
   const MTV = (window.MTV = window.MTV || {});
@@ -10,32 +10,65 @@
   const link = (action, text) => '<a data-action="' + esc(action) + '">' + esc(text) + '</a>';
   const pcLink = (model, pc) => link('instr:' + pc, instrLabel(model, pc));
   const cyLink = (t, text) => link('cycle:' + t, text === undefined ? 'cycle ' + fmt(t) : text);
+  const linkify = (text) => esc(text)
+    .replace(/\bpc (\d+)\b/g, (m0, n) => '<a data-action="instr:' + n + '">pc ' + n + '</a>')
+    .replace(/\bcycle ([\d,]+)\b/g, (m0, n) => '<a data-action="cycle:' + n.replace(/,/g, '') + '">cycle ' + n + '</a>');
+
+  // The registers of PE[k][c] after step s of a MatMul, from its recorded frames,
+  // with the identity psum_out = psum_in + act_in × w re-checked. Shared by the
+  // PE panel and the array view's hover tip.
+  function peValues(model, mm, f, s, k, c) {
+    const dim = model.dim, n = dim * dim;
+    const w = f.w[k * dim + c];
+    const actIn = c === 0 ? f.left[s * dim + k] : (s > 0 ? f.act[(s - 1) * n + k * dim + c - 1] : 0);
+    const psumIn = k === 0 ? 0 : (s > 0 ? f.psum[(s - 1) * n + (k - 1) * dim + c] : 0);
+    const psumOut = f.psum[s * n + k * dim + c];
+    const actOut = f.act[s * n + k * dim + c];
+    const want = (psumIn + Math.imul(actIn, w)) | 0;
+    const ok = want === psumOut && actOut === actIn;
+    const r = s - k - c;
+    const live = r >= 0 && r < mm.len;
+    const t = model.program[mm.pc].tile;
+    const coords = live && t ? { i: t.m * dim + r, kk: t.k * dim + k, j: t.n * dim + c } : null;
+    const landed = k === dim - 1 && live ? f.land[r * dim + c] : null;
+    return { w, actIn, psumIn, psumOut, actOut, want, ok, r, live, coords, landed, tile: t };
+  }
 
   class Inspector {
-    constructor(app, whytEl, titleEl, bodyEl) {
+    constructor(app, stripEl, titleEl, bodyEl) {
       this.app = app;
-      this.whyt = whytEl;
+      this.strip = stripEl;
       this.title = titleEl;
       this.body = bodyEl;
       const onClick = (e) => {
-        const a = e.target.closest('a[data-action]');
+        const ph = e.target.closest('[data-phase]');
+        if (ph) { e.preventDefault(); this.app.setCycle(this.app.t, ph.getAttribute('data-phase')); return; }
+        const a = e.target.closest('[data-action]');
         if (!a) return;
         e.preventDefault();
         this.app.action(a.getAttribute('data-action'));
       };
-      this.whyt.addEventListener('click', onClick);
+      this.strip.addEventListener('click', onClick);
       this.body.addEventListener('click', onClick);
     }
 
-    renderWhyt(model, st) {
-      const lines = MTV.narrate(model, st);
-      this.whyt.innerHTML = lines.map((l) => {
-        let text = esc(l.text);
-        // Link "pc N" mentions.
-        text = text.replace(/\bpc (\d+)\b/g, (m0, n) => '<a data-action="instr:' + n + '">pc ' + n + '</a>');
-        text = text.replace(/\bcycle ([\d,]+)\b/g, (m0, n) => '<a data-action="cycle:' + n.replace(/,/g, '') + '">cycle ' + n + '</a>');
-        return '<li class="' + l.kind + '"><span class="ph">' + l.phase + '</span>' + text + '<span class="src">' + esc(l.src) + '</span></li>';
+    // Five lines, one per run-loop step, in cycle order; the shape never changes.
+    renderStrip(model, st) {
+      const lines = MTV.brief(model, st);
+      this.strip.innerHTML = lines.map((l) => {
+        const phase = l.phase === 'array' ? 'issue' : l.phase;
+        return '<div class="cs-line ' + l.kind + ' ' + l.state + '" title="' + esc(l.full) + '">' +
+          '<span class="cs-ph" data-phase="' + phase + '" title="Stop at phase ' + phase + '">' + l.phase + '</span>' +
+          '<span class="cs-txt" data-action="' + esc(l.action) + '">' + linkify(l.text) + '</span></div>';
       }).join('');
+    }
+
+    // The long-form narration, collapsed under the cycle panel.
+    narrationHtml(model, st) {
+      const lines = MTV.narrate(model, st);
+      return '<details class="narr"><summary>Full narration of this cycle (' + lines.length + ' lines)</summary><ol>' +
+        lines.map((l) => '<li class="' + l.kind + '"><span class="ph">' + l.phase + '</span>' + linkify(l.text) + '<span class="src">' + esc(l.src) + '</span></li>').join('') +
+        '</ol></details>';
     }
 
     render(model, st, sel) {
@@ -86,6 +119,7 @@
       rows.push(['Planes', 'active ' + st.planes.active + (st.planes.pending ? ', switch pending' : '')]);
       rows.push(['UB streams', st.ubStreams.readers + ' read / ' + st.ubStreams.writers + ' write of ' + model.cfg.ub_banks]);
       let html = this.kv(rows);
+      html += this.narrationHtml(model, st);
       html += '<h3>Running counters at ' + fmt(st.t) + '</h3>' + this.countersSoFar(model, st.t);
       html += '<div class="btnrow">' + link('sel:stats', 'Final statistics') + ' · ' + link('sel:seq', 'Sequencer') + ' · ' + link('sel:planes', 'Weight planes') + '</div>';
       return html;
@@ -373,19 +407,9 @@
         rows.push(['State', 'loading the PE detail of pc ' + mm.pc + '…']);
         return this.kv(rows);
       }
-      const n = dim * dim;
-      const w = f.w[k * dim + c];
-      const actIn = c === 0 ? f.left[s * dim + k] : (s > 0 ? f.act[(s - 1) * n + k * dim + c - 1] : 0);
-      const psumIn = k === 0 ? 0 : (s > 0 ? f.psum[(s - 1) * n + (k - 1) * dim + c] : 0);
-      const psumOut = f.psum[s * n + k * dim + c];
-      const actOut = f.act[s * n + k * dim + c];
-      const want = (psumIn + Math.imul(actIn, w)) | 0;
-      const ok = want === psumOut && actOut === actIn;
-      const r = s - k - c;
-      const live = r >= 0 && r < mm.len;
-      const p = model.program[mm.pc];
-      const t = p.tile;
-      const coords = live && t ? { i: t.m * dim + r, kk: t.k * dim + k, j: t.n * dim + c } : null;
+      const v = peValues(model, mm, f, s, k, c);
+      const { w, actIn, psumIn, psumOut, actOut, ok, r, live, coords } = v;
+      const t = v.tile;
       rows.push(['MatMul', pcLink(model, mm.pc) + ', step ' + s + ' of ' + mm.steps + ' (cycle ' + fmt(mm.issue + s) + ')']);
       rows.push(['Role', live ? 'useful: row ' + r + ' of the A tile' : (r < 0 ? 'fill: no row has reached this PE yet (multiplies 0)' : 'drain: rows are past (multiplies 0)') + ' ' + chip('der', 'r = s − k − c')]);
       rows.push(['w (plane ' + mm.plane + ')', String(w) + (coords ? '  = B[' + coords.kk + '][' + coords.j + ']' : ''), true]);
@@ -398,9 +422,8 @@
         ['psum_out', String(psumOut) + (k === dim - 1 ? ' → bottom edge' : ' → PE[' + (k + 1) + '][' + c + '] at step ' + (s + 1)), true],
       ];
       if (coords) rows2.push(['Contributes to', 'C[' + coords.i + '][' + coords.j + '] (tile ' + t.m + ',' + t.n + ', K-tile ' + t.k + ' of ' + model.kt + ') ' + chip('der', 'coordinates from the tiler layout')]);
-      if (k === dim - 1 && live) {
-        const landed = f.land[r * dim + c];
-        rows2.push(['Landing', 'this value (' + fmt(landed) + ') is output row ' + r + ' column ' + c + ' of the staged rows; committed to bank ' + mm.bank + ' at ' + cyLink(mm.retire) + (mm.accumulate ? ' (added to the bank’s value at issue)' : ' (overwrite)')]);
+      if (v.landed !== null) {
+        rows2.push(['Landing', 'this value (' + fmt(v.landed) + ') is output row ' + r + ' column ' + c + ' of the staged rows; committed to bank ' + mm.bank + ' at ' + cyLink(mm.retire) + (mm.accumulate ? ' (added to the bank’s value at issue)' : ' (overwrite)')]);
       }
       html += this.kv(rows2);
       html += '<p class="note">Values are the recorded PE registers after this step (Mxu::matmul, commit()); the identity is re-checked here and by viz/check_trace.py. ' + chip('mod', 'modeled') + '</p>';
@@ -468,6 +491,7 @@
   }
 
   MTV.Inspector = Inspector;
+  MTV.peValues = peValues;
   MTV.esc = esc;
   MTV.chip = chip;
 })();

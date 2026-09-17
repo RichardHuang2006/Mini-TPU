@@ -592,10 +592,15 @@ hand-entered: `make report` prints the current tables.
 
 ## 19. Cycle visualizer
 
-`viz/index.html` shows a recorded run cycle by cycle: the block diagram with
-the transfers the trace records on each path, the systolic array one PE at a
-time with the arithmetic it performed, the logical matrices with the progress
-of every output element, the memories, and a timeline of every unit. The
+`viz/index.html` shows a recorded run cycle by cycle: the systolic array with
+the MatMul drawn inside the PE grid (the A tile entering, activations moving
+right, partial sums moving down and landing in the staged rows, each PE's
+arithmetic on hover), the block diagram with the transfers the trace records
+on each path, the logical matrices with the progress of every output element,
+the memories, a timeline of every unit, and a five-line strip that says what
+each step of the run loop did in the current cycle. `python3 visualizer.py`
+serves the page and opens the 128×128 example (`viz/traces/matmul_128.mtpt`)
+when it has been traced. The
 simulator is the only source of truth: `src/trace.h` is an observer the
 sequencer calls at each retire, prefetch, issue or stall, and at every array
 step; `tools/tracegen.cpp` records a run and, before writing the container,

@@ -62,31 +62,35 @@
   <main id="main">
     <section id="center">
       <nav id="tabs">
-        <button data-view="diagram" class="tab active">Microarchitecture</button>
-        <button data-view="array" class="tab">Systolic array</button>
+        <button data-view="array" class="tab active">Systolic array</button>
+        <button data-view="diagram" class="tab">Microarchitecture</button>
         <button data-view="matrices" class="tab">Matrices A · B · C</button>
         <button data-view="memory" class="tab">Memory</button>
         <span class="spacer"></span>
         <span id="view-note" class="note"></span>
       </nav>
       <div id="views">
-        <div id="view-diagram" class="view"></div>
-        <div id="view-array" class="view" hidden>
+        <div id="view-diagram" class="view" hidden></div>
+        <div id="view-array" class="view">
           <div class="array-toolbar">
             <span class="lbl">Colour</span>
-            <div class="seg" id="array-mode">
-              <button data-mode="role" class="active">role</button>
-              <button data-mode="psum">|psum|</button>
+            <div class="seg" id="array-mode" title="flow: act value moving right, psum bar growing down, role tint · act / |psum| / w: one register · role: useful / fill / drain only">
+              <button data-mode="flow" class="active">flow</button>
               <button data-mode="act">act</button>
+              <button data-mode="psum">|psum|</button>
+              <button data-mode="w">w</button>
+              <button data-mode="role">role</button>
             </div>
             <span class="lbl">Zoom</span>
             <input id="array-zoom" type="range" min="0" max="100" value="0">
-            <button id="array-fit" class="btn small">fit</button>
+            <button id="array-fit" class="btn small" title="Whole grid in view">fit</button>
+            <button id="array-text" class="btn small" title="Zoom until every PE shows its act value">text</button>
             <span id="array-note" class="note"></span>
           </div>
           <div class="array-stage">
             <canvas id="array-canvas"></canvas>
-            <canvas id="array-overview" title="Overview: drag the window to pan"></canvas>
+            <canvas id="array-overview" title="Overview: drag the window to pan" hidden></canvas>
+            <div id="array-tip" hidden></div>
           </div>
         </div>
         <div id="view-matrices" class="view" hidden>
@@ -116,9 +120,9 @@
       </div>
     </section>
     <aside id="inspector">
-      <section id="whyt-box">
-        <h2>What happened this cycle?</h2>
-        <ol id="whyt"></ol>
+      <section id="strip-box" title="One line per step of the run loop in cycle order: retire → prefetch → issue (with the array step it runs) → account. Click a step name to stop at that phase; click the text for details.">
+        <h2>This cycle</h2>
+        <div id="cycle-strip"></div>
       </section>
       <section id="insp-box">
         <h2 id="insp-title">Cycle</h2>

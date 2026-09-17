@@ -66,7 +66,7 @@
     // MXU
     s += block('mxu', 800, 20, 280, 200);
     s += '<text x="814" y="40" class="title" pointer-events="none">Matrix unit</text>' + text('mxu-l1', 814, 57, 'mut', 10);
-    s += '<rect id="mxu-grid" data-block="mxu" x="814" y="66" width="120" height="120" class="slot"/>';
+    s += '<rect id="mxu-grid" data-block="mxu" x="814" y="66" width="120" height="120" class="slot" style="cursor:pointer"><title>Open the Systolic array tab</title></rect>';
     s += '<foreignObject x="814" y="66" width="120" height="120" pointer-events="none"><canvas xmlns="http://www.w3.org/1999/xhtml" id="mxu-mini" width="120" height="120" style="display:block"></canvas></foreignObject>';
     for (let i = 0; i < 7; i++) s += text('mxu-r' + i, 944, 80 + i * 16, i === 0 ? 'mono' : 'mut', 10);
     s += text('mxu-l2', 814, 200, 'mut', 9.5);
@@ -113,6 +113,7 @@
       const blk = e.target.closest('[data-block]');
       if (!blk) return;
       const id = blk.getAttribute('data-block');
+      if (blk.id === 'mxu-grid') { this.app.setView('array'); return; }   // the mini grid opens the array tab
       const map = { seq: { type: 'seq' }, prog: { type: 'seq' }, host: { type: 'mem', kind: 'host', label: 'Host memory', open: true }, dma: { type: 'unit', unit: 'DMA' },
         ub: { type: 'mem', kind: 'ub', label: 'Unified Buffer', open: true }, ddr: { type: 'mem', kind: 'ddr', label: 'Weight memory', open: true },
         pref: { type: 'unit', unit: 'WEIGHT' }, fifo: { type: 'fifo', slot: blk.hasAttribute('data-slot') ? +blk.getAttribute('data-slot') : null },
@@ -292,7 +293,7 @@
         this.t('mxu-r4', next ? 'next: pc ' + next.pc + ' at ' + fmt(next.issue) : 'no more MatMuls');
         this.t('mxu-r5', ''); this.t('mxu-r6', '');
       }
-      this.t('mxu-l2', m.dim + '×' + m.dim + ' PEs, weight-stationary · len + 2·dim − 1 cycles per MatMul');
+      this.t('mxu-l2', m.dim + '×' + m.dim + ' PEs, weight-stationary · click the grid to watch each step (Systolic array tab, key 2)');
       this.drawMini(m, st);
       // Banks
       for (let b = 0; b < 4; b++) {
