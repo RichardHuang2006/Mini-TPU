@@ -1,10 +1,11 @@
 # Mini-TPU cycle visualizer
 
 An interactive, cycle-accurate view of what the simulator in `src/` does: the
-microarchitecture blocks and the data moving between them, the systolic array
-one processing element at a time, the logical matrices with the progress of
-every output element, the memories, and a timeline of every unit across the
-whole run, all driven by a trace the simulator itself records.
+systolic array with the MatMul drawn inside the PE grid, the microarchitecture
+blocks and the data moving between them, the logical matrices with the
+progress of every output element, the memories, a timeline of every unit
+across the whole run, and a five-line strip saying what each step of the run
+loop did this cycle, all driven by a trace the simulator itself records.
 
 Nothing in the page simulates. The simulator is instrumented through the
 observer in `src/trace.h`; `tools/tracegen.cpp` records a run into a container
@@ -17,15 +18,22 @@ Activate progress) are labelled as such.
 
 ## Run
 
-    make trace          # builds tools/tracegen, writes viz/traces/*.mtpt, checks them
-    open viz/index.html # or serve the directory with any static file server
+    make trace              # builds tools/tracegen, writes viz/traces/*.mtpt, checks them
+    python3 visualizer.py   # serves viz/ and opens the 128×128 example
 
-The page opens with the small teaching workload (`matmul_8`, embedded in
-`viz/traces/matmul_8.js`, so it works from `file://` with no server). Use
-**Open…** or drag-and-drop to load `viz/traces/matmul_128.mtpt` (33 MB; the
-per-MatMul PE detail is read lazily from the file, about 1 MB is kept in
-memory). When served over HTTP, `index.html?trace=traces/matmul_128.mtpt`
-loads a container directly.
+`visualizer.py` serves the directory over local HTTP, answers
+`traces/index.json` with every container in `viz/traces`, and opens
+`matmul_128` (128×128 · 128×128 on the 32×32 array: 64 tile MatMuls, 19,013
+cycles) when it has been traced; the **Workload** dropdown lists the embedded
+`matmul_8` and every container found. `--trace NAME` opens another one and
+`index.html?trace=traces/x.mtpt` works with any static server. Opened from
+`file://` the page starts on the small teaching workload (`matmul_8`, embedded
+in `viz/traces/matmul_8.js`); **Open…** or drag-and-drop loads a container
+from disk (the per-MatMul PE detail is then read lazily from the file).
+
+The **Lessons** menu jumps to named cycles; each entry opens the view it is
+best watched on (the array steps of the first MatMul, the stalls on the block
+diagram).
 
 `make` on this machine currently needs the Command Line Tools compiler:
 
@@ -51,6 +59,51 @@ cycle *t₀ + s* is the grid after step *s* committed. The staged rows commit to
 the accumulator bank at *t₀ + len + 2·dim − 1*, which is also the cycle the
 next MatMul in a K-chain issues. Halt increments the cycle counter itself, so
 the last cycle shows an empty machine.
+
+The **This cycle** strip (top right) has the same five lines for every cycle,
+in the loop's order: *retire*, *prefetch*, *issue*, the *array* step that
+issue ran, and *account*. Each line is one short clause built from the
+records above (which instruction, what it committed, which counter moved);
+lines for phases the phase control has not reached yet are dimmed. Clicking a
+step name stops at that phase; clicking the text selects the instruction,
+unit or view it names. The long-form narration of the same records is under
+*Full narration* in the cycle panel below the strip.
+
+## Systolic array view
+
+The default tab draws the MatMul in flight inside the `dim × dim` PE grid,
+reading left → grid → bottom → staged rows, with nothing simulated: every
+cell is a recorded PE register after the step shown, and the three placement
+rules are derived and checked by `viz/selftest.js`:
+
+| rule | meaning |
+|---|---|
+| role `r = s − k − c` | PE[k][c] works on row *r* of the A tile at step *s*; useful when 0 ≤ r < len, *fill* before, *drain* after |
+| input skew | PE row *k* receives `A[s − k][k]` at its left edge at step *s* (`left[s·dim + k]`): a whole row never enters at once |
+| landing | row *r* leaves column *c* at the bottom edge at step `s = r + dim − 1 + c` (`land[r·dim + c]`); row *r* is complete at `s = r + 2·dim − 2` |
+
+- **Grid** (*flow* colouring): the activation each PE holds as a blue (+) or
+  copper (−) tint that shifts one cell right per step, a faint role tint, and
+  a bar on each useful PE's right edge whose length is its partial sum, growing
+  toward the bottom edge. The leading anti-diagonal (`k + c = s`, row 0 of A)
+  and the trailing one (row len − 1) are drawn as lines with a dashed ghost of
+  the previous step, so playing the run shows the wavefront sweeping down and
+  to the right. *act*, *|psum|*, *w* and *role* colour one register or the
+  role only. Values appear as text once a cell is 26 px (act) or 44 px (act,
+  psum and w); the **text** button zooms there, **fit** shows the whole grid.
+  Hover any PE for its registers and `psum_in + act × w → psum_out`; click to
+  open it in the inspector; hovering also outlines every PE on the same
+  anti-diagonal, which all work on the same A row this step.
+- **In lane** (left of the grid): the value entering each PE row this step
+  (`left[s·dim + k]`), and the **A tile** thumbnail as read at issue with the
+  entering diagonal lit and the elements already inside dimmed.
+- **Landing lane** (under the grid): the partial sums leaving the bottom edge
+  this step, labelled with their output row, and the **staged rows** strip on
+  the right filling diagonally as rows land; complete rows are ticked, and the
+  caption says which bank they commit to and when.
+- **Weights**: the resident plane (the B tile) with which Read_Weights loaded
+  it. Between MatMuls the grid shows the resident plane faintly with a banner
+  naming what the array is waiting on and when the next MatMul issues.
 
 ## What is and is not modeled
 
@@ -78,7 +131,7 @@ active › ACT active › other).
 | `viz/embed_small.py` | embeds the small container into `viz/traces/matmul_8.js` |
 | `viz/js/container.js` | `.mtpt` reader (eager sections, lazy PE detail) |
 | `viz/js/model.js` | state at (cycle, phase) by commit replay |
-| `viz/js/narrate.js` | "What happened this cycle?" templates |
+| `viz/js/narrate.js` | the five-line cycle strip (`brief`) and the long-form narration (`narrate`) |
 | `viz/js/diagram.js`, `array.js`, `matrices.js`, `memory.js`, `timeline.js`, `inspector.js`, `app.js` | the views and the controller |
 
 ## Container format (`mtpt/1`)

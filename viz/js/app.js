@@ -7,32 +7,42 @@
   const SPEEDS = [1, 2, 4, 16, 64, 256, 1024, 4096];
 
   // Pointers to trace records; the views show the records, not this text.
+  // [cycle, text, view]: the view opens before seeking (array steps are best
+  // watched on the Systolic array tab, stalls on the block diagram).
   const BOOKMARKS = {
     matmul_128: [
-      [0, 'DMA preamble: Read_Host A(0,0) issues; the prefetcher has already filled the FIFO'],
-      [193, 'First Read_Weights issues (its tile has been ready since cycle 8)'],
-      [194, 'First MatMul issues: plane switch 0→1, 95-cycle occupancy begins'],
-      [196, 'Read_Weights #6 retires: shadow plane 0 loads under the running MatMul'],
-      [230, 'Mid-stream: PE[31][0] computes 70457 + (−31 × −46) → 71883 for C[5][0]'],
-      [289, 'MatMul #5 retires and #7 (accumulate) issues in the same cycle'],
-      [480, 'Activate #12 waits on accum_hazard while MatMul #11 still owns bank 0'],
-      [574, 'Activate #12 issues; the array goes idle and is charged to “activation”'],
-      [957, 'Write_Host #21 is blocked by ub_raw behind Activate #12 for 645 cycles'],
-      [1602, 'Activate #12 retires; Write_Host #21 issues next cycle'],
-      [18949, 'Halt waits for the last Write_Host (drain)'],
-      [19012, 'Halt issues; the run ends at 19 013 cycles'],
+      [0, 'DMA preamble: Read_Host A(0,0) issues; the prefetcher has already filled the FIFO', 'diagram'],
+      [193, 'First Read_Weights issues (its tile has been ready since cycle 8)', 'diagram'],
+      [194, 'First MatMul issues: step 0, A[0][0] enters PE[0][0]; plane switch 0→1', 'array'],
+      [196, 'Read_Weights #6 retires: shadow plane 0 loads under the running MatMul', 'diagram'],
+      [225, 'Step 31: the wavefront spans the anti-diagonal; C[0][0] is the first landing', 'array'],
+      [230, 'Step 36: PE[31][0] computes 70457 + (−31 × −46) → 71883 for C[5][0]', 'array'],
+      [256, 'Step 62: A[31][31] is the last input; output row 0 is complete', 'array'],
+      [287, 'Step 93: the last partial sum (row 31, column 31) lands', 'array'],
+      [288, 'Step 94: the grid has drained to zero; 32/32 rows are staged for bank 0', 'array'],
+      [289, 'MatMul #5 retires (bank 0 commit) and #7 (accumulate) issues in the same cycle', 'array'],
+      [480, 'Activate #12 waits on accum_hazard while MatMul #11 still owns bank 0', 'diagram'],
+      [574, 'Activate #12 issues; the array goes idle and is charged to “activation”', 'diagram'],
+      [957, 'Write_Host #21 is blocked by ub_raw behind Activate #12 for 645 cycles', 'diagram'],
+      [1000, 'Idle array behind Activate #12: what the grid shows between MatMuls', 'array'],
+      [1602, 'Activate #12 retires; Write_Host #21 issues next cycle', 'diagram'],
+      [18949, 'Halt waits for the last Write_Host (drain)', 'diagram'],
+      [19012, 'Halt issues; the run ends at 19 013 cycles', 'diagram'],
     ],
     matmul_8: [
-      [0, 'Read_Host A(0,0) issues; the prefetcher pushes four tiles, ready at cycle 8'],
-      [5, 'Read_Weights #2 stalls on weight_fifo_empty: the DDR latency is exposed'],
-      [8, 'Read_Weights #2 issues; it loads plane 1 at retire'],
-      [9, 'MatMul #3 issues: plane switch 0→1'],
-      [11, 'Read_Weights #4 retires: shadow plane 0 loads under the running MatMul'],
-      [20, 'MatMul #3 retires; MatMul #5 (accumulate) issues with a plane switch'],
-      [21, 'Activate #6 stalls on accum_hazard against MatMul #5'],
-      [31, 'Activate #6 issues (20 cycles = 4·4 + 4)'],
-      [51, 'Write_Host #11 issues after waiting on ub_raw'],
-      [155, 'Halt'],
+      [0, 'Read_Host A(0,0) issues; the prefetcher pushes four tiles, ready at cycle 8', 'diagram'],
+      [5, 'Read_Weights #2 stalls on weight_fifo_empty: the DDR latency is exposed', 'diagram'],
+      [8, 'Read_Weights #2 issues; it loads plane 1 at retire', 'diagram'],
+      [9, 'MatMul #3 issues: step 0, A[0][0] enters PE[0][0]; plane switch 0→1', 'array'],
+      [11, 'Read_Weights #4 retires: shadow plane 0 loads under the running MatMul', 'diagram'],
+      [12, 'Step 3: the wavefront spans the anti-diagonal; C[0][0] is the first landing', 'array'],
+      [18, 'Step 9: the last partial sum lands', 'array'],
+      [19, 'Step 10: the grid has drained; 4/4 rows are staged', 'array'],
+      [20, 'MatMul #3 retires; MatMul #5 (accumulate) issues with a plane switch', 'array'],
+      [21, 'Activate #6 stalls on accum_hazard against MatMul #5', 'diagram'],
+      [31, 'Activate #6 issues (20 cycles = 4·4 + 4)', 'diagram'],
+      [51, 'Write_Host #11 issues after waiting on ub_raw', 'diagram'],
+      [155, 'Halt', 'diagram'],
     ],
   };
 
@@ -47,10 +57,10 @@
         tabs: $('tabs'), badge: $('badge'), viewNote: $('view-note'),
       };
       this.sel = { type: 'cycle' };
-      this.view = 'diagram';
+      this.view = 'array';
       this.playing = false;
       this.speed = SPEEDS[3];
-      this.inspector = new MTV.Inspector(this, $('whyt'), $('insp-title'), $('insp'));
+      this.inspector = new MTV.Inspector(this, $('cycle-strip'), $('insp-title'), $('insp'));
       for (const v of ['timeline', 'diagram', 'array', 'matrices', 'memory']) MTV.views[v].init(this);
       this.bind();
     }
@@ -73,7 +83,11 @@
       e.cycle.addEventListener('change', () => this.setCycle(+e.cycle.value));
       e.slider.addEventListener('input', () => this.setCycle(+e.slider.value));
       e.phase.addEventListener('click', (ev) => { const b = ev.target.closest('button'); if (b) this.setCycle(this.t, b.getAttribute('data-phase')); });
-      e.bookmarks.addEventListener('change', () => { const v = e.bookmarks.value; if (v !== '') this.setCycle(+v); e.bookmarks.value = ''; });
+      e.bookmarks.addEventListener('change', () => {
+        const v = e.bookmarks.value;
+        if (v !== '') { const [t, view] = v.split(':'); if (view) this.setView(view); this.setCycle(+t, 'account'); }
+        e.bookmarks.value = '';
+      });
       e.tabs.addEventListener('click', (ev) => { const b = ev.target.closest('.tab'); if (b) this.setView(b.getAttribute('data-view')); });
       window.addEventListener('keydown', (ev) => this.onKey(ev));
       document.body.addEventListener('dragover', (ev) => { ev.preventDefault(); });
@@ -83,19 +97,33 @@
     async boot() {
       this.embedded = (window.MTPT_EMBEDDED || []);
       this.sources = this.embedded.map((e, i) => ({ label: e.name.replace(/\.mtpt$/, '') + ' (embedded)', kind: 'embedded', index: i }));
-      this.refreshSources();
-      if (this.sources.length) await this.loadSource(0);
-      const params = new URLSearchParams(location.search);
-      if (params.get('trace')) {
+      // Served over HTTP, visualizer.py lists every container in viz/traces.
+      const served = /^https?:$/.test(location.protocol);
+      if (served) {
         try {
-          const resp = await fetch(params.get('trace'));
-          const buf = await resp.arrayBuffer();
-          const name = params.get('trace').split('/').pop();
-          this.sources.push({ label: name, kind: 'buffer', buffer: buf, name });
-          this.refreshSources();
-          await this.loadSource(this.sources.length - 1);
-        } catch (err) { console.error(err); this.el.badge.textContent = 'could not fetch ' + params.get('trace'); }
+          const resp = await fetch('traces/index.json', { cache: 'no-store' });
+          if (resp.ok) {
+            for (const e of await resp.json()) {
+              if (!e || !e.file) continue;
+              this.sources.push({ label: e.name + ' (' + (e.bytes >= 1e6 ? (e.bytes / 1e6).toFixed(0) + ' MB' : (e.bytes / 1e3).toFixed(0) + ' kB') + ')', kind: 'url', url: e.file, name: e.file.split('/').pop() });
+            }
+          }
+        } catch (err) { /* static host without the index: Open… still works */ }
       }
+      this.refreshSources();
+      const params = new URLSearchParams(location.search);
+      const want = params.get('trace');
+      let start = 0;
+      if (want) {
+        const i = this.sources.findIndex((s) => s.kind === 'url' && (s.url === want || s.name === want.split('/').pop()));
+        if (i >= 0) start = i;
+        else { this.sources.push({ label: want.split('/').pop(), kind: 'url', url: want, name: want.split('/').pop() }); this.refreshSources(); start = this.sources.length - 1; }
+      } else {
+        // The 128×128 example is the one to open when it has been traced.
+        const i = this.sources.findIndex((s) => s.kind === 'url' && s.name === 'matmul_128.mtpt');
+        if (i >= 0) start = i;
+      }
+      if (this.sources.length) await this.loadSource(start);
     }
     refreshSources() {
       this.el.wl.innerHTML = this.sources.map((s, i) => '<option value="' + i + '">' + s.label + '</option>').join('');
@@ -117,7 +145,17 @@
         let c;
         if (s.kind === 'embedded') c = await MTV.Container.open({ base64: this.embedded[s.index].base64 }, this.embedded[s.index].name);
         else if (s.kind === 'file') c = await MTV.Container.open(s.file, s.file.name);
-        else c = await MTV.Container.open(s.buffer, s.name);
+        else {
+          if (!s.buffer) {
+            // Fetched whole into memory, so the PE frames are synchronous views (mmSync).
+            this.el.badge.textContent = 'fetching ' + s.label + '…';
+            const resp = await fetch(s.url);
+            if (!resp.ok) throw new Error('could not fetch ' + s.url + ' (' + resp.status + ')');
+            s.buffer = await resp.arrayBuffer();
+          }
+          c = await MTV.Container.open(s.buffer, s.name);
+        }
+        if (this.current !== i) return;   // another selection won the race
         this.setModel(new MTV.Model(c));
       } catch (err) {
         console.error(err);
@@ -138,7 +176,7 @@
       this.el.badge.title = 'tools/tracegen checks: run unchanged by tracing, oracle, golden loops, PE identity (' + fmt(ck.pe_checked) + ' steps), landings, commit replay, requantize, stall and idle partitions, unit intervals';
       this.el.badge.className = 'badge ' + (okAll ? 'ok' : 'bad');
       const bm = BOOKMARKS[model.workload.name] || [];
-      this.el.bookmarks.innerHTML = '<option value="">jump to…</option>' + bm.filter(([t]) => t < model.cycles).map(([t, text]) => '<option value="' + t + '">' + t + ' · ' + text + '</option>').join('');
+      this.el.bookmarks.innerHTML = '<option value="">jump to…</option>' + bm.filter(([t]) => t < model.cycles).map(([t, text, view]) => '<option value="' + t + ':' + (view || '') + '">' + t + ' · ' + text + '</option>').join('');
       document.title = 'Mini-TPU Cycle Visualizer · ' + model.workload.name;
       this.setCycle(0, 'account');
     }
@@ -173,7 +211,7 @@
 
     render() {
       const st = this.state;
-      this.inspector.renderWhyt(this.model, st);
+      this.inspector.renderStrip(this.model, st);
       this.inspector.render(this.model, st, this.sel);
       MTV.views.timeline.render();
       MTV.views[this.view].render();
@@ -201,6 +239,7 @@
       if (kind === 'cycle') this.setCycle(+arg);
       else if (kind === 'instr') this.select({ type: 'instr', pc: +arg });
       else if (kind === 'sel') this.select({ type: arg });
+      else if (kind === 'view') this.setView(arg);
       else if (kind === 'array') { const mm = this.model.matmuls[+arg]; this.setView('array'); this.setCycle(mm.issue, 'account'); }
       else if (kind === 'mem') { this.setView('memory'); MTV.views.memory.show(arg); if (arg2 !== undefined) { MTV.views.memory.addr = 0; } this.render(); }
       else if (kind === 'read') { const r = this.model.reads[+arg]; this.showBlob('Read at issue by pc ' + r.pc, r.kind === 'acc' ? this.model.readI32(r) : this.model.readI8(r), r.cols || 16, r.kind); }

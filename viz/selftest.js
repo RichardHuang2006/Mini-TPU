@@ -57,6 +57,56 @@ async function run(file) {
   for (let t = 0; t < m.cycles; t += stride) { m.setCycle(t, 'account'); lines += MTV.narrate(m, m.state).length; }
   check('narrate', lines > 0, lines + ' lines over the sampled cycles');
 
+  // The cycle strip is always five lines in run-loop order, each short.
+  {
+    let bad = 0, long = 0, n = 0;
+    const order = 'retire,prefetch,issue,array,account';
+    for (let t = 0; t < m.cycles; t += stride) {
+      for (const ph of MTV.PHASES) {
+        m.setCycle(t, ph);
+        const b = MTV.brief(m, m.state);
+        n++;
+        if (b.length !== 5 || b.map((l) => l.phase).join(',') !== order) bad++;
+        for (const l of b) { if (l.text.length > 52) long++; if (!['done', 'now', 'pending'].includes(l.state) || typeof l.action !== 'string') bad++; }
+        const cur = MTV.PHASES.indexOf(ph);
+        if (cur >= 1 && b[0].state === 'pending') bad++;
+        if (cur < 1 && b[0].state !== 'pending') bad++;
+        if (cur === 4 && b[4].state !== 'now') bad++;
+      }
+    }
+    check('cycle strip', bad === 0 && long === 0, n + ' (cycle, phase) samples, 5 lines each, longest ≤ 52 chars, ' + bad + ' shape violations');
+  }
+
+  // The rules the array view draws hold on every recorded MatMul:
+  // input skew, landing step, drained final step, complete-row count.
+  {
+    const dim = m.dim, n = dim * dim;
+    let bad = 0, cells = 0;
+    for (const mm of m.matmuls) {
+      const f = c.mmSync(mm.index);
+      const iss = m.issueByPc.get(mm.pc);
+      const rd = iss.reads.map((i) => m.reads[i]).find((r) => r.kind === 'ub');
+      const A = m.readI8(rd);
+      for (let s = 0; s < mm.steps; s++) for (let k = 0; k < dim; k++) {
+        const r = s - k;
+        const want = r >= 0 && r < mm.len ? A[r * dim + k] : 0;
+        if (f.left[s * dim + k] !== want) bad++;
+      }
+      for (let r = 0; r < mm.len; r++) for (let cc = 0; cc < dim; cc++) {
+        const s = r + dim - 1 + cc;
+        cells++;
+        if (s >= mm.steps || f.psum[s * n + (dim - 1) * dim + cc] !== f.land[r * dim + cc]) bad++;
+      }
+      for (let i = 0; i < n; i++) if (f.psum[(mm.steps - 1) * n + i] !== 0 || f.act[(mm.steps - 1) * n + i] !== 0) bad++;
+      for (const s of [0, dim - 1, 2 * dim - 2, mm.steps - 1]) {
+        let done = 0;
+        for (let r = 0; r < mm.len; r++) if (s >= r + 2 * dim - 2) done++;
+        if (done !== Math.max(0, Math.min(mm.len, s + 3 - 2 * dim))) bad++;
+      }
+    }
+    check('array rules', bad === 0, m.matmuls.length + ' MatMuls: left[s][k] = A[s−k][k], land[r][c] = psum[r+dim−1+c][dim−1][c] (' + cells + ' cells), final step all zero, done-row count');
+  }
+
   // Every hop obeys the release rule it claims, and every chain terminates.
   {
     let hops = 0, bad = 0, deepest = 0;
@@ -137,6 +187,24 @@ async function run(file) {
           ch21.slice(0, 3).map((h) => 'pc ' + h.pc + ' ' + h.kind + (h.reason ? ' ' + h.reason : '')).join(' → ') + ' … root pc ' + ch21[ch21.length - 1].pc + ' (' + ch21.length + ' hops)');
     const ib = m.idleBlockerAt(1000);
     check('idle blocker 1000', ib.pc === 12 && ib.via === 'blocker' && ib.o.idle === 'act', 'cycle 1000 charged to ' + ib.o.idle + ', points at pc ' + ib.pc + ' via ' + ib.via);
+    // The array-view bookmarks land on the steps they claim.
+    const steps = {};
+    for (const [t, want] of [[194, 0], [225, 31], [256, 62], [287, 93], [288, 94]]) { m.setCycle(t, 'account'); steps[t] = m.state.mxu.mm && m.state.mxu.mm.pc === 5 ? m.state.mxu.step : -1; if (steps[t] !== want) steps.bad = true; }
+    check('bookmark steps', !steps.bad, 'pc 5 steps at 194/225/256/287/288 = ' + [194, 225, 256, 287, 288].map((t) => steps[t]).join('/'));
+    m.setCycle(289, 'retire');
+    const b289 = MTV.brief(m, m.state);
+    check('strip 289 retire', b289[0].kind === 'retire' && /pc 5 .*bank 0/.test(b289[0].full) && b289[2].state === 'pending' && b289[3].state === 'done',
+          b289.map((l) => l.phase + ': ' + l.text).join(' | '));
+    m.setCycle(289, 'issue');
+    const b289i = MTV.brief(m, m.state);
+    check('strip 289 issue', /^pc 7 MatMul .*plane 0/.test(b289i[2].full) && /^step 0\/95/.test(b289i[3].full), b289i[2].text + ' | ' + b289i[3].text);
+    m.setCycle(230, 'account');
+    const b230 = MTV.brief(m, m.state);
+    check('strip 230', /unit_busy/.test(b230[2].full) && /^step 36\/95 .*r0…r5/.test(b230[3].full) && b230[4].kind === 'busy', b230[2].text + ' | ' + b230[3].text);
+    m.setCycle(1000, 'account');
+    const b1000 = MTV.brief(m, m.state);
+    const nextMm = m.unitIv.MXU.find((iv) => iv.issue > 1000);
+    check('strip 1000', /ub_raw ← pc 12/.test(b1000[2].full) && /^idle → act/.test(b1000[4].full) && b1000[3].full === 'idle · next pc ' + nextMm.pc + ' at ' + nextMm.issue.toLocaleString('en-US'), b1000[2].text + ' | ' + b1000[3].text + ' | ' + b1000[4].text);
     m.setCycle(m.cycles - 1, 'account');
     check('final C[5][0]', m.img.host[ce.host] === 16, 'host byte 0x' + ce.host.toString(16) + ' = ' + m.img.host[ce.host]);
   }
@@ -155,6 +223,11 @@ async function run(file) {
     const pe = c.mmSync(1);
     check('20 PE[0][0]', pe && pe.psum[0] === pe.left[0] * pe.w[0] && pe.act[0] === pe.left[0],
           'psum: 0 + (' + pe.left[0] + ' x ' + pe.w[0] + ') -> ' + pe.psum[0]);
+    m.setCycle(5, 'account');
+    const b5 = MTV.brief(m, m.state);
+    check('strip 5', /weight_fifo_empty/.test(b5[2].full) && b5[2].kind === 'stall', b5[2].text);
+    for (const [t, want] of [[9, 0], [12, 3], [18, 9], [19, 10]]) { m.setCycle(t, 'account'); const mx = m.state.mxu; if (!(mx.mm && mx.mm.pc === 3 && mx.step === want)) failures++, console.log('  FAIL bookmark ' + t + ' step ' + (mx.mm && mx.step)); }
+    check('bookmark steps', true, 'pc 3 steps at 9/12/18/19 = 0/3/9/10');
   }
 }
 
