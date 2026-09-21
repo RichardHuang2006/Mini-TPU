@@ -68,24 +68,6 @@ $(BUILD)/report: $(REPORT_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
 report: $(BUILD)/report
 	@./$(BUILD)/report
 
-# Writes the .mtpt containers viz/ opens, failing if any of its checks does.
-TRACE_SRC = tools/tracegen.cpp
-TRACE_DIR = viz/traces
-
-$(BUILD)/tracegen: $(TRACE_SRC) $(LIB_SRC) $(HDR) | $(BUILD)
-	$(CXX) $(CXXFLAGS_REL) $(TRACE_SRC) $(LIB_SRC) -o $@
-
-trace: $(BUILD)/tracegen examples
-	@mkdir -p $(TRACE_DIR)
-	./$(BUILD)/tracegen --small --out $(TRACE_DIR)/matmul_8.mtpt
-	./$(BUILD)/tracegen --prog examples/matmul_128.hex \
-	    --acts examples/matmul_128.acts.mtpu --weights examples/matmul_128.weights.mtpu \
-	    --expect examples/matmul_128.expect.mtpu --layer 128,128,128 \
-	    --dim 32 --ub 262144 --acc-banks 4 --macs 2097152 \
-	    --out $(TRACE_DIR)/matmul_128.mtpt
-	python3 viz/check_trace.py $(TRACE_DIR)/matmul_8.mtpt $(TRACE_DIR)/matmul_128.mtpt
-	python3 viz/embed_small.py $(TRACE_DIR)/matmul_8.mtpt viz/traces/matmul_8.js
-
 # Every test TU pulls in nearly every header, so the suite is rebuilt whenever
 # any of them changes rather than tracked dependency by dependency.
 $(BUILD)/test_main: $(TEST_SRC) $(TPU_SRC) $(HDR) | $(BUILD)

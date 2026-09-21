@@ -1,0 +1,35 @@
+# Correctness lint only. The source is hand-aligned to be read, so there is no
+# clang-format gate and none of these checks touch layout.
+#
+# The exclusions are the checks this codebase disagrees with on purpose: one
+# case per enumerator even when two share a body (branch-clone,
+# switch-missing-default-case), sized enums kept at their natural width
+# (enum-size), fixed-width integer arithmetic (narrowing-conversions,
+# signed-char-misuse, implicit-widening), optionals dereferenced behind an
+# explicit guard the analyzer cannot follow (unchecked-optional-access), a test
+# TU that #includes another TU (suspicious-include), and readability kept over
+# micro-optimization (inefficient-vector-operation, unnecessary-value-param,
+# inefficient-string-concatenation, exception-escape, easily-swappable-parameters).
+# DivideZero and DeadStores are off for path-sensitive false positives in tests/.
+Checks: >
+  bugprone-*,
+  performance-*,
+  clang-analyzer-*,
+  -bugprone-branch-clone,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-narrowing-conversions,
+  -bugprone-signed-char-misuse,
+  -bugprone-suspicious-include,
+  -bugprone-switch-missing-default-case,
+  -bugprone-unchecked-optional-access,
+  -clang-analyzer-core.DivideZero,
+  -clang-analyzer-deadcode.DeadStores,
+  -performance-enum-size,
+  -performance-inefficient-string-concatenation,
+  -performance-inefficient-vector-operation,
+  -performance-unnecessary-value-param
+
+# A finding fails the build, so the tree stays clean.
+WarningsAsErrors: '*'

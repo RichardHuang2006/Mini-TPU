@@ -1,0 +1,22 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      # Every header is checked through the TU that includes it; .clang-tidy
+      # turns any finding into a failure.
+      - name: Check lint
+        run: |
+          uvx clang-tidy@19.1.0.1 --quiet --header-filter='(src|tests)/' \
+            src/*.cpp tests/test_*.cpp tools/*.cpp \
+            -- -std=c++17 -Isrc -Itests
