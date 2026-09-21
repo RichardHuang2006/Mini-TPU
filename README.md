@@ -147,7 +147,6 @@ Mini-TPU/
 │   ├── loader.h            program (hex/raw) and tensor (MTPU) file formats
 │   ├── tpu.h / tpu.cpp     the machine: sequencer, scoreboard, units, ticking
 │   ├── stats.h             derived statistics: utilization, TOPS, roofline
-│   ├── trace.h             structured trace observer for the visualizer
 │   └── main.cpp            the CLI driver
 ├── tests/
 │   ├── test_support.h            harness, helpers, differential scaffolding
@@ -160,12 +159,10 @@ Mini-TPU/
 │   ├── test_isa_scoreboard.cpp   encode/decode, interlocks, overlap, Sync
 │   ├── test_workloads.cpp        dense/conv/MLP layers vs. golden loops
 │   └── test_differential.cpp     oracle diff, stats invariants, config sweep
-├── tools/
-│   ├── gen_examples.cpp    writes examples/ from the verified workloads
-│   ├── report.cpp          regenerates the performance tables
-│   ├── tracegen.cpp        records a run into a trace container, with checks
-│   └── mutate.sh           mutation harness: injected bugs must be caught
-└── viz/                    the cycle visualizer (static page) and its checkers
+└── tools/
+    ├── gen_examples.cpp    writes examples/ from the verified workloads
+    ├── report.cpp          regenerates the performance tables
+    └── mutate.sh           mutation harness: injected bugs must be caught
 ```
 
 ## 5. Recommended reading order
@@ -561,7 +558,6 @@ make test       # regenerate examples/ and run the full test suite
 make debug      # build and run the test suite under ASan + UBSan
 make examples   # write the bundled workloads to examples/
 make report     # regenerate the performance tables from the model
-make trace      # record matmul_128 and a small workload for the visualizer
 make clean      # remove build/ and examples/
 make help       # list the targets
 tools/mutate.sh # run the mutation harness (each mutation rebuilds the suite)
@@ -589,22 +585,3 @@ Run `./build/minitpu --help` for the full flag list. Each generated example
 carries its own run command in a `# run:` comment at the top of its `.hex`
 file, and the checked-in performance numbers are regenerated, never
 hand-entered: `make report` prints the current tables.
-
-## 19. Cycle visualizer
-
-`viz/index.html` shows a recorded run cycle by cycle: the systolic array with
-the MatMul drawn inside the PE grid (the A tile entering, activations moving
-right, partial sums moving down and landing in the staged rows, each PE's
-arithmetic on hover), the block diagram with the transfers the trace records
-on each path, the logical matrices with the progress of every output element,
-the memories, a timeline of every unit, and a five-line strip that says what
-each step of the run loop did in the current cycle. `python3 visualizer.py`
-serves the page and opens the 128×128 example (`viz/traces/matmul_128.mtpt`)
-when it has been traced. The
-simulator is the only source of truth: `src/trace.h` is an observer the
-sequencer calls at each retire, prefetch, issue or stall, and at every array
-step; `tools/tracegen.cpp` records a run and, before writing the container,
-checks that tracing left the run unchanged and that the trace agrees with the
-oracle, the golden loops and itself. `make trace` builds both containers and
-runs `viz/check_trace.py` over them; `viz/README.md` documents the cycle
-contract, what is and is not modeled, and the container format.

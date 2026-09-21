@@ -37,18 +37,6 @@ struct Reservation {
 // One instruction in flight per unit; SEQ covers those with no unit of their own.
 enum class Unit : uint8_t { DMA, WEIGHT, MXU, ACT, SEQ, COUNT };
 
-inline const char* unit_name(Unit u) {
-    switch (u) {
-        case Unit::DMA:    return "DMA";
-        case Unit::WEIGHT: return "WEIGHT";
-        case Unit::MXU:    return "MXU";
-        case Unit::ACT:    return "ACT";
-        case Unit::SEQ:    return "SEQ";
-        case Unit::COUNT:  break;
-    }
-    return "?";
-}
-
 // Why one issue attempt failed; each value names the StallStats counter it moves.
 enum class StallReason : uint8_t {
     NONE,
@@ -62,22 +50,6 @@ enum class StallReason : uint8_t {
     WEIGHT_STALL,
     UB_BANK_CONFLICT,
 };
-
-inline const char* stall_reason_name(StallReason r) {
-    switch (r) {
-        case StallReason::NONE:              return "none";
-        case StallReason::DRAIN:             return "drain";
-        case StallReason::UNIT_BUSY:         return "unit_busy";
-        case StallReason::WEIGHT_FIFO_EMPTY: return "weight_fifo_empty";
-        case StallReason::UB_RAW:            return "ub_raw";
-        case StallReason::UB_WAR:            return "ub_war";
-        case StallReason::UB_WAW:            return "ub_waw";
-        case StallReason::ACCUM_HAZARD:      return "accum_hazard";
-        case StallReason::WEIGHT_STALL:      return "weight_stall";
-        case StallReason::UB_BANK_CONFLICT:  return "ub_bank_conflict";
-    }
-    return "?";
-}
 
 // Outputs staged at issue, committed at retire.
 struct PendingWrite {
@@ -93,13 +65,11 @@ struct PendingWrite {
 };
 
 struct InFlight {
-    bool         active      = false;
-    Op           op          = Op::NOP;
-    std::size_t  pc          = 0;      // which instruction this is, for tracing
+    bool         active     = false;
+    Op           op         = Op::NOP;
     Reservation  res;
     PendingWrite pending;
-    uint64_t     issue_cycle = 0;
-    uint64_t     done_cycle  = 0;
+    uint64_t     done_cycle = 0;
 };
 
 // Why issue could not proceed, per cycle.
@@ -174,15 +144,10 @@ struct TpuResult {
     bool done() const { return halted || trapped; }
 };
 
-// Defined in src/trace.h; a null sink means no tracing.
-struct TraceSink;
-struct CycleInfo;
-
 struct TpuOptions {
     uint64_t   max_cycles = 10'000'000;   // runaway backstop
     bool       trace      = false;
     std::FILE* trace_out  = stderr;
-    TraceSink* sink       = nullptr;
 };
 
 // The whole machine; run() layers the sequencer over its drivable units.
@@ -212,13 +177,6 @@ public:
 
     const std::vector<uint8_t>& host() const { return host_; }
     const std::vector<i8>&      weight_mem() const { return weight_mem_; }
-
-    // Read-only views of the sequencer's state, for a trace sink.
-    const InFlight& unit(Unit u) const { return slot(u); }
-    std::size_t     prefetch_pc() const { return prefetch_pc_; }
-
-    // In-flight instructions holding a Unified Buffer read / write stream.
-    void ub_streams(uint32_t& readers, uint32_t& writers) const;
 
     // One cycle, with stages evaluated in reverse pipeline order.
     void tick();
@@ -270,6 +228,9 @@ private:
     // Does anything in flight conflict? Bumps the matching stall counter.
     bool interlocked(const Reservation& r, StallReason& why, Unit& blocker);
 
+    // In-flight instructions holding a Unified Buffer read / write stream.
+    void ub_streams(uint32_t& readers, uint32_t& writers) const;
+
     // Is a Unified Buffer port free? The bank count budgets same-direction streams.
     bool ub_port_available(const Reservation& r);
 
@@ -292,9 +253,6 @@ private:
     // Charge one array-idle cycle to a cause, given the stall counters before it.
     void charge_idle_cycle(const StallStats& before);
 
-    // The per-cycle trace record, sampled after the accounting step.
-    CycleInfo cycle_info(const RunProfile& before, const TpuResult& st) const;
-
     Config cfg_;
 
     UnifiedBuffer ub_;
@@ -315,12 +273,4 @@ private:
     InFlight   units_[static_cast<std::size_t>(Unit::COUNT)];
     StallStats stalls_;
     RunProfile profile_;
-
-    // Set for the duration of run(), plus this cycle's issue outcome for the hook.
-    TraceSink*  sink_            = nullptr;
-    bool        last_issued_     = false;
-    bool        last_trapped_    = false;
-    StallReason last_reason_     = StallReason::NONE;
-    Unit        last_blocker_    = Unit::COUNT;
-    std::size_t last_blocker_pc_ = 0;
 };
