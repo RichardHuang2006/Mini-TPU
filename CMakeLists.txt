@@ -12,8 +12,7 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# Sources are globbed so a new file needs no edit here; CONFIGURE_DEPENDS
-# re-globs on every build.
+# Globbed with CONFIGURE_DEPENDS, so a new file needs no edit here.
 file(GLOB_RECURSE CORE_SRC CONFIGURE_DEPENDS src/*.cpp)
 
 # tpu_core: the whole machine. Header-only until the first .cpp arrives.
@@ -26,7 +25,7 @@ else()
 endif()
 
 # One executable per tools/*.cpp that exists so far.
-foreach(tool tpu_sim gen_programs roofline)
+foreach(tool tpu_sim gen_programs roofline check_headers)
   if(EXISTS ${CMAKE_SOURCE_DIR}/tools/${tool}.cpp)
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE tpu_core)
@@ -38,10 +37,9 @@ add_executable(tpu_tests ${TEST_SRC})
 target_include_directories(tpu_tests PRIVATE tests)
 target_link_libraries(tpu_tests PRIVATE tpu_core)
 
-# `cmake --build build --target lint`: clang-tidy over every .cpp with the
-# checks in .clang-tidy; headers are checked through the files that include
-# them. The pinned clang-tidy comes from uvx, as in CI.
+# `cmake --build build --target lint`: the /// header rule on every file, then pinned clang-tidy over every .cpp.
 file(GLOB_RECURSE LINT_SRC CONFIGURE_DEPENDS src/*.cpp tests/*.cpp tools/*.cpp)
+file(GLOB_RECURSE LINT_HDR CONFIGURE_DEPENDS src/*.h tests/*.h)
 set(LINT_ARGS)
 if(APPLE)
   # The pip-built clang-tidy does not know where the macOS SDK headers are.
@@ -50,7 +48,9 @@ if(APPLE)
   list(APPEND LINT_ARGS --extra-arg=-isysroot${SDK_PATH})
 endif()
 add_custom_target(lint
+  COMMAND check_headers ${LINT_HDR} ${LINT_SRC}
   COMMAND uvx clang-tidy@19.1.0.1 --quiet -p ${CMAKE_BINARY_DIR} ${LINT_ARGS}
           --header-filter=${CMAKE_SOURCE_DIR}/\(src|tests|tools\)/ ${LINT_SRC}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   VERBATIM)
+add_dependencies(lint check_headers)

@@ -13,12 +13,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
-      # Configuring writes compile_commands.json, which clang-tidy reads for
-      # each file's flags.
+      # Writes compile_commands.json, which clang-tidy reads for each file's flags.
       - name: Configure
         run: cmake -S . -B build
 
-      # The same target runs locally; .clang-tidy turns any finding into a
-      # failure.
+      # Same target as locally; .clang-tidy makes any finding a failure.
       - name: Check lint
         run: cmake --build build --target lint

@@ -1,5 +1,4 @@
-// Runs every registered TEST, or only those whose name contains one of the
-// command-line arguments:  ./build/tpu_tests bf16 memory
+/// Runs every TEST, or only those whose name contains an argument: tpu_tests bf16
 
 #include <cstdio>
 #include <cstring>

@@ -1,15 +1,6 @@
-#pragma once
+/// Dependency-free test harness; a failed check reports and the test keeps going.
 
-// A dependency-free test harness.
-//
-//   TEST(bf16_rounds_ties_to_even) {
-//       CHECK(x == y);
-//       CHECK_EQ(bf16::from_f32(1.0f).bits, 0x3F80);
-//       CHECK_THROWS(mem.read(1 << 30));
-//   }
-//
-// A failed check reports and lets the test continue, so one run shows every
-// broken expectation, not just the first.
+#pragma once
 
 #include <cstdio>
 #include <sstream>
