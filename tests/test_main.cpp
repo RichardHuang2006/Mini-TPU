@@ -1,24 +1,29 @@
-// Runs every SECTION() the test_*.cpp files registered in tests/test_support.h.
+// Runs every registered TEST, or only those whose name contains one of the
+// command-line arguments:  ./build/tpu_tests bf16 memory
 
 #include <cstdio>
+#include <cstring>
 
-#include "test_support.h"
+#include "test_framework.h"
 
-int main() {
-    // Line-buffered, so stdout and stderr stay interleaved in order when piped.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+int main(int argc, char** argv) {
+    int ran = 0;
+    int failed_tests = 0;
 
-    int passes = 0, fails = 0;
-    for (auto& [name, fn] : test::registry()) {
-        const int before = test::assertion_failures;
-        std::printf("=== %s ===\n", name.c_str());
-        fn();
-        if (test::assertion_failures > before) ++fails;
-        else                                   ++passes;
+    for (const test::Case& c : test::registry()) {
+        bool selected = argc == 1;
+        for (int i = 1; i < argc && !selected; ++i)
+            selected = std::strstr(c.name, argv[i]) != nullptr;
+        if (!selected) continue;
+
+        const int before = test::failed_checks;
+        c.fn();
+        ++ran;
+        const bool ok = test::failed_checks == before;
+        if (!ok) ++failed_tests;
+        std::printf("%s %s\n", ok ? "pass" : "FAIL", c.name);
     }
-    std::printf("\n%d section%s ok, %d failing (%d assertion failure%s)\n",
-                passes, passes == 1 ? "" : "s",
-                fails,
-                test::assertion_failures, test::assertion_failures == 1 ? "" : "s");
-    return test::assertion_failures ? 1 : 0;
+
+    std::printf("\n%d test%s, %d failed\n", ran, ran == 1 ? "" : "s", failed_tests);
+    return failed_tests == 0 ? 0 : 1;
 }

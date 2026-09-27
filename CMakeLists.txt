@@ -1,0 +1,56 @@
+cmake_minimum_required(VERSION 3.16)
+project(MiniTPU LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD          17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS        OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # clang-tidy -p build
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+# Sources are globbed so a new file needs no edit here; CONFIGURE_DEPENDS
+# re-globs on every build.
+file(GLOB_RECURSE CORE_SRC CONFIGURE_DEPENDS src/*.cpp)
+
+# tpu_core: the whole machine. Header-only until the first .cpp arrives.
+if(CORE_SRC)
+  add_library(tpu_core STATIC ${CORE_SRC})
+  target_include_directories(tpu_core PUBLIC src)
+else()
+  add_library(tpu_core INTERFACE)
+  target_include_directories(tpu_core INTERFACE src)
+endif()
+
+# One executable per tools/*.cpp that exists so far.
+foreach(tool tpu_sim gen_programs roofline)
+  if(EXISTS ${CMAKE_SOURCE_DIR}/tools/${tool}.cpp)
+    add_executable(${tool} tools/${tool}.cpp)
+    target_link_libraries(${tool} PRIVATE tpu_core)
+  endif()
+endforeach()
+
+file(GLOB TEST_SRC CONFIGURE_DEPENDS tests/*.cpp)
+add_executable(tpu_tests ${TEST_SRC})
+target_include_directories(tpu_tests PRIVATE tests)
+target_link_libraries(tpu_tests PRIVATE tpu_core)
+
+# `cmake --build build --target lint`: clang-tidy over every .cpp with the
+# checks in .clang-tidy; headers are checked through the files that include
+# them. The pinned clang-tidy comes from uvx, as in CI.
+file(GLOB_RECURSE LINT_SRC CONFIGURE_DEPENDS src/*.cpp tests/*.cpp tools/*.cpp)
+set(LINT_ARGS)
+if(APPLE)
+  # The pip-built clang-tidy does not know where the macOS SDK headers are.
+  execute_process(COMMAND xcrun --show-sdk-path
+                  OUTPUT_VARIABLE SDK_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+  list(APPEND LINT_ARGS --extra-arg=-isysroot${SDK_PATH})
+endif()
+add_custom_target(lint
+  COMMAND uvx clang-tidy@19.1.0.1 --quiet -p ${CMAKE_BINARY_DIR} ${LINT_ARGS}
+          --header-filter=${CMAKE_SOURCE_DIR}/\(src|tests|tools\)/ ${LINT_SRC}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  VERBATIM)
