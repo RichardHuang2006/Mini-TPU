@@ -1,5 +1,7 @@
 /// TPUv1's fixed parameters
 
+#pragma once
+
 #include "common/types.h"
 
 namespace v1 {
