@@ -1,49 +1,21 @@
-/// Every structural knob of the TensorCore, with the tiny() and v4() presets.
-
-#pragma once
+/// TPUv1's fixed parameters
 
 #include "common/types.h"
 
-struct CoreConfig {
-    const char* name = "tiny";
+namespace v1 {
 
-    // Matrix units: each is a mxu_dim x mxu_dim weight-stationary systolic array.
-    u32 mxu_dim  = 8;
-    u32 num_mxus = 1;
+inline constexpr u32 kClockMhz = 700;
 
-    // A vreg is sublanes x lanes fp32 words; a row of lanes feeds one MXU input row.
-    u32 sublanes = 8;
-    u32 lanes    = 8;
+inline constexpr u32 kMxuDim  = 256;                       // Matrix Multiply Unit: 256 x 256 8-bit MACs
+inline constexpr u64 kTileBytes = u64{kMxuDim} * kMxuDim;  // one weight tile: 64 KiB
 
-    u32 num_vregs = 32;
-    u32 num_sregs = 32;
-    u32 num_sems  = 32;
+inline constexpr u32 kUbRows  = 96 * 1024;                 // Unified Buffer: 24 MiB of 256-byte rows
+inline constexpr u32 kAccRows = 4096;                      // Accumulators: 4 MiB of 256 x int32 rows
 
-    // Memory sizes in 32-bit words.
-    u32 main_words = 1u << 18;
-    u32 vmem_words = 1u << 16;
-    u32 smem_words = 1u << 12;
+inline constexpr u32 kWeightFifoTiles = 4;                 // Weight FIFO depth
+inline constexpr u64 kWeightMemBytes  = u64{8} << 30;      // off-chip DDR3 Weight Memory: 8 GiB
 
-    // DMA: cycles before the first word moves, then words moved per cycle.
-    u32 dma_latency         = 16;
-    u32 dma_words_per_cycle = 8;
+inline constexpr u32 kWeightBytesPerCycle = 48;            // DDR3 at 34 GB/s over 700 MHz
+inline constexpr u32 kHostBytesPerCycle   = 22;            // PCIe Gen3 x16 at 15.75 GB/s over 700 MHz
 
-    u32 vreg_words() const { return sublanes * lanes; }
-
-    // Small enough to draw every PE and vreg element in the terminal.
-    static CoreConfig tiny() { return {}; }
-
-    // TPUv4-like TensorCore: four 128x128 MXUs and 8x128 vregs.
-    static CoreConfig v4() {
-        CoreConfig c;
-        c.name                = "v4";
-        c.mxu_dim             = 128;
-        c.num_mxus            = 4;
-        c.lanes               = 128;
-        c.main_words          = 1u << 24;
-        c.vmem_words          = 1u << 22;
-        c.dma_latency         = 64;
-        c.dma_words_per_cycle = 128;
-        return c;
-    }
-};
+}  // namespace v1
