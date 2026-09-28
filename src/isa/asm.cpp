@@ -1,0 +1,297 @@
+/// The assembler: splits each line into words, builds an Instr or a data block, and encodes with isa.cpp's encode().
+
+#include "isa/asm.h"
+
+#include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <cstdint>
+#include <fstream>
+#include <sstream>
+#include <utility>
+#include <vector>
+
+#include "common/config.h"
+
+namespace {
+
+struct Token {
+    std::string text;
+    u32         col = 0;   // 1-based column where the word starts
+};
+
+// A plain char can be negative, which std::isspace and std::isdigit do not accept.
+bool is_space(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+bool is_digit(char c) {
+    return std::isdigit(static_cast<unsigned char>(c)) != 0;
+}
+
+bool is_hex(const std::string& text) {
+    if (text.size() <= 2) {
+        return false;
+    }
+    return text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+}
+
+bool contains(const std::vector<std::string>& list, const std::string& item) {
+    return std::find(list.begin(), list.end(), item) != list.end();
+}
+
+std::vector<Token> tokenize(const std::string& line) {
+    std::vector<Token> tokens;
+    std::size_t i = 0;
+
+    while (i < line.size()) {
+        if (line[i] == '#') {
+            break;
+        }
+        if (is_space(line[i])) {
+            ++i;
+            continue;
+        }
+
+        const std::size_t start = i;
+        while (i < line.size() && line[i] != '#' && !is_space(line[i])) {
+            ++i;
+        }
+
+        Token token;
+        token.text = line.substr(start, i - start);
+        token.col  = static_cast<u32>(start + 1);
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+// Decimal (optionally negative) or 0x hex; the whole text must be the number.
+bool parse_int(const std::string& text, std::int64_t& value) {
+    const char* first = text.data();
+    const char* last  = text.data() + text.size();
+    int base = 10;
+
+    if (is_hex(text)) {
+        first += 2;
+        base = 16;
+        if (*first == '-') {
+            return false;
+        }
+    }
+
+    const std::from_chars_result result = std::from_chars(first, last, value, base);
+    const bool parsed       = result.ec == std::errc();
+    const bool used_it_all  = result.ptr == last;
+    return parsed && used_it_all;
+}
+
+// The keys each instruction takes, in the order error messages list them.
+std::vector<std::string> operand_keys(Op op) {
+    if (op == Op::ReadHostMemory || op == Op::WriteHostMemory) {
+        return {"host", "ub", "rows"};
+    }
+    return {};
+}
+
+void set_operand(Instr& in, const std::string& key, u32 value) {
+    if (key == "host") {
+        in.host_row = value;
+    } else if (key == "ub") {
+        in.ub_row = value;
+    } else if (key == "rows") {
+        in.rows = value;
+    }
+}
+
+class Assembler {
+public:
+    explicit Assembler(std::string name) : name_(std::move(name)) {}
+
+    Program run(const std::string& source) {
+        std::istringstream lines(source);
+        std::string line;
+
+        while (std::getline(lines, line)) {
+            ++line_;
+            const std::vector<Token> tokens = tokenize(line);
+            if (tokens.empty()) {
+                continue;
+            }
+
+            const char first = tokens[0].text[0];
+            if (first == '.') {
+                directive(tokens);
+            } else if (first == '-' || is_digit(first)) {
+                data(tokens);
+            } else {
+                instruction(tokens);
+            }
+        }
+        return std::move(prog_);
+    }
+
+private:
+    std::string name_;
+    u32         line_  = 0;
+    DataBlock*  block_ = nullptr;   // the open data block, or none
+    Program     prog_;
+
+    [[noreturn]] void fail(u32 col, const std::string& msg) const {
+        const std::string where = name_ + ":" + std::to_string(line_) + ":" + std::to_string(col);
+        throw AsmError(where + ": error: " + msg);
+    }
+
+    std::int64_t number(const Token& token) const {
+        std::int64_t value = 0;
+        if (!parse_int(token.text, value)) {
+            fail(token.col, "'" + token.text + "' is not a number");
+        }
+        return value;
+    }
+
+    // `.host ROW` or `.weights TILE`: later data lines fill a block starting there.
+    void directive(const std::vector<Token>& tokens) {
+        const Token& name = tokens[0];
+        if (name.text != ".host" && name.text != ".weights") {
+            fail(name.col, "unknown directive '" + name.text + "' (expects .host or .weights)");
+        }
+        if (tokens.size() != 2) {
+            fail(name.col, name.text + " takes one address");
+        }
+
+        const std::int64_t address = number(tokens[1]);
+        if (address < 0 || address > 0xFFFFFFFF) {
+            fail(tokens[1].col, name.text + " address " + tokens[1].text + " is out of range");
+        }
+
+        DataBlock block;
+        if (name.text == ".host") {
+            block.addr = static_cast<u64>(address) * v1::kMxuDim;       // host memory is addressed in rows
+            prog_.host.push_back(block);
+            block_ = &prog_.host.back();
+        } else {
+            block.addr = static_cast<u64>(address) * v1::kTileBytes;    // Weight Memory is addressed in tiles
+            prog_.weights.push_back(block);
+            block_ = &prog_.weights.back();
+        }
+    }
+
+    // A line of int8 values, appended to the open block.
+    void data(const std::vector<Token>& tokens) {
+        if (block_ == nullptr) {
+            fail(tokens[0].col, "data outside a .host or .weights block");
+        }
+
+        for (const Token& token : tokens) {
+            const std::int64_t value = number(token);
+
+            bool fits = false;
+            if (is_hex(token.text)) {
+                fits = value <= 0xFF;
+            } else {
+                fits = value >= -128 && value <= 127;
+            }
+            if (!fits) {
+                fail(token.col, "value " + token.text + " is not an int8 (-128..127 or 0x00..0xFF)");
+            }
+
+            // Hex is a bit pattern: 0xFF is the byte 11111111, which as an int8 is -1.
+            const u8 bits = static_cast<u8>(value);
+            block_->bytes.push_back(static_cast<i8>(bits));
+        }
+    }
+
+    Op find_op(const Token& mnemonic) const {
+        for (Op op : kAllOps) {
+            if (mnemonic.text == op_name(op)) {
+                return op;
+            }
+        }
+        fail(mnemonic.col, "unknown instruction '" + mnemonic.text + "'");
+    }
+
+    // `Op key=value key=value ...`
+    void instruction(const std::vector<Token>& tokens) {
+        block_ = nullptr;   // an instruction ends any open data block
+
+        const Token& mnemonic = tokens[0];
+        Instr in;
+        in.op = find_op(mnemonic);
+
+        const std::vector<std::string> keys = operand_keys(in.op);
+        std::vector<std::string> given;
+
+        for (std::size_t i = 1; i < tokens.size(); ++i) {
+            const Token& token = tokens[i];
+
+            const std::size_t equals = token.text.find('=');
+            if (equals == std::string::npos) {
+                fail(token.col, "expected key=value, got '" + token.text + "'");
+            }
+            const std::string key = token.text.substr(0, equals);
+
+            if (!contains(keys, key)) {
+                fail(token.col, mnemonic.text + " has no operand '" + key + "'" + expects_hint(keys));
+            }
+            if (contains(given, key)) {
+                fail(token.col, "operand '" + key + "' given twice");
+            }
+            given.push_back(key);
+
+            Token value_token;
+            value_token.text = token.text.substr(equals + 1);
+            value_token.col  = token.col + static_cast<u32>(equals) + 1;   // errors point at the value, not the key
+
+            const std::int64_t value = number(value_token);
+            if (value < 0 || value > 0xFFFFFFFF) {
+                fail(token.col, key + "=" + value_token.text + " is out of range");
+            }
+            set_operand(in, key, static_cast<u32>(value));
+        }
+
+        for (const std::string& key : keys) {
+            if (!contains(given, key)) {
+                fail(mnemonic.col, mnemonic.text + " is missing operand '" + key + "'");
+            }
+        }
+
+        // encode() knows each field's width and throws if a value does not fit.
+        try {
+            prog_.code.push_back(encode(in));
+        } catch (const std::out_of_range& e) {
+            fail(mnemonic.col, e.what());
+        }
+    }
+
+    static std::string expects_hint(const std::vector<std::string>& keys) {
+        if (keys.empty()) {
+            return " (it takes none)";
+        }
+        std::string hint = " (expects ";
+        for (std::size_t k = 0; k < keys.size(); ++k) {
+            if (k > 0) {
+                hint += ", ";
+            }
+            hint += keys[k];
+        }
+        return hint + ")";
+    }
+};
+
+}  // namespace
+
+Program assemble(const std::string& source, const std::string& name) {
+    Assembler assembler(name);
+    return assembler.run(source);
+}
+
+Program assemble_file(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) {
+        throw AsmError(path + ": error: cannot open file");
+    }
+    std::ostringstream text;
+    text << file.rdbuf();
+    return assemble(text.str(), path);
+}
