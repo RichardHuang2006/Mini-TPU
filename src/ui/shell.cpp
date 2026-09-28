@@ -1,0 +1,311 @@
+/// Command parsing, and the text each command prints.
+
+#include "ui/shell.h"
+
+#include <charconv>
+#include <cstdio>
+#include <sstream>
+#include <stdexcept>
+
+#include "isa/asm.h"
+
+namespace {
+
+const char* kCommandList = "load FILE, run [N], step [N|-N], TARGET [hex|dec], quit";
+const char* kTargetList  = "pc, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
+
+std::vector<std::string> split_words(const std::string& line) {
+    std::istringstream stream(line);
+    std::vector<std::string> words;
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    return words;
+}
+
+// Decimal, or hex with a 0x prefix; `what` names the number in the error message.
+u64 parse_number(const std::string& text, const std::string& what) {
+    const char* first = text.data();
+    const char* last  = text.data() + text.size();
+    int base = 10;
+
+    const bool has_hex_prefix = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+    if (has_hex_prefix) {
+        first += 2;
+        base = 16;
+    }
+
+    u64 value = 0;
+    const std::from_chars_result result = std::from_chars(first, last, value, base);
+    const bool parsed      = result.ec == std::errc();
+    const bool used_it_all = result.ptr == last;
+    if (!parsed || !used_it_all) {
+        throw std::invalid_argument(what + " '" + text + "' is not a number");
+    }
+    return value;
+}
+
+std::string hex(u64 value) {
+    char text[24];
+    std::snprintf(text, sizeof text, "0x%llX", static_cast<unsigned long long>(value));
+    return text;
+}
+
+// A request to look at memory: NAME[ROW] shows 16 columns of one row, NAME[ROW:RxC] a block.
+struct View {
+    std::string memory;
+    u64         row  = 0;
+    u64         rows = 1;
+    u64         cols = 16;
+};
+
+View parse_view(const std::string& text) {
+    const std::size_t open = text.find('[');
+    const bool has_close = !text.empty() && text.back() == ']';
+    if (open == std::string::npos || !has_close) {
+        throw std::invalid_argument("unknown command '" + text + "'; commands: " + kCommandList);
+    }
+
+    View view;
+    view.memory = text.substr(0, open);
+    const std::string inside = text.substr(open + 1, text.size() - open - 2);
+
+    const std::size_t colon = inside.find(':');
+    if (colon == std::string::npos) {
+        view.row = parse_number(inside, "row");
+        return view;
+    }
+    view.row = parse_number(inside.substr(0, colon), "row");
+
+    // The shape is ROWSxCOLS; the last x splits it, so a hex row count like 0x4x16 still works.
+    const std::string shape = inside.substr(colon + 1);
+    const std::size_t x = shape.rfind('x');
+    if (x == std::string::npos) {
+        throw std::invalid_argument("expected ROWSxCOLS after ':', got '" + shape + "'");
+    }
+    view.rows = parse_number(shape.substr(0, x), "rows");
+    view.cols = parse_number(shape.substr(x + 1), "columns");
+
+    const bool rows_ok = view.rows >= 1;
+    const bool cols_ok = view.cols >= 1 && view.cols <= 256;
+    if (!rows_ok || !cols_ok) {
+        throw std::invalid_argument("a view is 1 or more rows of 1 to 256 columns");
+    }
+    return view;
+}
+
+std::string format_values(const std::vector<i8>& values, bool as_hex) {
+    std::string line;
+    for (i8 value : values) {
+        char cell[8];
+        if (as_hex) {
+            const unsigned bits = static_cast<u8>(value);
+            std::snprintf(cell, sizeof cell, " %02X", bits);
+        } else {
+            std::snprintf(cell, sizeof cell, "%5d", static_cast<int>(value));
+        }
+        line += cell;
+    }
+    return line;
+}
+
+// The first `cols` bytes of one 256-byte row of the named memory.
+std::vector<i8> read_row(const Tpu& tpu, const std::string& memory, u64 row, u64 cols) {
+    std::vector<i8> values(cols, 0);
+
+    if (memory == "ub") {
+        if (row > 0xFFFFFFFF) {
+            throw std::out_of_range("ub row " + std::to_string(row) + " is out of range");
+        }
+        const i8* bytes = tpu.ub().row(static_cast<u32>(row));
+        for (u64 col = 0; col < cols; ++col) {
+            values[col] = bytes[col];
+        }
+    } else if (memory == "host") {
+        tpu.host().read(row * UnifiedBuffer::kRowBytes, values.data(), cols);
+    } else if (memory == "wmem") {
+        tpu.wmem().read(row * UnifiedBuffer::kRowBytes, values.data(), cols);
+    } else {
+        throw std::invalid_argument("unknown target '" + memory + "' (try " + kTargetList + ")");
+    }
+    return values;
+}
+
+}  // namespace
+
+std::string machine_state(const Tpu& tpu) {
+    if (tpu.halted()) {
+        return "halted";
+    }
+    if (tpu.cycle() == 0) {
+        return "ready";
+    }
+    if (tpu.stall() == Stall::None) {
+        return "running";
+    }
+    return std::string("stalled: ") + stall_name(tpu.stall());
+}
+
+std::string status_line(const Tpu& tpu) {
+    return "cycle " + std::to_string(tpu.cycle()) + ", pc " + std::to_string(tpu.pc()) + ", " + machine_state(tpu);
+}
+
+Shell::Shell(Tpu& tpu) : tpu_(tpu) {}
+
+std::string Shell::execute(const std::string& line) {
+    const std::vector<std::string> words = split_words(line);
+    if (words.empty()) {
+        return "";
+    }
+
+    try {
+        const std::string& command = words[0];
+        if (command == "quit") {
+            quit_ = true;
+            return "";
+        }
+        if (command == "load") {
+            return load(words);
+        }
+        if (command == "run") {
+            return run(words);
+        }
+        if (command == "step") {
+            return step(words);
+        }
+        return show(words);
+    } catch (const AsmError& e) {
+        return e.what();   // already reads "file:line:col: error: ..."
+    } catch (const std::exception& e) {
+        return std::string("error: ") + e.what();
+    }
+}
+
+bool Shell::quit_requested() const {
+    return quit_;
+}
+
+const std::string& Shell::loaded_file() const {
+    return loaded_file_;
+}
+
+std::string Shell::load(const std::vector<std::string>& words) {
+    if (words.size() != 2) {
+        throw std::invalid_argument("usage: load FILE");
+    }
+    const std::string& path = words[1];
+    const Program program = assemble_file(path);
+    tpu_.load(program);
+    loaded_file_ = path;
+
+    u64 host_bytes = 0;
+    for (const DataBlock& block : program.host) {
+        host_bytes += block.bytes.size();
+    }
+    u64 weight_bytes = 0;
+    for (const DataBlock& block : program.weights) {
+        weight_bytes += block.bytes.size();
+    }
+
+    return "loaded " + path + ": " + std::to_string(program.code.size()) + " instructions, " +
+           std::to_string(host_bytes) + " host bytes, " + std::to_string(weight_bytes) + " weight bytes";
+}
+
+// `run` goes to Halt; `run N` advances N cycles.
+std::string Shell::run(const std::vector<std::string>& words) {
+    require_program();
+    if (words.size() == 1) {
+        tpu_.run_to_halt();
+    } else if (words.size() == 2) {
+        tpu_.run(parse_number(words[1], "cycle count"));
+    } else {
+        throw std::invalid_argument("usage: run [N]");
+    }
+    return status_line(tpu_);
+}
+
+// `step` issues one instruction, `step N` issues N, and `step -N` undoes the last N.
+std::string Shell::step(const std::vector<std::string>& words) {
+    require_program();
+    if (words.size() > 2) {
+        throw std::invalid_argument("usage: step [N|-N]");
+    }
+
+    u64 count = 1;
+    bool backwards = false;
+    if (words.size() == 2) {
+        std::string amount = words[1];
+        if (!amount.empty() && amount[0] == '-') {
+            backwards = true;
+            amount = amount.substr(1);
+        }
+        count = parse_number(amount, "step count");
+    }
+
+    if (backwards) {
+        tpu_.step_back(count);
+    } else {
+        tpu_.step(count);
+    }
+    return status_line(tpu_);
+}
+
+std::string Shell::show(const std::vector<std::string>& words) const {
+    if (words.size() > 2) {
+        throw std::invalid_argument("usage: TARGET [hex|dec]");
+    }
+
+    bool as_hex = false;
+    if (words.size() == 2) {
+        if (words[1] == "hex") {
+            as_hex = true;
+        } else if (words[1] != "dec") {
+            throw std::invalid_argument("format must be hex or dec, got '" + words[1] + "'");
+        }
+    }
+
+    if (words[0] == "pc") {
+        return show_pc();
+    }
+
+    const View view = parse_view(words[0]);
+
+    // Labels are padded to the widest one, so the columns line up.
+    std::vector<std::string> labels;
+    std::size_t label_width = 0;
+    for (u64 i = 0; i < view.rows; ++i) {
+        const std::string label = hex(view.row + i) + ":";
+        labels.push_back(label);
+        if (label.size() > label_width) {
+            label_width = label.size();
+        }
+    }
+
+    std::string text;
+    for (u64 i = 0; i < view.rows; ++i) {
+        const std::vector<i8> values = read_row(tpu_, view.memory, view.row + i, view.cols);
+        std::string label = labels[i];
+        label.resize(label_width, ' ');
+        if (i > 0) {
+            text += "\n";
+        }
+        text += label + format_values(values, as_hex);
+    }
+    return text;
+}
+
+std::string Shell::show_pc() const {
+    const std::vector<InstrBytes>& code = tpu_.program().code;
+    const u32 pc = tpu_.pc();
+    if (pc >= code.size()) {
+        return "pc " + std::to_string(pc) + " (no instruction there)";
+    }
+    return "pc " + std::to_string(pc) + ": " + disasm(decode(code[pc]));
+}
+
+void Shell::require_program() const {
+    if (tpu_.program().code.empty()) {
+        throw std::invalid_argument("no program loaded; use load FILE");
+    }
+}
