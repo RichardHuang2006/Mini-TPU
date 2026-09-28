@@ -40,6 +40,7 @@ target_link_libraries(tpu_tests PRIVATE tpu_core)
 # `cmake --build build --target lint`: the /// header rule on every file, then pinned clang-tidy over every .cpp.
 file(GLOB_RECURSE LINT_SRC CONFIGURE_DEPENDS src/*.cpp tests/*.cpp tools/*.cpp)
 file(GLOB_RECURSE LINT_HDR CONFIGURE_DEPENDS src/*.h tests/*.h)
+set(LINT_HEADER_FILTER "${CMAKE_SOURCE_DIR}/(src|tests|tools)/")   # headers clang-tidy reports on
 set(LINT_ARGS)
 if(APPLE)
   # The pip-built clang-tidy does not know where the macOS SDK headers are.
@@ -50,7 +51,7 @@ endif()
 add_custom_target(lint
   COMMAND check_headers ${LINT_HDR} ${LINT_SRC}
   COMMAND uvx clang-tidy@19.1.0.1 --quiet -p ${CMAKE_BINARY_DIR} ${LINT_ARGS}
-          --header-filter=${CMAKE_SOURCE_DIR}/\(src|tests|tools\)/ ${LINT_SRC}
+          --header-filter=${LINT_HEADER_FILTER} ${LINT_SRC}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   VERBATIM)
 add_dependencies(lint check_headers)

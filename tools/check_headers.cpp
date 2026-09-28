@@ -7,25 +7,54 @@
 namespace {
 
 struct Finding {
-    int         line = 0;   // 0: the file is clean
-    std::string what;
+    int         line = 0;   // 0 means the file is clean
+    std::string message;
 };
 
-bool blank(const std::string& s) { return s.find_first_not_of(" \t\r") == std::string::npos; }
+bool is_blank(const std::string& line) {
+    return line.find_first_not_of(" \t\r") == std::string::npos;
+}
+
+bool starts_with(const std::string& text, const std::string& prefix) {
+    return text.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool is_doc_line(const std::string& line) {
+    if (!starts_with(line, "/// ")) {
+        return false;
+    }
+    const std::string description = line.substr(4);
+    return !is_blank(description);
+}
+
+bool is_comment(const std::string& line) {
+    const std::size_t first_char = line.find_first_not_of(" \t");
+    const std::string trimmed = line.substr(first_char);
+    return starts_with(trimmed, "//") || starts_with(trimmed, "/*");
+}
 
 Finding check(const char* path) {
-    std::ifstream in(path);
-    if (!in) return {1, "cannot open file"};
+    std::ifstream file(path);
+    if (!file) {
+        return {1, "cannot open file"};
+    }
 
     std::string line;
-    if (!std::getline(in, line) || line.rfind("/// ", 0) != 0 || blank(line.substr(4)))
+    const bool has_first_line = static_cast<bool>(std::getline(file, line));
+    if (!has_first_line || !is_doc_line(line)) {
         return {1, "the first line must be a `/// ...` doc line"};
+    }
 
-    for (int n = 2; std::getline(in, line); ++n) {
-        if (blank(line)) continue;
-        const std::string code = line.substr(line.find_first_not_of(" \t"));
-        if (code.rfind("//", 0) == 0 || code.rfind("/*", 0) == 0)
-            return {n, "only the `///` line may be a comment above the code"};
+    // Everything between the doc line and the first line of code must be blank.
+    int number = 1;
+    while (std::getline(file, line)) {
+        number = number + 1;
+        if (is_blank(line)) {
+            continue;
+        }
+        if (is_comment(line)) {
+            return {number, "only the `///` line may be a comment above the code"};
+        }
         break;
     }
     return {};
@@ -34,12 +63,18 @@ Finding check(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    int bad = 0;
+    int bad_files = 0;
     for (int i = 1; i < argc; ++i) {
-        const Finding f = check(argv[i]);
-        if (f.line == 0) continue;
-        std::printf("%s:%d: error: %s\n", argv[i], f.line, f.what.c_str());
-        ++bad;
+        const Finding finding = check(argv[i]);
+        if (finding.line == 0) {
+            continue;
+        }
+        std::printf("%s:%d: error: %s\n", argv[i], finding.line, finding.message.c_str());
+        bad_files = bad_files + 1;
     }
-    return bad == 0 ? 0 : 1;
+
+    if (bad_files > 0) {
+        return 1;
+    }
+    return 0;
 }

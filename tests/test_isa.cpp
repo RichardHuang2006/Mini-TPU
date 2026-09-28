@@ -16,47 +16,65 @@ Instr host_op(Op op, u32 ub_row, u32 host_row, u32 rows) {
     return in;
 }
 
+Instr no_operands(Op op) {
+    Instr in;
+    in.op = op;
+    return in;
+}
+
 bool same(const Instr& a, const Instr& b) {
-    return a.op == b.op && a.ub_row == b.ub_row && a.host_row == b.host_row && a.rows == b.rows;
+    const bool same_op     = a.op == b.op;
+    const bool same_fields = a.ub_row == b.ub_row && a.host_row == b.host_row && a.rows == b.rows;
+    return same_op && same_fields;
 }
 
 }  // namespace
 
 TEST(isa_host_transfer_byte_layout) {
-    const InstrBytes b = encode(host_op(Op::ReadHostMemory, 0x030201, 0x07060504, 0x0908));
-    const InstrBytes want = {0x10, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
-    CHECK(b == want);
+    // Each field's bytes are numbered so their positions are easy to see: ub 01 02 03, host 04..07, rows 08 09.
+    const Instr in = host_op(Op::ReadHostMemory, 0x030201, 0x07060504, 0x0908);
+    const InstrBytes expected = {0x10, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
+    CHECK(encode(in) == expected);
 }
 
 TEST(isa_round_trips_at_field_limits) {
     for (Op op : {Op::ReadHostMemory, Op::WriteHostMemory}) {
-        const Instr max = host_op(op, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF);
-        const Instr min = host_op(op, 0, 0, 0);
-        CHECK(same(decode(encode(max)), max));
-        CHECK(same(decode(encode(min)), min));
+        const Instr largest  = host_op(op, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF);
+        const Instr smallest = host_op(op, 0, 0, 0);
+        CHECK(same(decode(encode(largest)), largest));
+        CHECK(same(decode(encode(smallest)), smallest));
     }
+
     for (Op op : {Op::Nop, Op::Halt, Op::Sync}) {
-        Instr in;
-        in.op = op;
+        const Instr in = no_operands(op);
         CHECK(same(decode(encode(in)), in));
-        CHECK(encode(in) == InstrBytes{static_cast<u8>(op)});   // every other byte zero
+
+        InstrBytes only_opcode{};   // the opcode, then eleven zero bytes
+        only_opcode[0] = static_cast<u8>(op);
+        CHECK(encode(in) == only_opcode);
     }
 }
 
 TEST(isa_fields_that_do_not_fit_throw) {
-    CHECK_THROWS(encode(host_op(Op::ReadHostMemory, 1u << 24, 0, 1)));
-    CHECK_THROWS(encode(host_op(Op::WriteHostMemory, 0, 0, 1u << 16)));
+    const u32 ub_needs_25_bits   = 1u << 24;
+    const u32 rows_needs_17_bits = 1u << 16;
+    CHECK_THROWS(encode(host_op(Op::ReadHostMemory, ub_needs_25_bits, 0, 1)));
+    CHECK_THROWS(encode(host_op(Op::WriteHostMemory, 0, 0, rows_needs_17_bits)));
 }
 
 TEST(isa_unknown_opcode_throws) {
-    CHECK_THROWS(decode(InstrBytes{0x03}));
-    CHECK_THROWS(decode(InstrBytes{0xFF}));
+    InstrBytes bytes{};
+    bytes[0] = 0x03;
+    CHECK_THROWS(decode(bytes));
+    bytes[0] = 0xFF;
+    CHECK_THROWS(decode(bytes));
 }
 
 TEST(isa_disassembly) {
-    CHECK_EQ(disasm(host_op(Op::ReadHostMemory, 0x10, 0x200, 4)), std::string("Read_Host_Memory host=0x200 ub=0x10 rows=4"));
-    CHECK_EQ(disasm(host_op(Op::WriteHostMemory, 0x10, 0x200, 4)), std::string("Write_Host_Memory ub=0x10 host=0x200 rows=4"));
-    Instr halt;
-    halt.op = Op::Halt;
-    CHECK_EQ(disasm(halt), std::string("Halt"));
+    const Instr read  = host_op(Op::ReadHostMemory, 0x10, 0x200, 4);
+    const Instr write = host_op(Op::WriteHostMemory, 0x10, 0x200, 4);
+
+    CHECK_EQ(disasm(read), std::string("Read_Host_Memory host=0x200 ub=0x10 rows=4"));
+    CHECK_EQ(disasm(write), std::string("Write_Host_Memory ub=0x10 host=0x200 rows=4"));
+    CHECK_EQ(disasm(no_operands(Op::Halt)), std::string("Halt"));
 }
