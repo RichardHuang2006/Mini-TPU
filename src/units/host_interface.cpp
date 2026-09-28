@@ -71,6 +71,14 @@ void HostInterface::tick() {
     bytes_done_ = bytes_done_ + piece;
 }
 
+void HostInterface::reset() {
+    direction_   = Direction::HostToUb;
+    host_addr_   = 0;
+    ub_addr_     = 0;
+    bytes_total_ = 0;
+    bytes_done_  = 0;
+}
+
 bool HostInterface::busy() const {
     return bytes_done_ < bytes_total_;
 }

@@ -20,6 +20,9 @@ public:
     // One cycle: moves the next 22 bytes (or fewer, at the end) of the running transfer.
     void tick();
 
+    // Drops any running transfer, as after a machine reset.
+    void reset();
+
     bool busy() const;
     u64  bytes_done() const;
     u64  bytes_total() const;

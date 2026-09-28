@@ -1,0 +1,69 @@
+/// The TPUv1 machine: its memories and units, and the in-order issue that drives them one cycle per tick().
+
+#pragma once
+
+#include <string>
+
+#include "common/stats.h"
+#include "isa/isa.h"
+#include "mem/dram.h"
+#include "mem/unified_buffer.h"
+#include "units/host_interface.h"
+
+class Tpu {
+public:
+    static constexpr u64 kHostMemBytes = 4 * kGiB;   // pages are allocated only when written
+
+    Tpu();
+
+    // The units hold references to the memories, so a Tpu is never copied.
+    Tpu(const Tpu&) = delete;
+    Tpu& operator=(const Tpu&) = delete;
+
+    // Resets the machine, then places the program's code and its host and Weight Memory data.
+    void load(const Program& program);
+
+    // One cycle: issue the instruction at the PC if it can go, then advance every unit.
+    void tick();
+
+    // Advances up to n cycles, stopping early at Halt.
+    void run(u64 cycles);
+
+    void run_to_halt();
+
+    // Advances until n more instructions have issued, stopping early at Halt.
+    void step(u64 instructions);
+
+    // Undoes the last n instruction issues: reloads the program and replays up to that point.
+    void step_back(u64 instructions);
+
+    bool         halted() const;
+    Cycle        cycle() const;
+    u32          pc() const;
+    u64          issued() const;
+    Stall        stall() const;   // why the last cycle issued nothing; Stall::None if something issued
+    const Stats& stats() const;
+
+    const Program&       program() const;
+    const UnifiedBuffer& ub() const;
+    const Dram&          host() const;
+    const Dram&          wmem() const;
+    const HostInterface& host_interface() const;
+
+private:
+    Program       program_;
+    UnifiedBuffer ub_;
+    Dram          host_;
+    Dram          wmem_;
+    HostInterface host_interface_;
+
+    u32   pc_     = 0;
+    bool  halted_ = false;
+    Stall stall_  = Stall::None;
+    Stats stats_;
+
+    bool  units_idle() const;
+    Stall why_blocked(const Instr& in) const;
+    void  issue(const Instr& in);
+    [[noreturn]] void fail_at_pc(const std::string& what) const;
+};
