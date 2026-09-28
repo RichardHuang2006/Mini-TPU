@@ -15,6 +15,10 @@ constexpr u32 kHostRowWidth = 4;
 constexpr u32 kRowsAt       = 10;
 constexpr u32 kRowsWidth    = 2;
 
+// Read_Weights: the tile number in bytes 3-6.
+constexpr u32 kTileAt       = 3;
+constexpr u32 kTileWidth    = 4;
+
 // Writes value into `width` bytes starting at `at`, lowest byte first (little-endian).
 void put(InstrBytes& bytes, u32 at, u32 width, u64 value, const char* field) {
     const u32 bits = 8 * width;
@@ -65,6 +69,8 @@ const char* op_name(Op op) {
             return "Read_Host_Memory";
         case Op::WriteHostMemory:
             return "Write_Host_Memory";
+        case Op::ReadWeights:
+            return "Read_Weights";
     }
     return "?";
 }
@@ -77,6 +83,9 @@ InstrBytes encode(const Instr& in) {
         put(bytes, kUbRowAt, kUbRowWidth, in.ub_row, "ub");
         put(bytes, kHostRowAt, kHostRowWidth, in.host_row, "host");
         put(bytes, kRowsAt, kRowsWidth, in.rows, "rows");
+    }
+    if (in.op == Op::ReadWeights) {
+        put(bytes, kTileAt, kTileWidth, in.tile, "tile");
     }
     return bytes;
 }
@@ -96,6 +105,9 @@ Instr decode(const InstrBytes& bytes) {
             in.host_row = get(bytes, kHostRowAt, kHostRowWidth);
             in.rows     = get(bytes, kRowsAt, kRowsWidth);
             break;
+        case Op::ReadWeights:
+            in.tile = get(bytes, kTileAt, kTileWidth);
+            break;
         default:
             throw std::invalid_argument("unknown opcode " + hex(bytes[0]));
     }
@@ -114,6 +126,9 @@ std::string disasm(const Instr& in) {
     }
     if (in.op == Op::WriteHostMemory) {
         return name + " " + ub + " " + host + " " + rows;
+    }
+    if (in.op == Op::ReadWeights) {
+        return name + " tile=" + hex(in.tile);
     }
     return name;
 }

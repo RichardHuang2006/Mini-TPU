@@ -133,6 +133,41 @@ TEST(tpu_step_back_replays_to_the_same_state) {
     CHECK_EQ(tpu.cycle(), Cycle{0});
 }
 
+TEST(tpu_read_weights_issues_before_the_tile_arrives) {
+    Tpu tpu;
+    tpu.load(assemble("Read_Weights tile=0\nHalt\n"));
+
+    tpu.step(1);   // decoupled access: the PC moves on at once
+    CHECK_EQ(tpu.cycle(), Cycle{1});
+    CHECK_EQ(tpu.pc(), u32{1});
+    CHECK(tpu.weight_fifo().fetching());
+
+    tpu.run_to_halt();   // Halt waits for the 1366-cycle fetch
+    CHECK_EQ(tpu.cycle(), Cycle{1367});
+    CHECK_EQ(tpu.stats().stalled(Stall::WaitForIdle), u64{1365});
+    CHECK(tpu.weight_fifo().front_ready());
+}
+
+TEST(tpu_fifth_read_weights_deadlocks_without_a_consumer) {
+    const char* source =
+        "Read_Weights tile=0\n"
+        "Read_Weights tile=1\n"
+        "Read_Weights tile=2\n"
+        "Read_Weights tile=3\n"
+        "Read_Weights tile=4\n"
+        "Halt\n";
+    Tpu tpu;
+    tpu.load(assemble(source));
+
+    tpu.run(100);
+    CHECK(tpu.stall() == Stall::WeightFifoFull);
+
+    // Once all four tiles have arrived nothing can free a slot, so the machine reports it instead of spinning.
+    CHECK_EQ(error_of_run(tpu), std::string("pc 4: Read_Weights tile=0x4: deadlock: weight FIFO full, but no unit is working"));
+    CHECK_EQ(tpu.cycle(), Cycle{4 * 1366});
+    CHECK_EQ(tpu.stats().stalled(Stall::WeightFifoFull), u64{4 * 1366 - 4});
+}
+
 TEST(tpu_errors_name_the_pc_and_leave_the_cycle_alone) {
     Tpu tpu;
     tpu.load(assemble("Read_Host_Memory host=0 ub=0x20000 rows=1\nHalt\n"));   // UB row 131072 is past the last
@@ -151,4 +186,7 @@ TEST(tpu_errors_name_the_pc_and_leave_the_cycle_alone) {
     unknown.code.push_back(bad);
     tpu.load(unknown);
     CHECK_EQ(error_of_run(tpu), std::string("pc 0: unknown opcode 0x3"));
+
+    tpu.load(assemble("Read_Weights tile=0x20000\nHalt\n"));
+    CHECK_EQ(error_of_run(tpu), std::string("pc 0: Read_Weights tile=0x20000: weight tile 131072 is past the last tile 131071"));
 }

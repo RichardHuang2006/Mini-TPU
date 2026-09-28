@@ -18,6 +18,7 @@ enum class Op : u8 {
     Sync            = 0x02,   // wait until every unit is idle
     ReadHostMemory  = 0x10,   // host memory -> Unified Buffer
     WriteHostMemory = 0x11,   // Unified Buffer -> host memory
+    ReadWeights     = 0x20,   // Weight Memory tile -> Weight FIFO
 };
 
 // Every opcode, so the assembler can look names up instead of keeping its own list.
@@ -27,6 +28,7 @@ inline constexpr Op kAllOps[] = {
     Op::Sync,
     Op::ReadHostMemory,
     Op::WriteHostMemory,
+    Op::ReadWeights,
 };
 
 // One instruction with its fields unpacked into plain numbers.
@@ -35,6 +37,7 @@ struct Instr {
     u32 ub_row   = 0;   // 24 bits: Unified Buffer row
     u32 host_row = 0;   // 32 bits: host memory is addressed in 256-byte rows
     u32 rows     = 0;   // 16 bits: rows moved
+    u32 tile     = 0;   // 32 bits: Weight Memory tile (64 KiB each)
 };
 
 // Bytes to place in a DRAM before the program runs.

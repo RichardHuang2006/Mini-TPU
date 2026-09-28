@@ -37,6 +37,18 @@ TEST(isa_host_transfer_byte_layout) {
     CHECK(encode(in) == expected);
 }
 
+TEST(isa_read_weights_byte_layout) {
+    Instr in;
+    in.op   = Op::ReadWeights;
+    in.tile = 0x04030201;
+    const InstrBytes expected = {0x20, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0};
+    CHECK(encode(in) == expected);
+
+    in.tile = 0xFFFFFFFF;
+    CHECK_EQ(decode(encode(in)).tile, u32{0xFFFFFFFF});
+    CHECK_EQ(disasm(in), std::string("Read_Weights tile=0xFFFFFFFF"));
+}
+
 TEST(isa_round_trips_at_field_limits) {
     for (Op op : {Op::ReadHostMemory, Op::WriteHostMemory}) {
         const Instr largest  = host_op(op, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF);

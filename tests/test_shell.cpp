@@ -75,12 +75,29 @@ TEST(shell_errors_are_text) {
     CHECK_EQ(shell.execute("foo"),
              std::string("error: unknown command 'foo'; commands: load FILE, run [N], step [N|-N], TARGET [hex|dec], quit"));
     CHECK_EQ(shell.execute("mem[0]"),
-             std::string("error: unknown target 'mem' (try pc, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
+             std::string("error: unknown target 'mem' (try pc, wfifo, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
     CHECK_EQ(shell.execute("ub[0:4]"), std::string("error: expected ROWSxCOLS after ':', got '4'"));
     CHECK_EQ(shell.execute("ub[0:1x300]"), std::string("error: a view is 1 or more rows of 1 to 256 columns"));
     CHECK_EQ(shell.execute("ub[0x20000]"), std::string("error: ub row 131072 is past the last row 98303"));
     CHECK_EQ(shell.execute("ub[0] oct"), std::string("error: format must be hex or dec, got 'oct'"));
     CHECK_EQ(shell.execute("   "), std::string(""));
+}
+
+TEST(shell_weight_fifo_view) {
+    Tpu tpu;
+    Shell shell(tpu);
+    shell.execute("load " + write_temp_program("mini_tpu_shell_fifo.s", "Read_Weights tile=0\nRead_Weights tile=1\nHalt\n"));
+    CHECK_EQ(shell.execute("wfifo"), std::string("weight FIFO: 0 of 4 slots"));
+
+    shell.execute("step 2");   // both issue on cycles 0 and 1; tile 0 has had two 48-byte cycles
+    const std::string expected =
+        "weight FIFO: 2 of 4 slots\n"
+        "slot 0: tile 0x0, 96 of 65536 bytes\n"
+        "slot 1: tile 0x1, 0 of 65536 bytes";
+    CHECK_EQ(shell.execute("wfifo"), expected);
+
+    shell.execute("run");
+    CHECK_EQ(shell.execute("wfifo"), std::string("weight FIFO: 2 of 4 slots\nslot 0: tile 0x0, ready\nslot 1: tile 0x1, ready"));
 }
 
 TEST(shell_quit) {

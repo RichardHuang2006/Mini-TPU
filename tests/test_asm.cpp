@@ -18,6 +18,13 @@ Instr host_op(Op op, u32 ub_row, u32 host_row, u32 rows) {
     return in;
 }
 
+Instr read_weights(u32 tile) {
+    Instr in;
+    in.op   = Op::ReadWeights;
+    in.tile = tile;
+    return in;
+}
+
 Instr no_operands(Op op) {
     Instr in;
     in.op = op;
@@ -85,6 +92,7 @@ TEST(asm_reads_what_disasm_prints) {
         no_operands(Op::Nop),
         no_operands(Op::Halt),
         no_operands(Op::Sync),
+        read_weights(0x5),
     };
 
     for (const Instr& in : samples) {
@@ -121,6 +129,8 @@ TEST(asm_errors_name_line_and_column) {
              std::string("t.s:3:1: error: data outside a .host or .weights block"));
     CHECK_EQ(error_of(".data 0"),
              std::string("t.s:1:1: error: unknown directive '.data' (expects .host or .weights)"));
+    CHECK_EQ(error_of("Read_Weights"),
+             std::string("t.s:1:1: error: Read_Weights is missing operand 'tile'"));
     CHECK_EQ(error_of(".host"),
              std::string("t.s:1:1: error: .host takes one address"));
 }

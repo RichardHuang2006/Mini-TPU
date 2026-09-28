@@ -13,6 +13,12 @@ std::string status_line(const Tpu& tpu);
 // What the last cycle did: "ready", "running", "halted" or "stalled: <cause>".
 std::string machine_state(const Tpu& tpu);
 
+// How full the Weight FIFO is: "empty" or e.g. "2 of 4 tiles".
+std::string fifo_occupancy(const WeightFifo& fifo);
+
+// The tile arriving now, e.g. "tile 0x1, 1200 of 65536 bytes", or "idle".
+std::string fifo_fetch(const WeightFifo& fifo);
+
 class Shell {
 public:
     explicit Shell(Tpu& tpu);
@@ -35,5 +41,6 @@ private:
     std::string step(const std::vector<std::string>& words);
     std::string show(const std::vector<std::string>& words) const;
     std::string show_pc() const;
+    std::string show_fifo() const;
     void        require_program() const;
 };

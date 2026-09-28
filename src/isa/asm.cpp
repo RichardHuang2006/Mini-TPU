@@ -91,6 +91,9 @@ std::vector<std::string> operand_keys(Op op) {
     if (op == Op::ReadHostMemory || op == Op::WriteHostMemory) {
         return {"host", "ub", "rows"};
     }
+    if (op == Op::ReadWeights) {
+        return {"tile"};
+    }
     return {};
 }
 
@@ -101,6 +104,8 @@ void set_operand(Instr& in, const std::string& key, u32 value) {
         in.ub_row = value;
     } else if (key == "rows") {
         in.rows = value;
+    } else if (key == "tile") {
+        in.tile = value;
     }
 }
 

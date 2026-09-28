@@ -12,7 +12,7 @@
 namespace {
 
 const char* kCommandList = "load FILE, run [N], step [N|-N], TARGET [hex|dec], quit";
-const char* kTargetList  = "pc, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
+const char* kTargetList  = "pc, wfifo, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
 
 std::vector<std::string> split_words(const std::string& line) {
     std::istringstream stream(line);
@@ -147,6 +147,25 @@ std::string machine_state(const Tpu& tpu) {
     return std::string("stalled: ") + stall_name(tpu.stall());
 }
 
+std::string fifo_occupancy(const WeightFifo& fifo) {
+    const std::size_t count = fifo.tiles().size();
+    if (count == 0) {
+        return "empty";
+    }
+    return std::to_string(count) + " of " + std::to_string(WeightFifo::kSlots) + " tiles";
+}
+
+std::string fifo_fetch(const WeightFifo& fifo) {
+    // Tiles arrive in order, so the first one not ready is the one arriving now.
+    for (const FifoTile& entry : fifo.tiles()) {
+        if (!entry.ready()) {
+            const std::string progress = std::to_string(entry.bytes_arrived) + " of " + std::to_string(v1::kTileBytes);
+            return "tile " + hex(entry.tile) + ", " + progress + " bytes";
+        }
+    }
+    return "idle";
+}
+
 std::string status_line(const Tpu& tpu) {
     return "cycle " + std::to_string(tpu.cycle()) + ", pc " + std::to_string(tpu.pc()) + ", " + machine_state(tpu);
 }
@@ -268,6 +287,9 @@ std::string Shell::show(const std::vector<std::string>& words) const {
     if (words[0] == "pc") {
         return show_pc();
     }
+    if (words[0] == "wfifo") {
+        return show_fifo();
+    }
 
     const View view = parse_view(words[0]);
 
@@ -302,6 +324,22 @@ std::string Shell::show_pc() const {
         return "pc " + std::to_string(pc) + " (no instruction there)";
     }
     return "pc " + std::to_string(pc) + ": " + disasm(decode(code[pc]));
+}
+
+// One line per slot, oldest first.
+std::string Shell::show_fifo() const {
+    const std::deque<FifoTile>& tiles = tpu_.weight_fifo().tiles();
+    std::string text = "weight FIFO: " + std::to_string(tiles.size()) + " of " + std::to_string(WeightFifo::kSlots) + " slots";
+
+    for (std::size_t slot = 0; slot < tiles.size(); ++slot) {
+        const FifoTile& entry = tiles[slot];
+        std::string state = "ready";
+        if (!entry.ready()) {
+            state = std::to_string(entry.bytes_arrived) + " of " + std::to_string(v1::kTileBytes) + " bytes";
+        }
+        text += "\nslot " + std::to_string(slot) + ": tile " + hex(entry.tile) + ", " + state;
+    }
+    return text;
 }
 
 void Shell::require_program() const {

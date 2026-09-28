@@ -7,7 +7,8 @@
 Tpu::Tpu()
     : host_("host", kHostMemBytes),
       wmem_("wmem", v1::kWeightMemBytes),
-      host_interface_(host_, ub_) {}
+      host_interface_(host_, ub_),
+      weight_fifo_(wmem_) {}
 
 void Tpu::load(const Program& program) {
     program_ = program;
@@ -16,6 +17,7 @@ void Tpu::load(const Program& program) {
     host_ = Dram("host", kHostMemBytes);
     wmem_ = Dram("wmem", v1::kWeightMemBytes);
     host_interface_.reset();
+    weight_fifo_.reset();
 
     pc_     = 0;
     halted_ = false;
@@ -47,6 +49,12 @@ void Tpu::tick() {
     }
 
     stall_ = why_blocked(in);
+
+    // Blocked with every unit idle means nothing can ever unblock it.
+    if (stall_ != Stall::None && units_idle()) {
+        fail_at_pc(disasm(in) + ": deadlock: " + stall_name(stall_) + ", but no unit is working");
+    }
+
     if (stall_ == Stall::None) {
         try {
             issue(in);
@@ -56,6 +64,7 @@ void Tpu::tick() {
     }
 
     host_interface_.tick();
+    weight_fifo_.tick();
 
     stats_.cycles = stats_.cycles + 1;
     if (stall_ != Stall::None) {
@@ -144,8 +153,14 @@ const HostInterface& Tpu::host_interface() const {
     return host_interface_;
 }
 
+const WeightFifo& Tpu::weight_fifo() const {
+    return weight_fifo_;
+}
+
 bool Tpu::units_idle() const {
-    return !host_interface_.busy();
+    const bool host_idle   = !host_interface_.busy();
+    const bool weight_idle = !weight_fifo_.fetching();
+    return host_idle && weight_idle;
 }
 
 // Stall::None means the instruction can issue this cycle.
@@ -165,6 +180,11 @@ Stall Tpu::why_blocked(const Instr& in) const {
                 return Stall::HostInterfaceBusy;
             }
             return Stall::None;
+        case Op::ReadWeights:
+            if (weight_fifo_.full()) {
+                return Stall::WeightFifoFull;
+            }
+            return Stall::None;
     }
     return Stall::None;
 }
@@ -182,6 +202,9 @@ void Tpu::issue(const Instr& in) {
             break;
         case Op::WriteHostMemory:
             host_interface_.start(Direction::UbToHost, in.host_row, in.ub_row, in.rows);
+            break;
+        case Op::ReadWeights:
+            weight_fifo_.push(in.tile);   // issues at once; the tile arrives over the next ~1366 cycles
             break;
     }
 

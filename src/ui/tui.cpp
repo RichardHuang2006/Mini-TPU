@@ -115,11 +115,14 @@ std::vector<std::string> machine_lines(const Tpu& tpu) {
     } else {
         lines.push_back(field("host i/f", "idle"));
     }
+    lines.push_back(field("wfifo", fifo_occupancy(tpu.weight_fifo())));
+    lines.push_back(field("fetching", fifo_fetch(tpu.weight_fifo())));
 
+    // Every stall cause except None, in the order the enum lists them.
     lines.push_back("");
     lines.push_back(" stall cycles");
-    const Stall kinds[] = {Stall::HostInterfaceBusy, Stall::WaitForIdle};
-    for (Stall kind : kinds) {
+    for (std::size_t i = 1; i < kStallKinds; ++i) {
+        const Stall kind = static_cast<Stall>(i);
         const std::string count = std::to_string(tpu.stats().stalled(kind));
         lines.push_back("   " + fit(stall_name(kind), 28) + count);
     }

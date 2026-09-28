@@ -9,6 +9,7 @@
 #include "mem/dram.h"
 #include "mem/unified_buffer.h"
 #include "units/host_interface.h"
+#include "units/weight_fifo.h"
 
 class Tpu {
 public:
@@ -49,6 +50,7 @@ public:
     const Dram&          host() const;
     const Dram&          wmem() const;
     const HostInterface& host_interface() const;
+    const WeightFifo&    weight_fifo() const;
 
 private:
     Program       program_;
@@ -56,6 +58,7 @@ private:
     Dram          host_;
     Dram          wmem_;
     HostInterface host_interface_;
+    WeightFifo    weight_fifo_;
 
     u32   pc_     = 0;
     bool  halted_ = false;

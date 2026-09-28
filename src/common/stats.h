@@ -11,9 +11,10 @@ enum class Stall : u8 {
     None,                // an instruction issued this cycle
     HostInterfaceBusy,   // a host transfer waits for the one in progress
     WaitForIdle,         // Sync or Halt waits for every unit to finish
+    WeightFifoFull,      // Read_Weights waits for a free FIFO slot
 };
 
-inline constexpr std::size_t kStallKinds = 3;
+inline constexpr std::size_t kStallKinds = 4;
 
 inline const char* stall_name(Stall stall) {
     switch (stall) {
@@ -23,6 +24,8 @@ inline const char* stall_name(Stall stall) {
             return "host interface busy";
         case Stall::WaitForIdle:
             return "waiting for units to finish";
+        case Stall::WeightFifoFull:
+            return "weight FIFO full";
     }
     return "?";
 }

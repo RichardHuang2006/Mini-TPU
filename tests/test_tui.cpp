@@ -64,6 +64,17 @@ TEST(tui_panels_show_the_machine) {
     CHECK(any_line_contains(screen, "some output"));
 }
 
+TEST(tui_machine_panel_shows_the_weight_fifo) {
+    Tpu tpu;
+    tpu.load(assemble("Read_Weights tile=0\nRead_Weights tile=1\nHalt\n"));
+    tpu.step(2);
+
+    const std::vector<std::string> screen = render_screen(tpu, "", "", "", 100, 30);
+    CHECK(any_line_contains(screen, " wfifo    2 of 4 tiles "));
+    CHECK(any_line_contains(screen, " fetching tile 0x0, 96 of 65536 bytes "));
+    CHECK(any_line_contains(screen, "weight FIFO full"));   // every stall cause is listed
+}
+
 TEST(tui_too_small_says_so) {
     const Tpu tpu;
     const std::vector<std::string> screen = render_screen(tpu, "", "", "", 40, 10);
