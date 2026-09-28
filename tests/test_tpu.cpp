@@ -63,7 +63,7 @@ TEST(tpu_second_transfer_waits_for_the_first) {
     Tpu tpu;
     tpu.load(assemble(kTwoReads));
 
-    tpu.run(5);
+    tpu.run_cycles(5);
     CHECK(tpu.stall() == Stall::HostInterfaceBusy);
 
     tpu.run_to_halt();
@@ -92,44 +92,66 @@ TEST(tpu_sync_waits_for_idle) {
     Tpu tpu;
     tpu.load(assemble("Read_Host_Memory host=0 ub=0 rows=1\nSync\nNop\nHalt\n"));
 
-    tpu.step(2);   // the read, then Sync once the read is done
+    tpu.next_instructions(2);   // the read, then Sync once the read is done
     CHECK_EQ(tpu.cycle(), Cycle{13});
     CHECK(!tpu.host_interface().busy());
 }
 
-TEST(tpu_step_stops_right_after_an_issue) {
+TEST(tpu_next_instructions_stops_right_after_an_issue) {
     Tpu tpu;
     tpu.load(assemble(kTwoReads));
 
-    tpu.step(1);
+    tpu.next_instructions(1);
     CHECK_EQ(tpu.issued(), u64{1});
     CHECK_EQ(tpu.cycle(), Cycle{1});
 
-    tpu.step(1);   // skips the 11 stalled cycles
+    tpu.next_instructions(1);   // skips the 11 stalled cycles
     CHECK_EQ(tpu.issued(), u64{2});
     CHECK_EQ(tpu.cycle(), Cycle{13});
     CHECK(tpu.stall() == Stall::None);
 }
 
-TEST(tpu_step_back_replays_to_the_same_state) {
+TEST(tpu_prev_instructions_replays_to_the_same_state) {
     Tpu tpu;
     tpu.load(assemble(kTwoReads));
     tpu.run_to_halt();
     CHECK_EQ(tpu.cycle(), Cycle{25});
 
-    tpu.step_back(1);   // undo Halt: back to just after the second read issued
+    tpu.prev_instructions(1);   // undo Halt: back to just after the second read issued
     CHECK_EQ(tpu.issued(), u64{2});
     CHECK_EQ(tpu.cycle(), Cycle{13});
     CHECK_EQ(tpu.pc(), u32{2});
     CHECK(!tpu.halted());
     CHECK_EQ(tpu.host_interface().bytes_done(), u64{22});   // the second transfer's first cycle
 
-    tpu.step(1);   // forward again lands where it was
+    tpu.next_instructions(1);   // forward again lands where it was
     CHECK(tpu.halted());
     CHECK_EQ(tpu.cycle(), Cycle{25});
 
-    tpu.step_back(10);   // more than were issued: back to the start
+    tpu.prev_instructions(10);   // more than were issued: back to the start
     CHECK_EQ(tpu.issued(), u64{0});
+    CHECK_EQ(tpu.cycle(), Cycle{0});
+}
+
+TEST(tpu_back_cycles_replays_to_an_earlier_cycle) {
+    Tpu tpu;
+    tpu.load(assemble(kTwoReads));
+    tpu.run_to_halt();
+
+    tpu.back_cycles(1);   // one cycle before Halt issued
+    CHECK_EQ(tpu.cycle(), Cycle{24});
+    CHECK(!tpu.halted());
+    CHECK(tpu.stall() == Stall::WaitForIdle);
+
+    tpu.back_cycles(20);
+    CHECK_EQ(tpu.cycle(), Cycle{4});
+    CHECK_EQ(tpu.host_interface().bytes_done(), u64{4 * 22});   // the first transfer, four cycles in
+
+    tpu.run_cycles(21);   // forward again lands where it was
+    CHECK_EQ(tpu.cycle(), Cycle{25});
+    CHECK(tpu.halted());
+
+    tpu.back_cycles(100);   // more than have run: back to the start
     CHECK_EQ(tpu.cycle(), Cycle{0});
 }
 
@@ -137,7 +159,7 @@ TEST(tpu_read_weights_issues_before_the_tile_arrives) {
     Tpu tpu;
     tpu.load(assemble("Read_Weights tile=0\nHalt\n"));
 
-    tpu.step(1);   // decoupled access: the PC moves on at once
+    tpu.next_instructions(1);   // decoupled access: the PC moves on at once
     CHECK_EQ(tpu.cycle(), Cycle{1});
     CHECK_EQ(tpu.pc(), u32{1});
     CHECK(tpu.weight_fifo().fetching());
@@ -159,7 +181,7 @@ TEST(tpu_fifth_read_weights_deadlocks_without_a_consumer) {
     Tpu tpu;
     tpu.load(assemble(source));
 
-    tpu.run(100);
+    tpu.run_cycles(100);
     CHECK(tpu.stall() == Stall::WeightFifoFull);
 
     // Once all four tiles have arrived nothing can free a slot, so the machine reports it instead of spinning.

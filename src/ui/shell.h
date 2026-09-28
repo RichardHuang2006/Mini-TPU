@@ -38,7 +38,7 @@ private:
 
     std::string load(const std::vector<std::string>& words);
     std::string run(const std::vector<std::string>& words);
-    std::string step(const std::vector<std::string>& words);
+    std::string move(const std::vector<std::string>& words);
     std::string show(const std::vector<std::string>& words) const;
     std::string show_pc() const;
     std::string show_fifo() const;

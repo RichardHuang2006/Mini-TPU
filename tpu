@@ -1,0 +1,11 @@
+#!/bin/sh
+# tpu: rebuilds the simulator if anything changed (build output only on failure), then starts it here.
+
+cd "$(dirname "$0")" || exit 1
+
+if ! log=$(cmake -S . -B build 2>&1 && cmake --build build --target tpu_sim 2>&1); then
+    echo "$log"
+    exit 1
+fi
+
+exec ./build/tpu_sim "$@"

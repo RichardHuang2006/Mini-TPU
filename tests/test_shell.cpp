@@ -1,4 +1,4 @@
-/// Shell: every command's exact output, memory views in dec and hex, step back, and errors as text.
+/// Shell: every command's exact output, memory views in dec and hex, moving by cycles and instructions, and errors as text.
 
 #include <filesystem>
 #include <fstream>
@@ -55,15 +55,25 @@ TEST(shell_memory_views) {
     CHECK_EQ(one_row.size(), std::string("0x0:").size() + 16 * 5);
 }
 
-TEST(shell_step_forward_and_back) {
+TEST(shell_moves_by_cycles_and_instructions) {
     Tpu tpu;
     Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_shell_step.s", kCopy));
+    shell.execute("load " + write_temp_program("mini_tpu_shell_move.s", kCopy));
 
+    // step and back count cycles.
     CHECK_EQ(shell.execute("step"), std::string("cycle 1, pc 1, running"));
-    CHECK_EQ(shell.execute("step 2"), std::string("cycle 49, pc 2, halted"));
-    CHECK_EQ(shell.execute("step -1"), std::string("cycle 25, pc 2, running"));
-    CHECK_EQ(shell.execute("step -5"), std::string("cycle 0, pc 0, ready"));
+    CHECK_EQ(shell.execute("step 4"), std::string("cycle 5, pc 1, stalled: host interface busy"));
+
+    // next and prev count instruction issues; the write issues on cycle 24.
+    CHECK_EQ(shell.execute("next"), std::string("cycle 25, pc 2, running"));
+    CHECK_EQ(shell.execute("prev"), std::string("cycle 1, pc 1, running"));
+    CHECK_EQ(shell.execute("next 2"), std::string("cycle 49, pc 2, halted"));
+
+    CHECK_EQ(shell.execute("back"), std::string("cycle 48, pc 2, stalled: waiting for units to finish"));
+    CHECK_EQ(shell.execute("back 100"), std::string("cycle 0, pc 0, ready"));
+
+    CHECK_EQ(shell.execute("step x"), std::string("error: count 'x' is not a number"));
+    CHECK_EQ(shell.execute("back 1 2"), std::string("error: usage: back [N]"));
 }
 
 TEST(shell_errors_are_text) {
@@ -73,7 +83,8 @@ TEST(shell_errors_are_text) {
     CHECK_EQ(shell.execute("run"), std::string("error: no program loaded; use load FILE"));
     CHECK_EQ(shell.execute("load /nonexistent/prog.s"), std::string("/nonexistent/prog.s: error: cannot open file"));
     CHECK_EQ(shell.execute("foo"),
-             std::string("error: unknown command 'foo'; commands: load FILE, run [N], step [N|-N], TARGET [hex|dec], quit"));
+             std::string("error: unknown command 'foo'; commands: load FILE, step [N], back [N], next [N], prev [N], run [N], "
+                         "TARGET [hex|dec], quit"));
     CHECK_EQ(shell.execute("mem[0]"),
              std::string("error: unknown target 'mem' (try pc, wfifo, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
     CHECK_EQ(shell.execute("ub[0:4]"), std::string("error: expected ROWSxCOLS after ':', got '4'"));
@@ -89,7 +100,7 @@ TEST(shell_weight_fifo_view) {
     shell.execute("load " + write_temp_program("mini_tpu_shell_fifo.s", "Read_Weights tile=0\nRead_Weights tile=1\nHalt\n"));
     CHECK_EQ(shell.execute("wfifo"), std::string("weight FIFO: 0 of 4 slots"));
 
-    shell.execute("step 2");   // both issue on cycles 0 and 1; tile 0 has had two 48-byte cycles
+    shell.execute("next 2");   // both issue on cycles 0 and 1; tile 0 has had two 48-byte cycles
     const std::string expected =
         "weight FIFO: 2 of 4 slots\n"
         "slot 0: tile 0x0, 96 of 65536 bytes\n"

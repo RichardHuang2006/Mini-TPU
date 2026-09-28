@@ -27,16 +27,19 @@ public:
     // One cycle: issue the instruction at the PC if it can go, then advance every unit.
     void tick();
 
-    // Advances up to n cycles, stopping early at Halt.
-    void run(u64 cycles);
+    // Forward n cycles, stopping early at Halt.
+    void run_cycles(u64 cycles);
+
+    // Back n cycles: reloads the program and replays up to that cycle.
+    void back_cycles(u64 cycles);
+
+    // Forward until n more instructions have issued, stopping early at Halt.
+    void next_instructions(u64 instructions);
+
+    // Back n instruction issues: reloads the program and replays up to just after the earlier issue.
+    void prev_instructions(u64 instructions);
 
     void run_to_halt();
-
-    // Advances until n more instructions have issued, stopping early at Halt.
-    void step(u64 instructions);
-
-    // Undoes the last n instruction issues: reloads the program and replays up to that point.
-    void step_back(u64 instructions);
 
     bool         halted() const;
     Cycle        cycle() const;
@@ -68,5 +71,6 @@ private:
     bool  units_idle() const;
     Stall why_blocked(const Instr& in) const;
     void  issue(const Instr& in);
+    void  reload();
     [[noreturn]] void fail_at_pc(const std::string& what) const;
 };

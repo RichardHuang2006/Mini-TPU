@@ -11,7 +11,7 @@
 
 namespace {
 
-const char* kCommandList = "load FILE, run [N], step [N|-N], TARGET [hex|dec], quit";
+const char* kCommandList = "load FILE, step [N], back [N], next [N], prev [N], run [N], TARGET [hex|dec], quit";
 const char* kTargetList  = "pc, wfifo, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
 
 std::vector<std::string> split_words(const std::string& line) {
@@ -190,8 +190,9 @@ std::string Shell::execute(const std::string& line) {
         if (command == "run") {
             return run(words);
         }
-        if (command == "step") {
-            return step(words);
+        const bool moves_in_time = command == "step" || command == "back" || command == "next" || command == "prev";
+        if (moves_in_time) {
+            return move(words);
         }
         return show(words);
     } catch (const AsmError& e) {
@@ -237,35 +238,34 @@ std::string Shell::run(const std::vector<std::string>& words) {
     if (words.size() == 1) {
         tpu_.run_to_halt();
     } else if (words.size() == 2) {
-        tpu_.run(parse_number(words[1], "cycle count"));
+        tpu_.run_cycles(parse_number(words[1], "cycle count"));
     } else {
         throw std::invalid_argument("usage: run [N]");
     }
     return status_line(tpu_);
 }
 
-// `step` issues one instruction, `step N` issues N, and `step -N` undoes the last N.
-std::string Shell::step(const std::vector<std::string>& words) {
+// step and back move by cycles, next and prev by instructions; each takes a count, 1 if left out.
+std::string Shell::move(const std::vector<std::string>& words) {
     require_program();
+    const std::string& command = words[0];
     if (words.size() > 2) {
-        throw std::invalid_argument("usage: step [N|-N]");
+        throw std::invalid_argument("usage: " + command + " [N]");
     }
 
     u64 count = 1;
-    bool backwards = false;
     if (words.size() == 2) {
-        std::string amount = words[1];
-        if (!amount.empty() && amount[0] == '-') {
-            backwards = true;
-            amount = amount.substr(1);
-        }
-        count = parse_number(amount, "step count");
+        count = parse_number(words[1], "count");
     }
 
-    if (backwards) {
-        tpu_.step_back(count);
+    if (command == "step") {
+        tpu_.run_cycles(count);
+    } else if (command == "back") {
+        tpu_.back_cycles(count);
+    } else if (command == "next") {
+        tpu_.next_instructions(count);
     } else {
-        tpu_.step(count);
+        tpu_.prev_instructions(count);
     }
     return status_line(tpu_);
 }

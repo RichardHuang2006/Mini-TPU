@@ -73,11 +73,42 @@ void Tpu::tick() {
     }
 }
 
-void Tpu::run(u64 cycles) {
+void Tpu::run_cycles(u64 cycles) {
     for (u64 i = 0; i < cycles; ++i) {
         if (halted_) {
             return;
         }
+        tick();
+    }
+}
+
+void Tpu::back_cycles(u64 cycles) {
+    Cycle target = 0;
+    if (stats_.cycles > cycles) {
+        target = stats_.cycles - cycles;
+    }
+
+    reload();
+    while (stats_.cycles < target) {
+        tick();
+    }
+}
+
+void Tpu::next_instructions(u64 instructions) {
+    const u64 target = stats_.issued + instructions;
+    while (!halted_ && stats_.issued < target) {
+        tick();
+    }
+}
+
+void Tpu::prev_instructions(u64 instructions) {
+    u64 target = 0;
+    if (stats_.issued > instructions) {
+        target = stats_.issued - instructions;
+    }
+
+    reload();
+    while (stats_.issued < target) {
         tick();
     }
 }
@@ -88,25 +119,10 @@ void Tpu::run_to_halt() {
     }
 }
 
-void Tpu::step(u64 instructions) {
-    const u64 target = stats_.issued + instructions;
-    while (!halted_ && stats_.issued < target) {
-        tick();
-    }
-}
-
-void Tpu::step_back(u64 instructions) {
-    u64 target = 0;
-    if (stats_.issued > instructions) {
-        target = stats_.issued - instructions;
-    }
-
-    // The machine is deterministic and load() is the only way data gets in, so replaying reaches the same state.
+// The machine is deterministic and load() is the only way data gets in, so replaying reaches the same state.
+void Tpu::reload() {
     const Program program = program_;
     load(program);
-    while (stats_.issued < target) {
-        tick();
-    }
 }
 
 bool Tpu::halted() const {
