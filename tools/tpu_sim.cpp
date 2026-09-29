@@ -1,4 +1,4 @@
-/// tpu_sim: the Mini-TPU terminal, plus a live browser visualizer. Start it with ./tpu; piped input runs in plain line mode.
+/// tpu_sim: the terminal loads programs, and the browser visualizer steps through them. Start it with ./tpu.
 
 #include <unistd.h>
 
@@ -13,6 +13,7 @@
 #include "ui/shell.h"
 #include "viz/server.h"
 #include "viz/snapshot.h"
+#include "viz/state.h"
 
 namespace {
 
@@ -30,17 +31,12 @@ void open_browser(const std::string& url) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Options: --viz / --no-viz turn the visualizer on or off (on when interactive), --no-open keeps the browser closed.
+    // Options: --no-open keeps the browser closed; any other argument is the program to load.
     std::string program;
-    bool viz_on  = isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0;
     bool open_it = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--viz") {
-            viz_on = true;
-        } else if (arg == "--no-viz") {
-            viz_on = false;
-        } else if (arg == "--no-open") {
+        if (arg == "--no-open") {
             open_it = false;
         } else {
             program = arg;
@@ -50,24 +46,26 @@ int main(int argc, char** argv) {
     Tpu tpu;
     Shell shell(tpu);
 
-    std::cout << "Mini-TPU (TPUv1). Commands: load FILE, step [N], back [N], next [N], prev [N], run [N], "
-                 "TARGET [hex|dec], quit\n";
+    std::cout << "Mini-TPU (TPUv1). Type load FILE, then step through it in the visualizer. quit exits.\n";
 
+    // The page is the only way to move the machine, so there is nothing to do without it.
     std::unique_ptr<VizServer> viz;
-    if (viz_on) {
-        try {
-            viz = std::make_unique<VizServer>(MINITPU_VIZ_DIR, 8008);
-            const std::string url = "http://127.0.0.1:" + std::to_string(viz->port()) + "/";
-            std::cout << "visualizer: " << url << "\n";
+    try {
+        viz = std::make_unique<VizServer>(MINITPU_VIZ_DIR, 8008);
+    } catch (const std::runtime_error& e) {
+        std::cout << e.what() << "\n";
+        return 1;
+    }
+    const std::string url = "http://127.0.0.1:" + std::to_string(viz->port()) + "/";
+    std::cout << "visualizer: " << url << "\n";
 
-            shell.set_observer([&viz, &tpu, &shell]() { viz->publish(snapshot_json(tpu, shell)); });
-            viz->publish(snapshot_json(tpu, shell));
-            if (open_it) {
-                open_browser(url);
-            }
-        } catch (const std::runtime_error& e) {
-            std::cout << "visualizer off: " << e.what() << "\n";
-        }
+    // A raw pointer, so a press still finishing while viz is destroyed publishes to a live server.
+    VizServer* server = viz.get();
+    shell.set_observer([server, &tpu]() { server->publish(snapshot_json(tpu), capture(tpu)); });
+    viz->on_move([&shell](const std::string& direction, const std::string& unit) { return shell.move(direction, unit); });
+    server->publish(snapshot_json(tpu), capture(tpu));
+    if (open_it) {
+        open_browser(url);
     }
 
     if (!program.empty()) {

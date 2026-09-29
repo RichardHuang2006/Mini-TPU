@@ -4,31 +4,13 @@
 
 #include <stdexcept>
 
-namespace {
-
-// Marks every map cell the rows [first, first + count) touch as written on `cycle`.
-void mark_written(std::vector<Cycle>& cells, u32 first, u32 count, Cycle cycle) {
-    if (count == 0) {
-        return;
-    }
-    const u32 first_cell = first / kMapRows;
-    const u32 last_cell  = (first + count - 1) / kMapRows;
-    for (u32 cell = first_cell; cell <= last_cell && cell < cells.size(); ++cell) {
-        cells[cell] = cycle;
-    }
-}
-
-}  // namespace
-
 Tpu::Tpu()
     : host_("host", kHostMemBytes),
       wmem_("wmem", v1::kWeightMemBytes),
       host_interface_(host_, ub_),
       weight_fifo_(wmem_),
       mxu_(ub_, acc_, weight_fifo_),
-      activation_(acc_, ub_) {
-    reset_activity();
-}
+      activation_(acc_, ub_) {}
 
 void Tpu::load(const Program& program) {
     program_ = program;
@@ -46,7 +28,10 @@ void Tpu::load(const Program& program) {
     halted_ = false;
     stall_  = Stall::None;
     stats_  = Stats();
-    reset_activity();
+    activity_.clear();
+    host_pc_ = -1;
+    mxu_pc_  = -1;
+    act_pc_  = -1;
 
     for (const DataBlock& block : program_.host) {
         host_.write(block.addr, block.bytes.data(), block.bytes.size());
@@ -79,8 +64,9 @@ void Tpu::tick() {
         fail_at_pc(disasm(in) + ": deadlock: " + stall_name(stall_) + ", but no unit is working");
     }
 
-    const u32 pc_before = pc_;
+    i32 issued_pc = -1;
     if (stall_ == Stall::None) {
+        issued_pc = static_cast<i32>(pc_);
         try {
             issue(in);
         } catch (const std::exception& e) {
@@ -92,7 +78,7 @@ void Tpu::tick() {
     const int shadow_before  = mxu_.shadow_tile();
     const bool mxu_working   = mxu_.busy();
 
-    record_cycle(pc_before);
+    record_cycle(issued_pc);
 
     host_interface_.tick();
     weight_fifo_.tick();
@@ -101,7 +87,9 @@ void Tpu::tick() {
 
     // The shifter's work shows only afterwards: a tile row moved if the count changed or a new tile started.
     const bool shifted = mxu_.rows_shifted() != shifted_before || mxu_.shadow_tile() != shadow_before;
-    activity_.back().shifting = shifted;
+    if (shifted) {
+        activity_.back().shifting = mxu_.shadow_tile();
+    }
     if (mxu_working) {
         stats_.mxu_busy_cycles = stats_.mxu_busy_cycles + 1;
     }
@@ -113,42 +101,33 @@ void Tpu::tick() {
     }
 }
 
-// Which units work this cycle, taken before they advance so a unit that finishes now still counts.
-void Tpu::record_cycle(u32 pc_before) {
+// What each unit works on this cycle, taken before they advance so a unit that finishes now still counts.
+void Tpu::record_cycle(i32 issued_pc) {
     CycleRecord record;
-    record.cycle      = stats_.cycles;
-    record.stall      = stall_;
-    record.host       = host_interface_.busy();
-    record.fetching   = weight_fifo_.fetching();
-    record.mxu        = mxu_.busy();
-    record.activation = activation_.busy();
-    if (stall_ == Stall::None) {
-        record.issued_pc = static_cast<int>(pc_before);
-    }
-
-    // The rows each unit is writing right now glow on the visualizer's maps.
-    const Cycle now = stats_.cycles;
-    if (host_interface_.busy() && host_interface_.direction() == Direction::HostToUb) {
-        mark_written(ub_written_, host_interface_.ub_row(), host_interface_.rows(), now);
-    }
-    if (activation_.busy()) {
-        const u32 out_rows = activate_output_rows(activation_.rows_total(), activation_.pool(), activation_.pool_size());
-        mark_written(ub_written_, activation_.ub_row(), out_rows, now);
+    record.stall  = stall_;
+    record.issued = issued_pc;
+    if (host_interface_.busy()) {
+        record.host = host_pc_;
     }
     if (mxu_.busy()) {
-        mark_written(acc_written_, mxu_.acc_row(), mxu_.rows(), now);
+        record.mxu = mxu_pc_;
+    }
+    if (activation_.busy()) {
+        record.activation = act_pc_;
+    }
+
+    // Tiles arrive in order, so the first one not ready is the one DDR3 is filling.
+    for (const FifoTile& entry : weight_fifo_.tiles()) {
+        if (!entry.ready()) {
+            record.fetching = static_cast<i32>(entry.tile);
+            break;
+        }
     }
 
     activity_.push_back(record);
-    if (activity_.size() > kActivityCycles) {
+    if (activity_.size() > kTimelineCycles) {
         activity_.pop_front();
     }
-}
-
-void Tpu::reset_activity() {
-    activity_.clear();
-    ub_written_.assign(v1::kUbRows / kMapRows, kNever);
-    acc_written_.assign(v1::kAccRows / kMapRows, kNever);
 }
 
 void Tpu::run_cycles(u64 cycles) {
@@ -267,14 +246,6 @@ const std::deque<CycleRecord>& Tpu::activity() const {
     return activity_;
 }
 
-const std::vector<Cycle>& Tpu::ub_written() const {
-    return ub_written_;
-}
-
-const std::vector<Cycle>& Tpu::acc_written() const {
-    return acc_written_;
-}
-
 bool Tpu::units_idle() const {
     const bool host_idle   = !host_interface_.busy();
     const bool weight_idle = !weight_fifo_.fetching();
@@ -369,18 +340,22 @@ void Tpu::issue(const Instr& in) {
             break;
         case Op::ReadHostMemory:
             host_interface_.start(Direction::HostToUb, in.host_row, in.ub_row, in.rows);
+            host_pc_ = static_cast<i32>(pc_);
             break;
         case Op::WriteHostMemory:
             host_interface_.start(Direction::UbToHost, in.host_row, in.ub_row, in.rows);
+            host_pc_ = static_cast<i32>(pc_);
             break;
         case Op::ReadWeights:
             weight_fifo_.push(in.tile);   // issues at once; the tile arrives over the next ~1366 cycles
             break;
         case Op::MatrixMultiply:
             mxu_.start(in.ub_row, in.acc_row, in.rows, in.accumulate == 1, in.new_weights == 1);
+            mxu_pc_ = static_cast<i32>(pc_);
             break;
         case Op::Activate:
             activation_.start(in.acc_row, in.ub_row, in.rows, in.shift, in.function, in.pool, in.pool_size, in.pool_width);
+            act_pc_ = static_cast<i32>(pc_);
             break;
     }
 

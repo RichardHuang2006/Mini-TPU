@@ -64,10 +64,8 @@ public:
     const SystolicArray&  mxu() const;
     const ActivationUnit& activation() const;
 
-    // For the visualizer: the last 512 cycles, and the cycle each 256-row map cell was last written (kNever if never).
+    // For the visualizer's timeline: the last kTimelineCycles cycles, oldest first.
     const std::deque<CycleRecord>& activity() const;
-    const std::vector<Cycle>&      ub_written() const;
-    const std::vector<Cycle>&      acc_written() const;
 
 private:
     Program        program_;
@@ -86,14 +84,14 @@ private:
     Stats stats_;
 
     std::deque<CycleRecord> activity_;
-    std::vector<Cycle>      ub_written_;
-    std::vector<Cycle>      acc_written_;
+    i32 host_pc_ = -1;   // the instruction each unit last started, which it works for while busy
+    i32 mxu_pc_  = -1;
+    i32 act_pc_  = -1;
 
     bool  units_idle() const;
     Stall why_blocked(const Instr& in) const;
     void  issue(const Instr& in);
     void  reload();
-    void  reset_activity();
-    void  record_cycle(u32 pc_before);
+    void  record_cycle(i32 issued_pc);
     [[noreturn]] void fail_at_pc(const std::string& what) const;
 };

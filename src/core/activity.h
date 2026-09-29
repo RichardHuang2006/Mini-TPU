@@ -1,4 +1,4 @@
-/// The per-cycle activity record the visualizer draws its timeline and memory glows from.
+/// The per-cycle activity record the visualizer's timeline is drawn from.
 
 #pragma once
 
@@ -6,18 +6,15 @@
 
 #include "common/stats.h"
 
-// What one cycle did: whether an instruction issued (or why not), and which units worked.
+// What one cycle did: why nothing issued (Stall::None if something did), and what each unit worked on; -1 means idle.
 struct CycleRecord {
-    Cycle cycle      = 0;
     Stall stall      = Stall::None;
-    int   issued_pc  = -1;      // the PC that issued this cycle, or -1
-    bool  host       = false;   // the host interface moved bytes
-    bool  fetching   = false;   // DDR3 filled a Weight FIFO slot
-    bool  shifting   = false;   // the weight shifter moved a tile row into the shadow plane
-    bool  mxu        = false;   // the systolic array took a step
-    bool  activation = false;   // the activation unit took a row
+    i32   issued     = -1;   // the pc that issued
+    i32   host       = -1;   // the pc of the Read_Host_Memory or Write_Host_Memory the host interface is moving
+    i32   fetching   = -1;   // the tile DDR3 is filling into the Weight FIFO
+    i32   shifting   = -1;   // the tile the weight shifter is moving into the shadow plane
+    i32   mxu        = -1;   // the pc of the MatrixMultiply the array is stepping
+    i32   activation = -1;   // the pc of the Activate the activation unit is working through
 };
 
-inline constexpr std::size_t kActivityCycles = 512;   // how many recent cycles the Tpu keeps
-inline constexpr u32 kMapRows = 256;                  // one visualizer map cell covers 256 rows
-inline constexpr Cycle kNever = ~Cycle{0};            // a map cell nothing has written yet
+inline constexpr std::size_t kTimelineCycles = 64;   // the visualizer's timeline shows the last 64 cycles

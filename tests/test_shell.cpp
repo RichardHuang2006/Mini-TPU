@@ -1,4 +1,4 @@
-/// Shell: every command's exact output, memory views in dec and hex, moving by cycles and instructions, and errors as text.
+/// Shell: the terminal's load and quit, button moves by cycle and by instruction, and errors as text.
 
 #include <filesystem>
 #include <fstream>
@@ -28,31 +28,28 @@ std::string write_temp_program(const std::string& name, const std::string& sourc
 
 }  // namespace
 
-TEST(shell_load_and_run) {
+TEST(shell_loads_a_program) {
     Tpu tpu;
     Shell shell(tpu);
     const std::string path = write_temp_program("mini_tpu_shell_copy.s", kCopy);
 
     CHECK_EQ(shell.execute("load " + path), "loaded " + path + ": 3 instructions, 8 host bytes, 0 weight bytes");
-    CHECK_EQ(shell.loaded_file(), path);
-    CHECK_EQ(shell.execute("run 5"), std::string("cycle 5, pc 1, stalled: host interface busy"));
-    CHECK_EQ(shell.execute("run"), std::string("cycle 49, pc 2, halted"));
-    CHECK_EQ(shell.execute("pc"), std::string("pc 2: Halt"));
+    CHECK_EQ(tpu.program().code.size(), std::size_t{3});
+    CHECK_EQ(shell.execute("load /nonexistent/prog.s"), std::string("/nonexistent/prog.s: error: cannot open file"));
+    CHECK_EQ(shell.execute("load"), std::string("error: usage: load FILE"));
 }
 
-TEST(shell_memory_views) {
+TEST(shell_terminal_takes_only_load_and_quit) {
     Tpu tpu;
     Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_shell_views.s", kCopy));
-    shell.execute("run");
+    CHECK_EQ(shell.execute("step"),
+             std::string("error: unknown command 'step': the terminal takes load FILE and quit; "
+                         "step through the program in the visualizer"));
+    CHECK_EQ(shell.execute("   "), std::string(""));
 
-    CHECK_EQ(shell.execute("ub[0:2x4]"), std::string("0x0:    1    2    3    4\n0x1:   -1   -2   -3   -4"));
-    CHECK_EQ(shell.execute("ub[1:1x4] hex"), std::string("0x1: FF FE FD FC"));
-    CHECK_EQ(shell.execute("host[4:2x2]"), std::string("0x4:    1    2\n0x5:   -1   -2"));
-    CHECK_EQ(shell.execute("wmem[0:1x2]"), std::string("0x0:    0    0"));
-
-    const std::string one_row = shell.execute("ub[0x0]");   // a bare row shows 16 columns
-    CHECK_EQ(one_row.size(), std::string("0x0:").size() + 16 * 5);
+    CHECK(!shell.quit_requested());
+    CHECK_EQ(shell.execute("quit"), std::string(""));
+    CHECK(shell.quit_requested());
 }
 
 TEST(shell_moves_by_cycles_and_instructions) {
@@ -60,110 +57,28 @@ TEST(shell_moves_by_cycles_and_instructions) {
     Shell shell(tpu);
     shell.execute("load " + write_temp_program("mini_tpu_shell_move.s", kCopy));
 
-    // step and back count cycles.
-    CHECK_EQ(shell.execute("step"), std::string("cycle 1, pc 1, running"));
-    CHECK_EQ(shell.execute("step 4"), std::string("cycle 5, pc 1, stalled: host interface busy"));
+    CHECK_EQ(shell.move("forward", "cycle"), std::string("cycle 1, pc 1, running"));
+    CHECK_EQ(shell.move("back", "cycle"), std::string("cycle 0, pc 0, ready"));
+    CHECK_EQ(shell.move("back", "cycle"), std::string("cycle 0, pc 0, ready"));   // cycle 0 is as far back as it goes
 
-    // next and prev count instruction issues; the write issues on cycle 24.
-    CHECK_EQ(shell.execute("next"), std::string("cycle 25, pc 2, running"));
-    CHECK_EQ(shell.execute("prev"), std::string("cycle 1, pc 1, running"));
-    CHECK_EQ(shell.execute("next 2"), std::string("cycle 49, pc 2, halted"));
+    // An instruction move runs until one more issues; the read issues on cycle 0 and the write on cycle 24.
+    CHECK_EQ(shell.move("forward", "instruction"), std::string("cycle 1, pc 1, running"));
+    CHECK_EQ(shell.move("forward", "instruction"), std::string("cycle 25, pc 2, running"));
+    CHECK_EQ(shell.move("back", "instruction"), std::string("cycle 1, pc 1, running"));
 
-    CHECK_EQ(shell.execute("back"), std::string("cycle 48, pc 2, stalled: waiting for units to finish"));
-    CHECK_EQ(shell.execute("back 100"), std::string("cycle 0, pc 0, ready"));
-
-    CHECK_EQ(shell.execute("step x"), std::string("error: count 'x' is not a number"));
-    CHECK_EQ(shell.execute("back 1 2"), std::string("error: usage: back [N]"));
+    CHECK_EQ(shell.move("forward", "instruction"), std::string("cycle 25, pc 2, running"));
+    CHECK_EQ(shell.move("forward", "instruction"), std::string("cycle 49, pc 2, halted"));
+    CHECK_EQ(shell.move("forward", "cycle"), std::string("cycle 49, pc 2, halted"));   // nothing runs past Halt
+    CHECK_EQ(shell.move("back", "cycle"), std::string("cycle 48, pc 2, stalled: waiting for units to finish"));
 }
 
-TEST(shell_errors_are_text) {
+TEST(shell_move_errors_are_text) {
     Tpu tpu;
     Shell shell(tpu);
+    CHECK_EQ(shell.move("forward", "cycle"), std::string("error: no program loaded; use load FILE"));
 
-    CHECK_EQ(shell.execute("run"), std::string("error: no program loaded; use load FILE"));
-    CHECK_EQ(shell.execute("load /nonexistent/prog.s"), std::string("/nonexistent/prog.s: error: cannot open file"));
-    CHECK_EQ(shell.execute("foo"),
-             std::string("error: unknown command 'foo'; commands: load FILE, step [N], back [N], next [N], prev [N], run [N], "
-                         "TARGET [hex|dec], quit"));
-    CHECK_EQ(shell.execute("mem[0]"),
-             std::string("error: unknown target 'mem' (try pc, wfifo, mxu, act, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
-    CHECK_EQ(shell.execute("ub[0:4]"), std::string("error: expected ROWSxCOLS after ':', got '4'"));
-    CHECK_EQ(shell.execute("ub[0:1x300]"), std::string("error: a view is 1 or more rows of 1 to 256 columns"));
-    CHECK_EQ(shell.execute("ub[0x20000]"), std::string("error: ub row 131072 is past the last row 98303"));
-    CHECK_EQ(shell.execute("ub[0] oct"), std::string("error: format must be hex or dec, got 'oct'"));
-    CHECK_EQ(shell.execute("   "), std::string(""));
-}
-
-TEST(shell_weight_fifo_view) {
-    Tpu tpu;
-    Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_shell_fifo.s", "Read_Weights tile=0\nRead_Weights tile=1\nHalt\n"));
-    CHECK_EQ(shell.execute("wfifo"), std::string("weight FIFO: 0 of 4 slots"));
-
-    shell.execute("next 2");   // both issue on cycles 0 and 1; tile 0 has had two 48-byte cycles
-    const std::string expected =
-        "weight FIFO: 2 of 4 slots\n"
-        "slot 0: tile 0x0, 96 of 65536 bytes\n"
-        "slot 1: tile 0x1, 0 of 65536 bytes";
-    CHECK_EQ(shell.execute("wfifo"), expected);
-
-    shell.execute("run");
-    CHECK_EQ(shell.execute("wfifo"), std::string("weight FIFO: 1 of 4 slots\nslot 0: tile 0x1, ready"));   // tile 0 went to the MXU
-}
-
-TEST(shell_accumulator_and_mxu_views) {
-    const char* source =
-        ".host 0\n"
-        "1 2\n"
-        ".weights 0 0\n"
-        "3 -4\n"
-        "Read_Host_Memory host=0 ub=0 rows=1\n"
-        "Read_Weights tile=0\n"
-        "MatrixMultiply ub=0 acc=0 rows=1 accumulate=0 new_weights=1\n"
-        "Halt\n";
-    Tpu tpu;
-    Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_shell_mxu.s", source));
-    CHECK_EQ(shell.execute("mxu").substr(0, 9), std::string("MXU: idle"));
-
-    shell.execute("run");
-    CHECK_EQ(shell.execute("acc[0:1x3]"), std::string("0x0:        3       -4        0"));   // x = (1, 2), row 0 of W = (3, -4)
-    CHECK_EQ(shell.execute("acc[0:1x2] hex"), std::string("0x0: 00000003 FFFFFFFC"));
-    CHECK_EQ(shell.execute("acc[4096]"), std::string("error: acc row 4096 is past the last row 4095"));
-
-    const std::string mxu = shell.execute("mxu");
-    CHECK_EQ(mxu.substr(0, mxu.find("PEs")),
-             std::string("MXU: idle\nactive weights: tile 0x0\nshadow weights: empty\n"));
-}
-
-TEST(shell_activation_view) {
-    const char* source =
-        ".host 0\n"
-        "1 2\n"
-        ".weights 0 0\n"
-        "3 -4\n"
-        "Read_Host_Memory host=0 ub=0 rows=1\n"
-        "Read_Weights tile=0\n"
-        "MatrixMultiply ub=0 acc=0 rows=2 accumulate=0 new_weights=1\n"
-        "Activate acc=0 ub=0x10 rows=2 shift=1 function=relu\n"
-        "Halt\n";
-    Tpu tpu;
-    Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_shell_act.s", source));
-    CHECK_EQ(shell.execute("act"), std::string("activation: idle"));
-
-    shell.execute("next 4");   // Activate issues and does its first row that same cycle
-    CHECK_EQ(shell.execute("act"), std::string("activation: 1 of 2 rows done\nacc 0x0 -> ub 0x10, function relu, shift 1"));
-
-    shell.execute("run");
-    CHECK_EQ(shell.execute("act"), std::string("activation: idle"));
-    CHECK_EQ(shell.execute("ub[0x10:2x2]"), std::string("0x10:    2    0\n0x11:    0    0"));   // 3/2 rounds to 2; -4/2 is cut by relu
-}
-
-TEST(shell_quit) {
-    Tpu tpu;
-    Shell shell(tpu);
-    CHECK(!shell.quit_requested());
-    CHECK_EQ(shell.execute("quit"), std::string(""));
-    CHECK(shell.quit_requested());
+    shell.execute("load " + write_temp_program("mini_tpu_shell_errors.s", kCopy));
+    CHECK_EQ(shell.move("up", "cycle"), std::string("error: direction must be forward or back, got 'up'"));
+    CHECK_EQ(shell.move("forward", "bundle"), std::string("error: unit must be cycle or instruction, got 'bundle'"));
+    CHECK_EQ(tpu.cycle(), Cycle{0});
 }

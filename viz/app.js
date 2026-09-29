@@ -1,39 +1,16 @@
-// app.js: draws the TPU from each snapshot the simulator pushes over /events; nothing on the page is clickable.
+// app.js: draws each snapshot: blocks paint occupied rows and computing PEs, the inspector shows values, the timeline the last 64 cycles.
 "use strict";
 
-const SVG_NS = "http://www.w3.org/2000/svg";
-const MAP_ROWS = 256;          // one map cell covers 256 memory rows
-const UB_ACROSS = 24;          // the Unified Buffer map: 384 cells, 24 across and 16 down
-const FRESH_CYCLES = 40;       // a just-written cell fades out over this many cycles
-const TIMELINE_LANES = [
-    { key: "issue", label: "issue" },
-    { key: "host",  label: "PCIe" },
-    { key: "fetch", label: "DDR3" },
-    { key: "shift", label: "shift" },
-    { key: "mxu",   label: "MXU" },
-    { key: "act",   label: "activate" },
-];
+const COLS = 256;                 // every memory row, and every PE row, is 256 values wide
+const ROWS_PER_PAGE = 256;        // a 64 KiB host page, a weight tile and a FIFO slot are each 256 rows
+const FIFO_SLOTS = 4;
+const UB_ROWS = 98304;
+const ACC_ROWS = 4096;
+const GAP_FROM = 6;               // cells this many pixels or larger get a gap between them
+const TIMELINE_GUTTER = 92;       // the timeline's lane-name column
+const TIMELINE_RULER = 16;        // the cycle ruler above the lanes
 
-// One color per timeline letter: I is an instruction issuing, the rest are the stall causes.
-const LETTER_COLORS = {
-    I: "#0f9d8a",
-    h: "#4c7bd9",
-    w: "#8b93a5",
-    f: "#a064c8",
-    m: "#e0782c",
-    g: "#d9a400",
-    u: "#d0453a",
-    a: "#b0487d",
-    c: "#7a8f3a",
-};
-
-const ui = {
-    ubCells: [],
-    accCells: [],
-    fifoSlots: [],
-    programKey: "",
-    keyBuilt: false,
-};
+let latest = null;   // the most recent snapshot
 
 function byId(id) {
     return document.getElementById(id);
@@ -41,6 +18,13 @@ function byId(id) {
 
 function hex(value) {
     return "0x" + value.toString(16).toUpperCase();
+}
+
+function rowRange(first, count) {
+    if (count <= 1) {
+        return "row " + hex(first);
+    }
+    return "rows " + hex(first) + "-" + hex(first + count - 1);
 }
 
 function cssColor(name) {
@@ -53,76 +37,271 @@ function rgb(color) {
     return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
 }
 
-function svg(tag, attributes, parent) {
-    const node = document.createElementNS(SVG_NS, tag);
-    for (const name of Object.keys(attributes)) {
-        node.setAttribute(name, attributes[name]);
-    }
-    parent.appendChild(node);
-    return node;
+function mix(from, to, t) {
+    return [
+        Math.round(from[0] + (to[0] - from[0]) * t),
+        Math.round(from[1] + (to[1] - from[1]) * t),
+        Math.round(from[2] + (to[2] - from[2]) * t),
+    ];
 }
 
-// "rows 0x10-0x1F", or "row 0x10" for a single row.
-function rowRange(first, count) {
-    if (count <= 1) {
-        return "row " + hex(first);
-    }
-    return "rows " + hex(first) + "-" + hex(first + count - 1);
+function readPalette() {
+    return {
+        panel: cssColor("--panel"),
+        ink: cssColor("--ink"),
+        line: cssColor("--line"),
+        stripe: cssColor("--stripe"),
+        empty: rgb(cssColor("--empty")),
+        occupied: rgb(cssColor("--occupied")),
+        computing: rgb(cssColor("--computing")),
+        lanes: {
+            issue: cssColor("--lane-issue"),
+            stall: cssColor("--lane-stall"),
+            host: cssColor("--lane-host"),
+            weights: cssColor("--lane-weights"),
+            mxu: cssColor("--lane-mxu"),
+            act: cssColor("--lane-act"),
+        },
+    };
 }
 
-// True when map cell `cell` holds any of the rows [first, first + count).
-function cellInRange(cell, first, count) {
+// Sizes a canvas's drawing buffer to how big it is on screen, so lines and text stay sharp.
+function fitCanvas(canvas) {
+    let scale = 1;
+    if (window.devicePixelRatio > 1) {
+        scale = window.devicePixelRatio;
+    }
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const context = canvas.getContext("2d");
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    return { context: context, width: width, height: height };
+}
+
+// Host memory and Weight Memory blocks show only the pages in use; this finds a real row's place among them (-1: not in use).
+function pagedViewRow(pages, realRow) {
+    const index = pages.indexOf(Math.floor(realRow / ROWS_PER_PAGE));
+    if (index < 0) {
+        return -1;
+    }
+    return index * ROWS_PER_PAGE + (realRow % ROWS_PER_PAGE);
+}
+
+// ---------------------------------------------------------------- blocks: occupied rows and computing PEs
+
+// How many cells go on a line (a power of two) so `count` cells come out as large as the canvas allows.
+function cellLayout(count, width, height) {
+    let best = { across: 1, down: count, size: 0 };
+    for (let across = 1; across <= count * 2; across = across * 2) {
+        const down = Math.ceil(count / across);
+        const size = Math.min(width / across, height / down);
+        if (size > best.size) {
+            best = { across: across, down: down, size: size };
+        }
+    }
+    return best;
+}
+
+function drawGaps(context, layout, left, color) {
+    context.strokeStyle = color;
+    context.lineWidth = 1;
+    context.beginPath();
+    for (let a = 1; a < layout.across; a++) {
+        context.moveTo(left + a * layout.size, 0);
+        context.lineTo(left + a * layout.size, layout.down * layout.size);
+    }
+    for (let d = 1; d < layout.down; d++) {
+        context.moveTo(left, d * layout.size);
+        context.lineTo(left + layout.across * layout.size, d * layout.size);
+    }
+    context.stroke();
+}
+
+// Paints `count` cells line by line: a cell whose flag is 1 in `color`, the rest empty; `across` fixes the cells per line.
+function paintCells(canvas, flags, count, color, across) {
+    const { context, width, height } = fitCanvas(canvas);
+    context.clearRect(0, 0, width, height);
     if (count === 0) {
-        return false;
+        return;
     }
-    const firstCell = Math.floor(first / MAP_ROWS);
-    const lastCell = Math.floor((first + count - 1) / MAP_ROWS);
-    return cell >= firstCell && cell <= lastCell;
+    let layout = cellLayout(count, width, height);
+    if (across !== undefined) {
+        const down = Math.ceil(count / across);
+        layout = { across: across, down: down, size: Math.min(width / across, height / down) };
+    }
+
+    // One pixel per cell, stretched to size; smoothing only when cells are smaller than a pixel, so painted ones still show.
+    const palette = readPalette();
+    const image = context.createImageData(layout.across, layout.down);
+    for (let i = 0; i < count; i++) {
+        let fill = palette.empty;
+        if (flags[i] === 1) {
+            fill = color;
+        }
+        image.data[i * 4] = fill[0];
+        image.data[i * 4 + 1] = fill[1];
+        image.data[i * 4 + 2] = fill[2];
+        image.data[i * 4 + 3] = 255;
+    }
+    const pixels = document.createElement("canvas");
+    pixels.width = layout.across;
+    pixels.height = layout.down;
+    pixels.getContext("2d").putImageData(image, 0, 0);
+    const left = (width - layout.across * layout.size) / 2;   // centred across the block
+    context.imageSmoothingEnabled = layout.size < 1;
+    context.drawImage(pixels, left, 0, layout.across * layout.size, layout.down * layout.size);
+    if (layout.size >= GAP_FROM) {
+        drawGaps(context, layout, left, palette.panel);
+    }
 }
 
-// ---------------------------------------------------------------- setup
-
-function buildMaps() {
-    const ubMap = byId("ub-map");
-    for (let i = 0; i < 384; i++) {
-        const x = 316 + (i % UB_ACROSS) * 11;
-        const y = 62 + Math.floor(i / UB_ACROSS) * 11;
-        ui.ubCells.push(svg("rect", { x: x, y: y, width: 10, height: 10, rx: 1.5, class: "cell" }, ubMap));
+// One flag per cell: every row of each [first, count] run sets the cell `cellOf` maps it to (-1: not shown).
+function runFlags(runs, count, cellOf) {
+    const flags = new Uint8Array(count);
+    for (const run of runs) {
+        for (let row = run[0]; row < run[0] + run[1]; row++) {
+            const cell = cellOf(row);
+            if (cell >= 0 && cell < count) {
+                flags[cell] = 1;
+            }
+        }
     }
+    return flags;
+}
 
-    const accMap = byId("acc-map");
-    for (let i = 0; i < 16; i++) {
-        const x = 686 + i * 15;
-        ui.accCells.push(svg("rect", { x: x, y: 458, width: 13, height: 30, rx: 2, class: "cell" }, accMap));
+function sameRow(row) {
+    return row;
+}
+
+// The UB and accumulators show at least 256 rows, doubling until the highest written row fits.
+function shownRows(runs, total) {
+    let highest = -1;
+    for (const run of runs) {
+        highest = Math.max(highest, run[0] + run[1] - 1);
     }
+    let shown = 256;
+    while (shown <= highest && shown < total) {
+        shown = shown * 2;
+    }
+    return Math.min(shown, total);
+}
 
-    const slots = byId("fifo-slots");
-    for (let i = 0; i < 4; i++) {
-        const y = 250 + i * 32;
-        const name = svg("text", { x: 1006, y: y + 10, class: "slot-name" }, slots);
-        svg("rect", { x: 1006, y: y + 16, width: 158, height: 6, rx: 3, class: "track" }, slots);
-        const fill = svg("rect", { x: 1006, y: y + 16, width: 0, height: 6, rx: 3, class: "fill" }, slots);
-        ui.fifoSlots.push({ name: name, fill: fill });
+// A slot's rows fill in as its tile streams in from DDR3.
+function fifoFlags(s) {
+    const flags = new Uint8Array(FIFO_SLOTS * ROWS_PER_PAGE);
+    s.wfifo.slots.forEach(function (slot, index) {
+        const rows = Math.ceil(slot.arrived / COLS);
+        for (let r = 0; r < rows; r++) {
+            flags[index * ROWS_PER_PAGE + r] = 1;
+        }
+    });
+    return flags;
+}
+
+// The PEs holding an input value this cycle, from [k, first column, count] runs.
+function peFlags(s) {
+    const flags = new Uint8Array(COLS * COLS);
+    for (const run of s.mxu.pes) {
+        for (let n = run[1]; n < run[1] + run[2]; n++) {
+            flags[run[0] * COLS + n] = 1;
+        }
+    }
+    return flags;
+}
+
+function paintBlocks(s) {
+    const palette = readPalette();
+
+    const ubCount = shownRows(s.ub_rows, UB_ROWS);
+    paintCells(byId("view-ub"), runFlags(s.ub_rows, ubCount, sameRow), ubCount, palette.occupied);
+
+    const accCount = shownRows(s.acc_rows, ACC_ROWS);
+    paintCells(byId("view-acc"), runFlags(s.acc_rows, accCount, sameRow), accCount, palette.occupied);
+
+    const hostCount = s.host.pages.length * ROWS_PER_PAGE;
+    const hostCell = function (row) {
+        return pagedViewRow(s.host.pages, row);
+    };
+    paintCells(byId("view-host"), runFlags(s.host.written, hostCount, hostCell), hostCount, palette.occupied);
+
+    const wmemCount = s.wmem.tiles.length * ROWS_PER_PAGE;
+    const wmemCell = function (row) {
+        return pagedViewRow(s.wmem.tiles, row);
+    };
+    paintCells(byId("view-wmem"), runFlags(s.wmem.written, wmemCount, wmemCell), wmemCount, palette.occupied);
+
+    paintCells(byId("view-wfifo"), fifoFlags(s), FIFO_SLOTS * ROWS_PER_PAGE, palette.occupied);
+
+    let lineCount = 0;
+    if (s.act.busy) {
+        lineCount = s.act.line_rows;
+    }
+    paintCells(byId("view-line"), new Uint8Array(lineCount).fill(1), lineCount, palette.occupied);
+
+    paintCells(byId("view-mxu"), peFlags(s), COLS * COLS, palette.computing, COLS);
+}
+
+// ---------------------------------------------------------------- arrows, laid across the gaps between blocks
+
+// Each arrow runs from one block to the next, `at` of the way along the edge the two blocks share.
+const ARROWS = [
+    { id: "arrow-host-ub", from: "block-host", to: "block-ub", at: 0.35 },
+    { id: "arrow-ub-host", from: "block-ub", to: "block-host", at: 0.65 },
+    { id: "arrow-ub-mxu", from: "block-ub", to: "block-mxu", at: 0.5 },
+    { id: "arrow-wmem-fifo", from: "block-wmem", to: "block-wfifo", at: 0.5 },
+    { id: "arrow-fifo-mxu", from: "block-wfifo", to: "block-mxu", at: 0.5 },
+    { id: "arrow-mxu-acc", from: "block-mxu", to: "block-acc", at: 0.5 },
+    { id: "arrow-acc-act", from: "block-acc", to: "block-act", at: 0.5 },
+    { id: "arrow-act-ub", from: "block-act", to: "block-ub", at: 0.5 },
+];
+
+// A block's box in the stage's coordinates, which are the arrow layer's.
+function boxInStage(id, stage) {
+    const box = byId(id).getBoundingClientRect();
+    return {
+        left: box.left - stage.left,
+        right: box.right - stage.left,
+        top: box.top - stage.top,
+        bottom: box.bottom - stage.top,
+    };
+}
+
+function layoutArrows() {
+    const stage = byId("stage").getBoundingClientRect();
+    for (const arrow of ARROWS) {
+        const a = boxInStage(arrow.from, stage);
+        const b = boxInStage(arrow.to, stage);
+        let start = null;
+        let end = null;
+        const sideBySide = a.right <= b.left || b.right <= a.left;
+        if (sideBySide) {
+            const top = Math.max(a.top, b.top);
+            const y = top + (Math.min(a.bottom, b.bottom) - top) * arrow.at;
+            if (a.right <= b.left) {
+                start = { x: a.right + 2, y: y };
+                end = { x: b.left - 3, y: y };
+            } else {
+                start = { x: a.left - 2, y: y };
+                end = { x: b.right + 3, y: y };
+            }
+        } else {
+            const left = Math.max(a.left, b.left);
+            const x = left + (Math.min(a.right, b.right) - left) * arrow.at;
+            if (a.bottom <= b.top) {
+                start = { x: x, y: a.bottom + 2 };
+                end = { x: x, y: b.top - 3 };
+            } else {
+                start = { x: x, y: a.top - 2 };
+                end = { x: x, y: b.bottom + 3 };
+            }
+        }
+        byId(arrow.id).setAttribute("d", "M" + start.x + "," + start.y + " L" + end.x + "," + end.y);
     }
 }
 
-function connect() {
-    const badge = byId("connection");
-    const source = new EventSource("/events");
-    source.onopen = function () {
-        badge.textContent = "live";
-        badge.className = "badge";
-    };
-    source.onerror = function () {
-        badge.textContent = "disconnected: restart ./tpu";
-        badge.className = "badge off";
-    };
-    source.onmessage = function (event) {
-        render(JSON.parse(event.data));
-    };
-}
-
-// ---------------------------------------------------------------- the diagram
+// ---------------------------------------------------------------- statuses, arrows and the header
 
 function setBlock(id, busy, stalled) {
     const block = byId(id);
@@ -140,14 +319,12 @@ function renderBlocks(s) {
     setBlock("block-wfifo", fetching || s.mxu.shifting, blame === "wfifo");
     setBlock("block-acc", s.mxu.busy || s.act.busy, blame === "acc");
     setBlock("block-act", s.act.busy, blame === "act");
-}
 
-function renderArrows(s) {
     const flows = {
         "arrow-host-ub": s.host.busy && s.host.to_ub,
         "arrow-ub-host": s.host.busy && !s.host.to_ub,
         "arrow-ub-mxu": s.mxu.busy,
-        "arrow-wmem-fifo": s.wmem.fetching >= 0,
+        "arrow-wmem-fifo": fetching,
         "arrow-fifo-mxu": s.mxu.shifting,
         "arrow-mxu-acc": s.mxu.busy,
         "arrow-acc-act": s.act.busy,
@@ -158,255 +335,114 @@ function renderArrows(s) {
     }
 }
 
-function renderHost(s) {
+// The parts joined by " · ", or `fallback` when there are none.
+function joinedOr(parts, fallback) {
+    if (parts.length === 0) {
+        return fallback;
+    }
+    return parts.join(" · ");
+}
+
+function renderStatuses(s) {
     const host = s.host;
+    let hostText = "idle";
+    if (host.busy && host.to_ub) {
+        hostText = "host " + rowRange(host.host_row, host.rows) + " → UB " + rowRange(host.ub_row, host.rows);
+    } else if (host.busy) {
+        hostText = "UB " + rowRange(host.ub_row, host.rows) + " → host " + rowRange(host.host_row, host.rows);
+    }
     if (host.busy) {
-        const hostRows = "host " + rowRange(host.host_row, host.rows);
-        const ubRows = "UB " + rowRange(host.ub_row, host.rows);
-        if (host.to_ub) {
-            byId("host-status").textContent = hostRows;
-            byId("host-status-2").textContent = "→ " + ubRows;
-        } else {
-            byId("host-status").textContent = ubRows;
-            byId("host-status-2").textContent = "→ " + hostRows;
-        }
-        byId("host-detail").textContent = host.done + " of " + host.total + " bytes moved";
-    } else {
-        byId("host-status").textContent = "idle";
-        byId("host-status-2").textContent = "";
-        byId("host-detail").textContent = "";
+        hostText = hostText + ", " + host.done + " of " + host.total + " bytes";
     }
-    byId("host-pages").textContent = host.pages + " × 64 KiB pages in use";
-}
+    byId("host-status").textContent = hostText;
 
-// Shades cells that hold data, lights cells written recently, and outlines the rows units are touching now.
-function renderMap(cells, map, writing, reading) {
-    for (let i = 0; i < cells.length; i++) {
-        const cell = cells[i];
-        const age = map.age[i];
-        const fresh = age >= 0 && age < FRESH_CYCLES;
-
-        cell.classList.toggle("data", map.nonzero[i] === "#");
-        cell.classList.toggle("fresh", fresh);
-        if (fresh) {
-            cell.style.fillOpacity = String(1 - age / FRESH_CYCLES);
-        } else {
-            cell.style.fillOpacity = "";
-        }
-
-        let isWriting = false;
-        for (const range of writing) {
-            isWriting = isWriting || cellInRange(i, range[0], range[1]);
-        }
-        let isReading = false;
-        for (const range of reading) {
-            isReading = isReading || cellInRange(i, range[0], range[1]);
-        }
-        cell.classList.toggle("writing", isWriting);
-        cell.classList.toggle("reading", isReading && !isWriting);
-    }
-}
-
-function renderUnifiedBuffer(s) {
-    const writing = [];
-    const reading = [];
-    const said = [];
-    if (s.host.busy && s.host.to_ub) {
-        writing.push([s.host.ub_row, s.host.rows]);
-        said.push("host writes " + rowRange(s.host.ub_row, s.host.rows));
-    }
-    if (s.host.busy && !s.host.to_ub) {
-        reading.push([s.host.ub_row, s.host.rows]);
-        said.push("host reads " + rowRange(s.host.ub_row, s.host.rows));
-    }
+    const ub = [];
     if (s.mxu.busy) {
-        reading.push([s.mxu.ub_row, s.mxu.rows]);
-        said.push("MXU reads " + rowRange(s.mxu.ub_row, s.mxu.rows));
+        ub.push("MXU reads " + rowRange(s.mxu.ub_row, s.mxu.rows));
     }
     if (s.act.busy) {
-        writing.push([s.act.ub_row, s.act.out_rows]);
-        said.push("activation writes " + rowRange(s.act.ub_row, s.act.out_rows));
+        ub.push("activation writes " + rowRange(s.act.ub_row, s.act.out_rows));
     }
-    renderMap(ui.ubCells, s.ub, writing, reading);
-    if (said.length > 0) {
-        byId("ub-status").textContent = said.join(" · ");
-    } else {
-        byId("ub-status").textContent = "idle";
+    if (host.busy && host.to_ub) {
+        ub.push("host writes " + rowRange(host.ub_row, host.rows));
+    } else if (host.busy) {
+        ub.push("host reads " + rowRange(host.ub_row, host.rows));
     }
-}
+    byId("ub-status").textContent = joinedOr(ub, "idle");
 
-function renderAccumulators(s) {
-    const writing = [];
-    const reading = [];
-    const said = [];
-    if (s.mxu.busy) {
-        writing.push([s.mxu.acc_row, s.mxu.rows]);
-        said.push("MXU writes " + rowRange(s.mxu.acc_row, s.mxu.rows));
-    }
-    if (s.act.busy) {
-        reading.push([s.act.acc_row, s.act.total]);
-        said.push("activation reads " + rowRange(s.act.acc_row, s.act.total));
-    }
-    renderMap(ui.accCells, s.acc, writing, reading);
-    byId("acc-status").textContent = "";
-    byId("acc-status-2").textContent = "";
-    if (said.length > 0) {
-        byId("acc-status").textContent = said[0];
-    }
-    if (said.length > 1) {
-        byId("acc-status-2").textContent = said[1];
-    }
-}
-
-// Every PE, 256 x 256: the PEs holding data this cycle form diagonal bands, one per input row, sweeping down and right.
-function renderMxuCanvas(s) {
     const mxu = s.mxu;
-    const canvas = byId("mxu-canvas");
-    const context = canvas.getContext("2d");
-    const image = context.createImageData(mxu.dim, mxu.dim);
-
-    const empty = rgb(cssColor("--pe-empty"));
-    const loaded = rgb(cssColor("--pe-loaded"));
-    const active = rgb(cssColor("--pe-active"));
-    const activeAlt = rgb(cssColor("--pe-active-alt"));
-    let base = empty;
-    if (mxu.active_tile >= 0) {
-        base = loaded;
-    }
-
-    // After step s the grid holds step s - 1: PE (k, n) carries input row (s - 1) - k - n.
-    const lastStep = mxu.step - 1;
-    for (let k = 0; k < mxu.dim; k++) {
-        for (let n = 0; n < mxu.dim; n++) {
-            const row = lastStep - k - n;
-            const holdsData = mxu.busy && row >= 0 && row < mxu.rows;
-            let color = base;
-            if (holdsData && row % 2 === 0) {
-                color = active;
-            } else if (holdsData) {
-                color = activeAlt;
-            }
-            const at = (k * mxu.dim + n) * 4;
-            image.data[at] = color[0];
-            image.data[at + 1] = color[1];
-            image.data[at + 2] = color[2];
-            image.data[at + 3] = 255;
-        }
-    }
-    context.putImageData(image, 0, 0);
-}
-
-function renderMxu(s) {
-    const mxu = s.mxu;
-    renderMxuCanvas(s);
-
+    let mxuText = "idle";
     if (mxu.busy) {
-        byId("mxu-status").textContent = "step " + mxu.step + " of " + mxu.total;
-        byId("mxu-flow").textContent = "UB " + rowRange(mxu.ub_row, mxu.rows) + " → acc " + rowRange(mxu.acc_row, mxu.rows);
-    } else {
-        byId("mxu-status").textContent = "idle";
-        byId("mxu-flow").textContent = "";
+        mxuText = "step " + mxu.step + " of " + mxu.total + ", UB " + rowRange(mxu.ub_row, mxu.rows) +
+                  " → acc " + rowRange(mxu.acc_row, mxu.rows);
     }
-
     if (mxu.active_tile >= 0) {
-        byId("mxu-weights").textContent = "active weights: tile " + hex(mxu.active_tile);
-    } else {
-        byId("mxu-weights").textContent = "active weights: none yet";
+        mxuText = mxuText + " · weights tile " + hex(mxu.active_tile);
     }
-
-    let shadow = "shadow weights: empty";
-    let shifted = 0;
     if (mxu.shadow_ready) {
-        shadow = "shadow weights: tile " + hex(mxu.shadow_tile) + ", ready";
-        shifted = 256;
+        mxuText = mxuText + " · next tile " + hex(mxu.shadow_tile) + " ready";
     } else if (mxu.shifting) {
-        shadow = "shadow weights: tile " + hex(mxu.shadow_tile) + ", " + mxu.rows_shifted + " of 256 rows shifted in";
-        shifted = mxu.rows_shifted;
+        mxuText = mxuText + " · next tile " + hex(mxu.shadow_tile) + " " + mxu.rows_shifted + "/256 rows in";
     }
-    byId("mxu-shadow").textContent = shadow;
-    byId("shadow-bar").setAttribute("width", String(238 * shifted / 256));
-}
+    byId("mxu-status").textContent = mxuText;
 
-function renderWeights(s) {
-    const wmem = s.wmem;
-    if (wmem.fetching >= 0) {
-        byId("wmem-status").textContent = "fetching tile " + hex(wmem.fetching);
+    if (s.wmem.fetching >= 0) {
+        byId("wmem-status").textContent = "fetching tile " + hex(s.wmem.fetching);
     } else {
         byId("wmem-status").textContent = "idle";
     }
 
-    let tiles = wmem.tiles + " tiles hold weights";
-    if (wmem.tiles === 1) {
-        tiles = "1 tile holds weights";
-    }
-    if (wmem.tiles > 0) {
-        tiles = tiles + ": " + wmem.tile_list.slice(0, 6).map(hex).join(", ");
-    }
-    if (wmem.tiles > 6) {
-        tiles = tiles + ", …";
-    }
-    byId("wmem-tiles").textContent = tiles;
-
-    const fifo = s.wfifo;
-    for (let i = 0; i < ui.fifoSlots.length; i++) {
-        const slot = ui.fifoSlots[i];
-        const entry = fifo.slots[i];
-        if (entry === undefined) {
-            slot.name.textContent = "slot " + i + ": empty";
-            slot.fill.setAttribute("width", "0");
-            continue;
+    const slots = s.wfifo.slots.map(function (slot) {
+        if (slot.arrived === s.wfifo.tile_bytes) {
+            return "tile " + hex(slot.tile) + " ready";
         }
-        let state = "ready";
-        if (entry.arrived < fifo.tile_bytes) {
-            state = Math.floor(100 * entry.arrived / fifo.tile_bytes) + "% arrived";
-        }
-        slot.name.textContent = "slot " + i + ": tile " + hex(entry.tile) + ", " + state;
-        slot.fill.setAttribute("width", String(158 * entry.arrived / fifo.tile_bytes));
-    }
-}
+        return "tile " + hex(slot.tile) + " " + Math.floor(100 * slot.arrived / s.wfifo.tile_bytes) + "%";
+    });
+    byId("wfifo-status").textContent = joinedOr(slots, "empty");
 
-function renderActivation(s) {
     const act = s.act;
-    if (!act.busy) {
-        byId("act-status").textContent = "idle";
-        byId("act-detail").textContent = "";
-        byId("act-progress").textContent = "";
-        byId("act-bar").setAttribute("width", "0");
-        return;
+    let actText = "idle";
+    let progress = 0;
+    if (act.busy) {
+        actText = act.function + ", shift " + act.shift;
+        if (act.pool !== "none") {
+            actText = actText + ", " + act.pool + " pool " + act.pool_size + "×" + act.pool_size;
+        }
+        actText = actText + ", acc " + rowRange(act.acc_row, act.total) + " → UB " + rowRange(act.ub_row, act.out_rows);
+        progress = 100 * act.done / act.total;
     }
+    byId("act-status").textContent = actText;
+    byId("act-bar").style.width = progress + "%";
 
-    let how = act.function + ", shift " + act.shift;
-    if (act.pool !== "none") {
-        how = how + ", " + act.pool + " pool " + act.pool_size + "×" + act.pool_size + " over width " + act.pool_width;
+    const acc = [];
+    if (s.mxu.busy) {
+        acc.push("MXU writes " + rowRange(s.mxu.acc_row, s.mxu.rows));
     }
-    byId("act-status").textContent = how;
-    byId("act-detail").textContent = "acc " + rowRange(act.acc_row, act.total) + " → UB " + rowRange(act.ub_row, act.out_rows);
-    byId("act-progress").textContent = act.done + " of " + act.total + " rows read";
-    byId("act-bar").setAttribute("width", String(268 * act.done / act.total));
+    if (act.busy) {
+        acc.push("activation reads " + rowRange(act.acc_row, act.total));
+    }
+    byId("acc-status").textContent = joinedOr(acc, "idle");
 }
-
-// ---------------------------------------------------------------- the panels
 
 function renderHeader(s) {
-    if (s.file === "") {
-        byId("file").textContent = "no program loaded";
-    } else {
-        byId("file").textContent = s.file;
-    }
     byId("cycle").textContent = String(s.cycle);
     byId("pc").textContent = String(s.pc);
     byId("issued").textContent = String(s.issued);
-
     const state = byId("state");
     state.textContent = s.state;
+    if (s.program.length === 0) {
+        state.textContent = "no program: type load FILE in the terminal";
+    }
     state.classList.toggle("stalled", s.state.startsWith("stalled"));
 }
 
+let programKey = "";
+
 function renderProgram(s) {
     const list = byId("program");
-    const key = s.file + "\n" + s.program.join("\n");
-    if (key !== ui.programKey) {
-        ui.programKey = key;
+    const key = s.program.join("\n");
+    if (key !== programKey) {
+        programKey = key;
         list.textContent = "";
         s.program.forEach(function (line, index) {
             const item = document.createElement("li");
@@ -414,161 +450,555 @@ function renderProgram(s) {
             list.appendChild(item);
         });
     }
-
     const items = list.children;
     for (let i = 0; i < items.length; i++) {
-        const item = items[i];
         const current = i === s.pc;
-        item.classList.toggle("done", i < s.pc);
-        item.classList.toggle("current", current);
-        item.classList.toggle("stalled", current && s.state.startsWith("stalled"));
+        items[i].classList.toggle("current", current);
+        items[i].classList.toggle("stalled", current && s.state.startsWith("stalled"));
     }
-
-    const current = items[s.pc];
-    if (current !== undefined) {
-        list.scrollTop = current.offsetTop - list.clientHeight / 2;
+    if (items[s.pc] !== undefined) {
+        list.scrollTop = items[s.pc].offsetTop - list.clientHeight / 2;
     }
 }
 
-function buildTimelineKey(s) {
-    const key = byId("timeline-key");
-    const entries = [["I", "issued"]];
-    for (const stall of s.stalls) {
-        entries.push([stall.letter, stall.name]);
+// ---------------------------------------------------------------- the buttons
+
+let pressing = false;   // one press at a time; clicks while one is on its way are dropped
+
+// Asks the simulator to move one cycle or one instruction; the new snapshot arrives over /events as usual.
+async function press(direction) {
+    if (pressing) {
+        return;
     }
-    for (const entry of entries) {
-        const item = document.createElement("span");
-        const swatch = document.createElement("i");
-        swatch.style.background = LETTER_COLORS[entry[0]];
-        item.appendChild(swatch);
-        item.appendChild(document.createTextNode(entry[1]));
-        key.appendChild(item);
+    pressing = true;
+    const unit = document.querySelector("input[name='unit']:checked").value;
+    try {
+        await fetch("/move?direction=" + direction + "&unit=" + unit, { method: "POST" });
+    } catch (error) {
+        // the simulator has gone away
     }
-    ui.keyBuilt = true;
+    pressing = false;
 }
 
-// One column per cycle, newest on the right; the issue lane is colored by what happened, unit lanes by busy or idle.
-function renderTimeline(s) {
-    if (!ui.keyBuilt) {
-        buildTimelineKey(s);
-    }
+function listenButtons() {
+    byId("back").addEventListener("click", function () {
+        press("back");
+    });
+    byId("forward").addEventListener("click", function () {
+        press("forward");
+    });
+}
 
-    const t = s.timeline;
+// ---------------------------------------------------------------- the row inspector: the one place values show
+
+// One value from a /rows or /pes reply: an int8, a little-endian int32, or a PE's 12 bytes of registers.
+function decodeValue(kind, bytes, i) {
+    if (kind === "i8") {
+        return bytes.getInt8(i);
+    }
+    if (kind === "i32") {
+        return bytes.getInt32(i * 4, true);
+    }
+    const at = i * 12;
+    return {
+        weight: bytes.getInt8(at),
+        shadow: bytes.getInt8(at + 1),
+        act: bytes.getInt8(at + 2),
+        psum: bytes.getInt32(at + 4, true),
+        row: bytes.getInt32(at + 8, true),
+    };
+}
+
+// `count` rows of 256 values each.
+function decodeRows(kind, bytes, count) {
+    const rows = [];
+    for (let r = 0; r < count; r++) {
+        const values = [];
+        for (let c = 0; c < COLS; c++) {
+            values.push(decodeValue(kind, bytes, r * COLS + c));
+        }
+        rows.push(values);
+    }
+    return rows;
+}
+
+// A memory whose /rows numbering is its real row numbering.
+function directRow(s, row) {
+    return row;
+}
+
+// Each memory's name, value kind, row count, and where a real row sits in its /rows numbering (-1: page not in use); MXU entries read one PE register.
+const MEMORIES = {
+    ub: {
+        name: "Unified Buffer", kind: "i8", changes: false,
+        rows: function () { return UB_ROWS; },
+        viewRow: directRow,
+    },
+    acc: {
+        name: "Accumulators", kind: "i32", changes: false,
+        rows: function () { return ACC_ROWS; },
+        viewRow: directRow,
+    },
+    host: {
+        name: "Host memory", kind: "i8", changes: false,
+        rows: function () { return 16777216; },   // 4 GiB of 256-byte rows
+        viewRow: function (s, row) { return pagedViewRow(s.host.pages, row); },
+    },
+    wmem: {
+        name: "Weight Memory", kind: "i8", changes: false,
+        rows: function () { return 33554432; },   // 8 GiB of 256-byte rows
+        viewRow: function (s, row) { return pagedViewRow(s.wmem.tiles, row); },
+    },
+    fifo: {
+        name: "Weight FIFO", kind: "i8", changes: true,
+        rows: function (s) { return s.wfifo.slots.length * ROWS_PER_PAGE; },
+        viewRow: directRow,
+    },
+    line: {
+        name: "Pooling buffer", kind: "i32", changes: true,
+        rows: function (s) { return s.act.line_rows; },
+        viewRow: directRow,
+    },
+    mxu_weight: {
+        name: "MXU weights", kind: "i8", field: "weight", changes: false,
+        rows: function () { return COLS; },
+        viewRow: directRow,
+    },
+    mxu_shadow: {
+        name: "MXU shadow weights", kind: "i8", field: "shadow", changes: false,
+        rows: function () { return COLS; },
+        viewRow: directRow,
+    },
+    mxu_act: {
+        name: "MXU activations", kind: "i8", field: "act", changes: false,
+        rows: function () { return COLS; },
+        viewRow: directRow,
+    },
+    mxu_psum: {
+        name: "MXU partial sums", kind: "i32", field: "psum", changes: false,
+        rows: function () { return COLS; },
+        viewRow: directRow,
+    },
+};
+
+const inspector = {
+    memory: "ub",
+    row: 0,           // the real row; -1 when the row box does not hold a number
+    values: null,     // the row's 256 values, or null when there is nothing to show
+    cycle: -1,        // the cycle the values belong to
+    ticket: 0,        // each fetch takes a ticket, and only the newest one's reply is kept
+};
+
+// "36" or "0x24"; -1 for anything else.
+function parseRow(text) {
+    const trimmed = text.trim();
+    if (/^0x[0-9a-f]+$/i.test(trimmed)) {
+        return parseInt(trimmed.slice(2), 16);
+    }
+    if (/^[0-9]+$/.test(trimmed)) {
+        return parseInt(trimmed, 10);
+    }
+    return -1;
+}
+
+function inspectedViewRow(s) {
+    const memory = MEMORIES[inspector.memory];
+    if (inspector.row < 0 || inspector.row >= memory.rows(s)) {
+        return -1;
+    }
+    return memory.viewRow(s, inspector.row);
+}
+
+// A PE row comes from /pes and keeps one register; a memory row comes from /rows.
+function inspectorUrl(viewRow) {
+    if (MEMORIES[inspector.memory].field !== undefined) {
+        return "/pes?first=" + viewRow + "&count=1";
+    }
+    return "/rows?memory=" + inspector.memory + "&first=" + viewRow + "&count=1";
+}
+
+function inspectorValues(bytes) {
+    const memory = MEMORIES[inspector.memory];
+    if (memory.field === undefined) {
+        return decodeRows(memory.kind, bytes, 1)[0];
+    }
+    return decodeRows("pe", bytes, 1)[0].map(function (pe) {
+        return pe[memory.field];
+    });
+}
+
+// Fetches the inspected row for the latest cycle; a page not in use reads as zeros, as it does in the machine.
+async function loadInspector() {
+    if (latest === null) {
+        return;
+    }
+    inspector.ticket = inspector.ticket + 1;
+    const ticket = inspector.ticket;
+    const memory = MEMORIES[inspector.memory];
+    const s = latest;
+    inspector.cycle = s.cycle;
+
+    const inRange = inspector.row >= 0 && inspector.row < memory.rows(s);
+    const viewRow = inspectedViewRow(s);
+    if (!inRange) {
+        inspector.values = null;
+    } else if (viewRow < 0) {
+        inspector.values = new Array(COLS).fill(0);
+    } else {
+        try {
+            const response = await fetch(inspectorUrl(viewRow));
+            if (!response.ok || ticket !== inspector.ticket) {
+                return;
+            }
+            inspector.values = inspectorValues(new DataView(await response.arrayBuffer()));
+        } catch (error) {
+            return;   // the simulator has gone away
+        }
+    }
+    if (ticket === inspector.ticket) {
+        renderInspector();
+    }
+}
+
+function formatValue(value, kind, asHex) {
+    if (!asHex) {
+        return String(value);
+    }
+    if (kind === "i8") {
+        return (value & 0xFF).toString(16).toUpperCase().padStart(2, "0");
+    }
+    return (value >>> 0).toString(16).toUpperCase().padStart(8, "0");
+}
+
+// Where the row is, in words: the real row, plus the tile or slot it falls in when that helps.
+function inspectorTitle(s) {
+    const memory = MEMORIES[inspector.memory];
+    const row = inspector.row;
+    let where = memory.name + " row " + hex(row);
+    if (memory.field !== undefined) {
+        where = memory.name + ", PE row " + row;
+    }
+    if (inspector.memory === "wmem") {
+        where = where + " (tile " + hex(Math.floor(row / ROWS_PER_PAGE)) + ", row " + (row % ROWS_PER_PAGE) + ")";
+    }
+    if (inspector.memory === "fifo") {
+        const slot = Math.floor(row / ROWS_PER_PAGE);
+        where = where + " (slot " + slot + ", tile " + hex(s.wfifo.slots[slot].tile) + ", row " + (row % ROWS_PER_PAGE) + ")";
+    }
+    where = where + " at cycle " + inspector.cycle;
+    if (inspectedViewRow(s) < 0) {
+        where = where + ": never written, so every value is 0";
+    }
+    return where;
+}
+
+// Why there is nothing to show: the row is past the memory's end; a row box that is not a number shows nothing at all.
+function inspectorProblem(s) {
+    const memory = MEMORIES[inspector.memory];
+    if (inspector.row < 0) {
+        return "";
+    }
+    const rows = memory.rows(s);
+    let now = "";
+    if (memory.changes) {
+        now = " right now";
+    }
+    if (rows === 0) {
+        return memory.name + " is empty" + now;
+    }
+    return memory.name + " has rows 0x0-" + hex(rows - 1) + now;
+}
+
+// The 256 values, 16 to a line, each line labelled with its first column.
+function renderInspector() {
+    const grid = byId("inspect-values");
+    if (inspector.values === null) {
+        byId("inspect-title").textContent = inspectorProblem(latest);
+        grid.textContent = "";
+        return;
+    }
+    byId("inspect-title").textContent = inspectorTitle(latest);
+
+    const kind = MEMORIES[inspector.memory].kind;
+    const asHex = byId("inspect-hex").checked;
+    const cells = [];
+    const corner = document.createElement("span");
+    corner.className = "label";
+    cells.push(corner);
+    for (let col = 0; col < 16; col++) {
+        const heading = document.createElement("span");
+        heading.className = "label";
+        heading.textContent = "+" + col.toString(16).toUpperCase();
+        cells.push(heading);
+    }
+    for (let line = 0; line < 16; line++) {
+        const label = document.createElement("span");
+        label.className = "label";
+        label.textContent = hex(line * 16);
+        cells.push(label);
+        for (let col = 0; col < 16; col++) {
+            const cell = document.createElement("span");
+            cell.textContent = formatValue(inspector.values[line * 16 + col], kind, asHex);
+            cells.push(cell);
+        }
+    }
+    grid.replaceChildren(...cells);
+}
+
+function listenInspector() {
+    const pick = function () {
+        inspector.memory = byId("inspect-memory").value;
+        inspector.row = parseRow(byId("inspect-row").value);
+        loadInspector();
+    };
+    byId("inspect-memory").addEventListener("change", pick);
+    byId("inspect-row").addEventListener("input", pick);
+    byId("inspect-hex").addEventListener("change", function () {
+        if (inspector.values !== null) {
+            renderInspector();
+        }
+    });
+}
+
+// ---------------------------------------------------------------- the timeline: the last 64 cycles, one lane per unit
+
+// Each lane names what its unit works on; a run of cycles with the same work is one bar.
+const LANES = [
+    { name: "Issue", key: "issued" },
+    { name: "PCIe", key: "host", color: "host" },
+    { name: "DDR3 → FIFO", key: "fetching", color: "weights" },
+    { name: "Weight shift", key: "shifting", color: "weights" },
+    { name: "MXU", key: "mxu", color: "mxu" },
+    { name: "Activation", key: "activation", color: "act" },
+];
+
+let timelineHover = -1;   // the hovered cycle's place in the window, or -1
+
+function instructionText(s, pc) {
+    if (pc >= 0 && pc < s.program.length) {
+        return s.program[pc];
+    }
+    return "pc " + pc;
+}
+
+// What a lane shows in one cycle: an id that joins equal neighbours into one bar, a label, a short label and a color; null when idle.
+function laneWork(s, lane, cycle) {
+    if (lane.key === "issued") {
+        if (cycle.issued >= 0) {
+            const text = instructionText(s, cycle.issued);
+            return { id: "i" + cycle.issued, label: "pc " + cycle.issued + ": " + text, short: String(cycle.issued), color: "issue" };
+        }
+        if (cycle.stall > 0) {
+            return { id: "s" + cycle.stall, label: "stalled: " + s.stall_names[cycle.stall], short: "stall", color: "stall" };
+        }
+        return null;
+    }
+    const value = cycle[lane.key];
+    if (value < 0) {
+        return null;
+    }
+    if (lane.key === "fetching" || lane.key === "shifting") {
+        return { id: String(value), label: "tile " + hex(value), short: hex(value), color: lane.color };
+    }
+    const text = instructionText(s, value);
+    return { id: String(value), label: text, short: text.split(" ")[0], color: lane.color };
+}
+
+// The lane's bars across the window: each is { first, count, work }, with first counted from the window's start.
+function laneBars(s, lane) {
+    const bars = [];
+    s.timeline.cycles.forEach(function (cycle, index) {
+        const work = laneWork(s, lane, cycle);
+        if (work === null) {
+            return;
+        }
+        const last = bars[bars.length - 1];
+        const continues = last !== undefined && last.first + last.count === index && last.work.id === work.id;
+        if (continues) {
+            last.count = last.count + 1;
+        } else {
+            bars.push({ first: index, count: 1, work: work });
+        }
+    });
+    return bars;
+}
+
+// The longest text that fits in `room` pixels: the label, the label cut short with "…", the short label, or nothing.
+function fitText(context, label, short, room) {
+    if (context.measureText(label).width <= room) {
+        return label;
+    }
+    for (let length = label.length - 1; length >= 8; length--) {
+        const cut = label.slice(0, length) + "…";
+        if (context.measureText(cut).width <= room) {
+            return cut;
+        }
+    }
+    if (context.measureText(short).width <= room) {
+        return short;
+    }
+    return "";
+}
+
+function drawBar(context, palette, bar, x, top, width, laneHeight) {
+    const edge = palette.lanes[bar.work.color];
+    const y = top + 2.5;
+    const height = laneHeight - 5;
+    const fill = mix(rgb(palette.panel), rgb(edge), 0.3);
+    context.beginPath();
+    context.roundRect(x + 1, y, Math.max(width - 2, 1), height, 3);
+    context.fillStyle = "rgb(" + fill.join(",") + ")";
+    context.fill();
+    context.strokeStyle = edge;
+    context.lineWidth = 1;
+    context.stroke();
+
+    const text = fitText(context, bar.work.label, bar.work.short, width - 8);
+    if (text !== "") {
+        context.fillStyle = palette.ink;
+        context.fillText(text, x + 5, y + height / 2);
+    }
+}
+
+// A tick for every cycle, a longer one with the cycle number every 8.
+function drawRuler(context, palette, t, cell, width) {
+    context.strokeStyle = palette.line;
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(TIMELINE_GUTTER, TIMELINE_RULER - 0.5);
+    context.lineTo(width, TIMELINE_RULER - 0.5);
+    for (let c = 0; c <= t.length; c++) {
+        const x = Math.round(TIMELINE_GUTTER + c * cell) + 0.5;
+        let tick = 3;
+        if ((t.first + c) % 8 === 0) {
+            tick = 7;
+        }
+        context.moveTo(x, TIMELINE_RULER);
+        context.lineTo(x, TIMELINE_RULER - tick);
+    }
+    context.stroke();
+
+    context.fillStyle = palette.ink;
+    for (let c = 0; c < t.length; c++) {
+        const label = String(t.first + c);
+        const x = TIMELINE_GUTTER + c * cell + 3;
+        const fits = x + context.measureText(label).width <= width;
+        if ((t.first + c) % 8 === 0 && fits) {
+            context.fillText(label, x, 6);
+        }
+    }
+}
+
+function drawTimeline() {
     const canvas = byId("timeline");
-    let scale = 1;
-    if (window.devicePixelRatio > 1) {
-        scale = window.devicePixelRatio;
+    const { context, width, height } = fitCanvas(canvas);
+    context.clearRect(0, 0, width, height);
+    if (latest === null) {
+        return;
     }
-    const shownWidth = canvas.clientWidth;
-    const shownHeight = canvas.clientHeight;
-    canvas.width = Math.round(shownWidth * scale);
-    canvas.height = Math.round(shownHeight * scale);
-    const context = canvas.getContext("2d");
-    context.setTransform(scale, 0, 0, scale, 0, 0);
-    const labelWidth = 70;
-    const laneHeight = 22;
-    const cycles = t.issue.length;
-    const width = (shownWidth - labelWidth) / 200;
-
-    context.clearRect(0, 0, shownWidth, shownHeight);
-    context.font = "12px -apple-system, sans-serif";
+    const palette = readPalette();
+    const t = latest.timeline;
+    const cell = (width - TIMELINE_GUTTER) / t.length;
+    const laneHeight = (height - TIMELINE_RULER) / LANES.length;
+    context.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
     context.textBaseline = "middle";
 
-    const busy = cssColor("--busy");
-    const idle = cssColor("--line");
-    TIMELINE_LANES.forEach(function (lane, laneIndex) {
-        const y = laneIndex * (laneHeight + 3);
-        context.fillStyle = cssColor("--dim");
-        context.fillText(lane.label, 0, y + laneHeight / 2);
+    LANES.forEach(function (lane, index) {
+        const top = TIMELINE_RULER + index * laneHeight;
+        if (index % 2 === 1) {
+            context.fillStyle = palette.stripe;
+            context.fillRect(0, top, width, laneHeight);
+        }
+        context.fillStyle = palette.ink;
+        context.fillText(lane.name, 2, top + laneHeight / 2);
+    });
 
-        const marks = t[lane.key];
-        for (let c = 0; c < cycles; c++) {
-            const letter = marks[c];
-            let color = idle;
-            if (lane.key === "issue" && letter in LETTER_COLORS) {
-                color = LETTER_COLORS[letter];
-            } else if (lane.key !== "issue" && letter === "#") {
-                color = busy;
-            }
-            context.fillStyle = color;
-            context.fillRect(labelWidth + c * width, y, Math.max(width - 0.5, 1), laneHeight);
+    drawRuler(context, palette, t, cell, width);
+
+    LANES.forEach(function (lane, index) {
+        const top = TIMELINE_RULER + index * laneHeight;
+        for (const bar of laneBars(latest, lane)) {
+            drawBar(context, palette, bar, TIMELINE_GUTTER + bar.first * cell, top, bar.count * cell, laneHeight);
         }
     });
 
-    if (cycles > 0) {
-        byId("timeline-range").textContent = "cycles " + t.first_cycle + "-" + (t.first_cycle + cycles - 1);
-    } else {
-        byId("timeline-range").textContent = "";
+    if (timelineHover >= 0 && timelineHover < t.cycles.length) {
+        const x = Math.round(TIMELINE_GUTTER + (timelineHover + 0.5) * cell) + 0.5;
+        context.strokeStyle = palette.ink;
+        context.beginPath();
+        context.moveTo(x, TIMELINE_RULER);
+        context.lineTo(x, height);
+        context.stroke();
     }
 }
 
-function renderStalls(s) {
-    const box = byId("stalls");
-    box.textContent = "";
-    let largest = 1;
-    for (const stall of s.stalls) {
-        largest = Math.max(largest, stall.cycles);
+// The hovered cycle in one line: its number, then what each busy lane worked on.
+function showTimelineHover() {
+    const readout = byId("timeline-readout");
+    if (latest === null || timelineHover < 0 || timelineHover >= latest.timeline.cycles.length) {
+        readout.textContent = "";
+        return;
     }
-    for (const stall of s.stalls) {
-        const row = document.createElement("div");
-        row.className = "stall-row";
-
-        const name = document.createElement("span");
-        name.textContent = stall.name;
-        const track = document.createElement("span");
-        const bar = document.createElement("div");
-        bar.className = "stall-bar";
-        bar.style.width = (100 * stall.cycles / largest) + "%";
-        bar.style.background = LETTER_COLORS[stall.letter];
-        track.appendChild(bar);
-        const count = document.createElement("span");
-        count.className = "stall-count";
-        count.textContent = String(stall.cycles);
-
-        row.appendChild(name);
-        row.appendChild(track);
-        row.appendChild(count);
-        box.appendChild(row);
+    const cycle = latest.timeline.cycles[timelineHover];
+    const parts = ["cycle " + (latest.timeline.first + timelineHover)];
+    for (const lane of LANES) {
+        const work = laneWork(latest, lane, cycle);
+        if (work !== null) {
+            parts.push(lane.name + ": " + work.label);
+        }
     }
-
-    let share = 0;
-    if (s.cycle > 0) {
-        share = Math.round(100 * s.mxu_busy_cycles / s.cycle);
-    }
-    byId("utilization").textContent = "MXU busy " + s.mxu_busy_cycles + " of " + s.cycle + " cycles (" + share + "%)";
+    readout.textContent = parts.join(" · ");
 }
 
-function renderPinned(s) {
-    const box = byId("pinned");
-    box.textContent = "";
-    for (const view of s.pinned) {
-        const section = document.createElement("div");
-        section.className = "pinned-view";
-        const title = document.createElement("h3");
-        title.textContent = view.target;
-        const text = document.createElement("pre");
-        text.textContent = view.text;
-        section.appendChild(title);
-        section.appendChild(text);
-        box.appendChild(section);
-    }
+function listenTimeline() {
+    const canvas = byId("timeline");
+    canvas.addEventListener("mousemove", function (event) {
+        timelineHover = -1;
+        if (latest !== null && event.offsetX >= TIMELINE_GUTTER) {
+            const cell = (canvas.clientWidth - TIMELINE_GUTTER) / latest.timeline.length;
+            timelineHover = Math.floor((event.offsetX - TIMELINE_GUTTER) / cell);
+        }
+        drawTimeline();
+        showTimelineHover();
+    });
+    canvas.addEventListener("mouseleave", function () {
+        timelineHover = -1;
+        drawTimeline();
+        showTimelineHover();
+    });
 }
+
+// ---------------------------------------------------------------- snapshots
 
 function render(s) {
+    latest = s;
     renderHeader(s);
     renderBlocks(s);
-    renderArrows(s);
-    renderHost(s);
-    renderUnifiedBuffer(s);
-    renderMxu(s);
-    renderWeights(s);
-    renderAccumulators(s);
-    renderActivation(s);
+    renderStatuses(s);
     renderProgram(s);
-    renderTimeline(s);
-    renderStalls(s);
-    renderPinned(s);
+    paintBlocks(s);
+    drawTimeline();
+    showTimelineHover();
+    loadInspector();
 }
 
-buildMaps();
+function connect() {
+    const source = new EventSource("/events");
+    source.onmessage = function (event) {
+        render(JSON.parse(event.data));
+    };
+}
+
+window.addEventListener("resize", function () {
+    layoutArrows();
+    if (latest !== null) {
+        paintBlocks(latest);
+        drawTimeline();
+    }
+});
+
+listenButtons();
+listenInspector();
+listenTimeline();
+layoutArrows();
 connect();

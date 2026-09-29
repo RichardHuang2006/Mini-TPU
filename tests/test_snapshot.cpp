@@ -1,4 +1,4 @@
-/// Snapshot JSON: the fields the page draws, at known cycles of a copy program, and pinned targets.
+/// Snapshot JSON: the fields the page draws, at known cycles of a copy program, and the observer hook.
 
 #include <filesystem>
 #include <fstream>
@@ -33,9 +33,9 @@ TEST(snapshot_shows_the_machine_mid_copy) {
     Tpu tpu;
     Shell shell(tpu);
     shell.execute("load " + write_temp_program("mini_tpu_snapshot.s", kCopy));
-    shell.execute("step 5");
+    tpu.run_cycles(5);
 
-    const std::string json = snapshot_json(tpu, shell);
+    const std::string json = snapshot_json(tpu);
     CHECK_EQ(json.front(), '{');
     CHECK_EQ(json.back(), '}');
     CHECK(json.find('\n') == std::string::npos);   // one line: an SSE event cannot hold a raw newline
@@ -43,32 +43,30 @@ TEST(snapshot_shows_the_machine_mid_copy) {
     CHECK(has(json, "\"state\":\"stalled: host interface busy\""));
     CHECK(has(json, "\"blame\":\"host\""));
     CHECK(has(json, "\"done\":110,\"total\":512"));   // five cycles of 22 bytes
-    CHECK(has(json, "\"issue\":\"Ihhhh\""));           // the read issued, then the write waited four cycles
-    CHECK(has(json, "\"host\":\"#####\""));
+    CHECK(has(json, "\"pages\":[0],\"written\":[[0,1]]"));   // host page 0, row 0 holds the program's data
+
+    // The host block's "rows" is the transfer's row count, and appears once: a second key would replace it.
+    const std::size_t host_start = json.find("\"host\":{");
+    const std::string host = json.substr(host_start, json.find('}', host_start) - host_start);
+    CHECK(has(host, "\"rows\":2,"));
+    CHECK_EQ(host.find("\"rows\":"), host.rfind("\"rows\":"));
     CHECK(has(json, "\"Read_Host_Memory host=0x0 ub=0x0 rows=2\""));
-    CHECK(has(json, "\"nonzero\":\"#"));                // UB cell 0 now holds the first bytes
-    CHECK(has(json, "\"age\":[1,"));                    // written during cycle 4, the one just finished
+    CHECK(has(json, "\"ub_rows\":[[0,1]]"));          // 110 bytes have landed, all in UB row 0
+    CHECK(has(json, "\"acc_rows\":[]"));
+
+    // Cycle 0 issued the read and started the host interface on it; cycle 1's write waits for it.
+    CHECK(has(json, "\"timeline\":{\"first\":0,\"length\":64,\"cycles\":[{\"stall\":0,\"issued\":0,\"host\":0,"));
+    CHECK(has(json, "{\"stall\":1,\"issued\":-1,\"host\":0,\"fetching\":-1,\"shifting\":-1,\"mxu\":-1,\"activation\":-1}"));
 }
 
-TEST(snapshot_keeps_pinned_targets_live) {
-    Tpu tpu;
-    Shell shell(tpu);
-    shell.execute("load " + write_temp_program("mini_tpu_snapshot_pin.s", kCopy));
-    shell.execute("ub[0:1x4]");
-
-    CHECK(has(snapshot_json(tpu, shell), "\"target\":\"ub[0:1x4]\",\"text\":\"0x0:    0    0    0    0\""));
-    shell.execute("run");
-    CHECK(has(snapshot_json(tpu, shell), "\"target\":\"ub[0:1x4]\",\"text\":\"0x0:    1    2    3    4\""));
-}
-
-TEST(snapshot_tells_the_observer_after_every_command) {
+TEST(snapshot_tells_the_observer_after_every_line_and_press) {
     Tpu tpu;
     Shell shell(tpu);
     int calls = 0;
     shell.set_observer([&calls]() { calls = calls + 1; });
 
     shell.execute("load " + write_temp_program("mini_tpu_snapshot_obs.s", kCopy));
-    shell.execute("step");
+    shell.move("forward", "cycle");
     shell.execute("bogus");
     CHECK_EQ(calls, 3);
 }

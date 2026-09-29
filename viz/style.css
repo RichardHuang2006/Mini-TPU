@@ -1,23 +1,24 @@
-/* style.css: colors are variables, redefined for dark mode; busy is teal, stalled is amber, just-written is green. */
+/* style.css: one screen, all text in ink; busy blocks are teal, the block an instruction waits on is amber. */
 
 :root {
   --bg: #f6f7f9;
   --panel: #ffffff;
   --ink: #1d2330;
-  --dim: #6b7384;
   --line: #d5d9e2;
-  --block: #ffffff;
+  --stripe: #f3f5f8;
   --busy: #0f9d8a;
   --busy-soft: #d5f2ee;
   --stalled: #d98a00;
   --stalled-soft: #fbeccd;
-  --data: #9aa6bf;
-  --fresh: #22b35e;
-  --read: #3b6fe0;
-  --pe-empty: #e8ebf1;
-  --pe-loaded: #d7dcea;
-  --pe-active: #0f9d8a;
-  --pe-active-alt: #56c7b6;
+  --empty: #eef0f4;
+  --occupied: #0f9d8a;
+  --computing: #e0782c;
+  --lane-issue: #0f9d8a;
+  --lane-stall: #d98a00;
+  --lane-host: #3b6fe0;
+  --lane-weights: #8a4fd0;
+  --lane-mxu: #e0782c;
+  --lane-act: #22a35e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,20 +26,21 @@
     --bg: #11141a;
     --panel: #181c24;
     --ink: #e4e7ee;
-    --dim: #8b93a5;
     --line: #2c3240;
-    --block: #1c212b;
+    --stripe: #1d222c;
     --busy: #2cc7b0;
     --busy-soft: #173a36;
     --stalled: #f0a52a;
     --stalled-soft: #3d2f12;
-    --data: #56607a;
-    --fresh: #3ddc7c;
-    --read: #6b95ff;
-    --pe-empty: #222835;
-    --pe-loaded: #2b3345;
-    --pe-active: #2cc7b0;
-    --pe-active-alt: #1d8f7f;
+    --empty: #222835;
+    --occupied: #2cc7b0;
+    --computing: #f08a4b;
+    --lane-issue: #2cc7b0;
+    --lane-stall: #f0a52a;
+    --lane-host: #6b95ff;
+    --lane-weights: #b58af0;
+    --lane-mxu: #f08a4b;
+    --lane-act: #3ddc7c;
   }
 }
 
@@ -46,117 +48,159 @@
   box-sizing: border-box;
 }
 
+/* The page is exactly the window: nothing scrolls but the instruction list, and the inspector on short windows. */
+
+html,
 body {
+  height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
   margin: 0;
+  overflow: hidden;
   background: var(--bg);
   color: var(--ink);
-  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font: 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 header {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 18px;
-  padding: 14px 20px;
+  flex: none;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 16px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
 
 h1 {
   margin: 0;
-  font-size: 18px;
+  font-size: 15px;
 }
 
 h2 {
-  margin: 0 0 8px;
-  font-size: 14px;
+  margin: 0;
+  font-size: 12.5px;
+  white-space: nowrap;
 }
 
-.dim {
-  color: var(--dim);
-  font-weight: normal;
-}
-
-.figure b {
+header b {
   font-variant-numeric: tabular-nums;
 }
 
 .badge {
-  padding: 2px 10px;
+  padding: 1px 9px;
   border-radius: 999px;
   background: var(--busy-soft);
-  color: var(--busy);
   font-weight: 600;
 }
 
 .badge.stalled {
   background: var(--stalled-soft);
-  color: var(--stalled);
 }
 
-.badge.off {
-  background: var(--line);
-  color: var(--dim);
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
-main {
-  padding: 16px 20px 28px;
+button,
+select,
+input[type="text"] {
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1.5px solid var(--line);
+  border-radius: 7px;
 }
 
-#diagram {
-  display: block;
-  width: 100%;
-  max-width: 1400px;
-  margin: 0 auto 16px;
+button {
+  padding: 3px 13px;
+  font-weight: 600;
+  cursor: pointer;
 }
 
-/* The block diagram. */
-
-.block > rect:first-child {
-  fill: var(--block);
-  stroke: var(--line);
-  stroke-width: 1.5;
+button:hover {
+  border-color: var(--busy);
 }
 
-.block.busy > rect:first-child {
-  stroke: var(--busy);
-  stroke-width: 3;
+button:active {
+  background: var(--busy-soft);
 }
 
-.block.stalled > rect:first-child {
-  stroke: var(--stalled);
-  stroke-width: 3;
-  stroke-dasharray: 8 5;
+select,
+input[type="text"] {
+  padding: 1px 6px;
 }
 
-.title {
-  fill: var(--ink);
-  font-size: 15px;
+input[type="checkbox"] {
+  accent-color: var(--busy);
+}
+
+/* The instruction / cycle switch: two radio buttons drawn as one pill. */
+
+#unit {
+  display: inline-flex;
+  border: 1.5px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+#unit label {
+  padding: 2px 12px;
+  cursor: pointer;
+}
+
+#unit input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#unit label:has(input:checked) {
+  background: var(--busy-soft);
   font-weight: 600;
 }
 
-.status {
-  fill: var(--ink);
-  font-size: 13px;
+#unit label:has(input:focus-visible) {
+  outline: 2px solid var(--busy);
+  outline-offset: -2px;
 }
 
-.note {
-  fill: var(--dim);
-  font-size: 11.5px;
+main {
+  display: grid;
+  flex: 1;
+  grid-template-rows: minmax(0, 1fr) clamp(190px, 31vh, 260px) clamp(130px, 19vh, 175px);
+  gap: 10px;
+  min-height: 0;
+  padding: 10px 16px;
 }
 
-.end {
-  text-anchor: end;
+/* The block diagram: a grid that stretches with the window; the arrows are laid across its gaps by app.js. */
+
+#stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1.3fr 1.3fr 0.9fr 0.9fr;
+  grid-template-rows: 2fr 1fr;
+  grid-template-areas:
+    "host ub  mxu fifo wmem"
+    "host act acc fifo wmem";
+  gap: 22px 34px;
+  min-height: 0;
 }
 
-.middle {
-  text-anchor: middle;
-}
-
-.label {
-  fill: var(--dim);
-  font-size: 11px;
+#arrows {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
 }
 
 .arrow {
@@ -167,13 +211,12 @@ main {
 
 .arrow.active {
   stroke: var(--busy);
-  stroke-width: 4;
   stroke-dasharray: 10 6;
   animation: flow 0.6s linear infinite;
 }
 
 .arrowhead {
-  fill: var(--dim);
+  fill: var(--ink);
 }
 
 @keyframes flow {
@@ -182,152 +225,173 @@ main {
   }
 }
 
-.track {
-  fill: var(--line);
-}
-
-.fill {
-  fill: var(--busy);
-}
-
-.cell {
-  fill: var(--pe-empty);
-}
-
-.cell.data {
-  fill: var(--data);
-}
-
-.cell.fresh {
-  fill: var(--fresh);
-}
-
-.cell.writing {
-  stroke: var(--fresh);
-  stroke-width: 2;
-}
-
-.cell.reading {
-  stroke: var(--read);
-  stroke-width: 2;
-}
-
-.slot-name {
-  fill: var(--ink);
-  font-size: 11.5px;
-}
-
-#mxu-canvas {
-  width: 230px;
-  height: 230px;
-  image-rendering: pixelated;
-  border-radius: 4px;
-}
-
-/* The panels under the diagram. */
-
-.panels {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(560px, 1fr));
-  gap: 16px;
-  max-width: 1400px;
-  margin: 0 auto;
-}
-
-.panel {
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   min-width: 0;
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  min-height: 0;
+  padding: 6px 8px;
+  border: 1.5px solid var(--line);
+  border-radius: 8px;
   background: var(--panel);
 }
 
-.program {
-  max-height: 260px;
+.block.busy {
+  border: 3px solid var(--busy);
+  padding: 4.5px 6.5px;
+}
+
+.block.stalled {
+  border: 3px dashed var(--stalled);
+  padding: 4.5px 6.5px;
+}
+
+#block-host {
+  grid-area: host;
+}
+
+#block-ub {
+  grid-area: ub;
+}
+
+#block-mxu {
+  grid-area: mxu;
+}
+
+#block-wfifo {
+  grid-area: fifo;
+}
+
+#block-wmem {
+  grid-area: wmem;
+}
+
+#block-act {
+  grid-area: act;
+}
+
+#block-acc {
+  grid-area: acc;
+}
+
+.head,
+.panel-head {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.status,
+.readout {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A block's canvas only paints; it takes no clicks, scrolls or drags. */
+
+.block canvas {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  pointer-events: none;
+}
+
+.progress {
+  flex: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+#act-bar {
+  width: 0;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--busy);
+}
+
+/* The bottom rows: the row inspector beside the instructions, then the timeline across the whole width. */
+
+#bottom {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.panel-head {
+  align-items: center;
+  gap: 12px;
+}
+
+#inspect-values {
+  display: grid;
+  flex: 1;
+  grid-template-columns: auto repeat(16, minmax(5ch, max-content));
+  align-content: start;
+  justify-content: start;
+  min-height: 0;
+  overflow: auto;
+  font: 10.5px/12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+#inspect-values span {
+  padding: 0 5px;
+  text-align: right;
+  white-space: pre;
+}
+
+#inspect-values .label {
+  font-weight: 700;
+}
+
+#program {
+  position: relative;
+  flex: 1;
+  min-height: 0;
   margin: 0;
   padding: 0;
   overflow: auto;
   list-style: none;
-  font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.program li {
+#program li {
   padding: 0 6px;
   white-space: pre;
-  color: var(--dim);
 }
 
-.program li.done {
-  opacity: 0.55;
-}
-
-.program li.current {
-  color: var(--ink);
+#program li.current {
   background: var(--busy-soft);
   border-radius: 4px;
 }
 
-.program li.current.stalled {
+#program li.current.stalled {
   background: var(--stalled-soft);
 }
 
 #timeline {
+  flex: 1;
   width: 100%;
-  height: 150px;
-}
-
-.key {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  margin-top: 6px;
-  color: var(--dim);
-  font-size: 12px;
-}
-
-.key i {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  margin-right: 4px;
-  border-radius: 2px;
-  vertical-align: -1px;
-}
-
-.stall-row {
-  display: grid;
-  grid-template-columns: 190px 1fr 60px;
-  align-items: center;
-  gap: 8px;
-  margin: 3px 0;
-  font-size: 12.5px;
-}
-
-.stall-bar {
-  height: 8px;
-  border-radius: 4px;
-  background: var(--stalled);
-}
-
-.stall-count {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.pinned-view {
-  margin: 0 0 10px;
-}
-
-.pinned-view h3 {
-  margin: 0 0 4px;
-  font: 600 12.5px ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.pinned-view pre {
-  margin: 0;
-  padding: 8px;
-  overflow: auto;
-  border-radius: 6px;
-  background: var(--bg);
-  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-height: 0;
 }

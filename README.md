@@ -14,7 +14,7 @@ A small compiler turns dense layers, MLPs and convolutions into TPU programs, an
 ./tpu programs/matmul.s
 ```
 
-`./tpu` rebuilds anything that changed, starts the simulator at a `tpu>` prompt, and opens the visualizer in your browser. From there, `step`, `next` and `run` move time forward, `back` and `prev` move it back, and the page redraws after every command.
+`./tpu` rebuilds anything that changed, loads the program, and opens the visualizer in your browser. The terminal only loads programs. The page's buttons move the machine forward and back, and every value in it can be read on the page.
 
 ## The machine
 
@@ -32,24 +32,27 @@ At 700 MHz the array peaks at 91.75 TOPS (65,536 multiply-adds per cycle, 2 oper
 
 Instructions are 12 bytes each and issue in order, one per cycle. The units then run side by side, and an interlock holds an instruction back until what it needs is ready. [docs/microarch.md](docs/microarch.md) covers the timing and the interlocks, and [docs/isa.md](docs/isa.md) the instruction set.
 
-## Terminal commands
+## Using it
+
+The terminal takes two commands:
 
 | Command | Does |
 |---|---|
 | `load FILE` | reset the machine, assemble the file, load its code and data |
-| `step [N]` / `back [N]` | forward / back N **cycles** (default 1) |
-| `next [N]` / `prev [N]` | forward until N more **instructions** issue / undo the last N |
-| `run` / `run N` | run to Halt / run N cycles; the page animates while it runs |
-| `pc` | the instruction at the program counter |
-| `wfifo`, `mxu`, `act` | the Weight FIFO's slots, the MXU (with a map of its PEs), the activation unit |
-| `ub[ROW:RxC]`, `acc[..]`, `host[..]`, `wmem[..]` | R rows × C columns of a memory from ROW; add `hex` for hex. `ub[5]` is 16 columns of row 5 |
 | `quit` | exit (Ctrl-C and Ctrl-D too) |
 
-↑ and ↓ walk the command history, and pressing Enter on an empty line repeats the last command, so `step` followed by Enter, Enter walks one cycle at a time. `back` and `prev` reload the program and replay it, which is exact because the machine is deterministic. Any target you look at is pinned on the page and stays live.
+`./tpu FILE` loads the file as it starts. Enter on an empty line repeats the last command, so after editing a `.s` file, Enter reloads it.
+
+Everything else happens on the page:
+- **◀ back** and **forward ▶** move the machine one step. The switch between them sets the step:
+  - **instruction:** forward runs until the next instruction issues; back undoes the last one
+  - **cycle:** exactly one clock cycle
+- Going back reloads the program and replays it, which is exact because the machine is deterministic.
+- **The row inspector** shows all 256 values of any row. Pick a memory and type a row (`36` or `0x24`). It updates with every step.
 
 ## The visualizer
 
-The page at `http://127.0.0.1:8008/` is read-only. It has no buttons, and every command is typed in the terminal. It draws TPUv1's block diagram in the order data flows:
+The page at `http://127.0.0.1:8008/` draws TPUv1's block diagram in the order data flows:
 
 ```
  Host memory ─PCIe─▶ Unified Buffer ─rows, skewed─▶ Matrix Multiply Unit ◀─tile─ Weight FIFO ◀─DDR3─ Weight Memory
@@ -59,17 +62,29 @@ The page at `http://127.0.0.1:8008/` is read-only. It has no buttons, and every 
 
 - **Blocks** turn teal while they work. The block an instruction is waiting on turns amber and dashed, and the header names the cause.
 - **Arrows** animate on the cycles data moves along them.
-- **Memory maps:** the Unified Buffer (384 cells of 256 rows) and the accumulators (16 cells) shade the cells that hold data and flash green where something was just written. Rows being written are outlined in green, rows being read in blue.
-- **The MXU** is drawn PE by PE at 256 × 256. The rows of a multiply sweep across it as diagonal bands, one hop per cycle.
-- **Panels:** below the diagram are the instruction listing with the PC, a timeline of the last 200 cycles (what issued or why not, and which units worked), the stall counters, and your pinned targets.
+The whole page fits the window, and nothing on it scrolls except the instruction list.
 
-The server listens on 127.0.0.1 only, trying ports 8008 to 8017. `./tpu --no-open` skips opening a browser, and `./tpu --no-viz` runs without the page. The visualizer is off when input is piped, unless you pass `--viz`.
+- **Blocks** turn teal while they work. The block an instruction is waiting on turns amber and dashed, and the header names the cause.
+- **Arrows** animate on the cycles data moves along them.
+- **Occupancy only.** A block shows no values: each of its memory's rows is a cell, painted teal once something has written it.
+  - **Unified Buffer and accumulators:** they show 256 rows, doubling until the highest written row fits.
+  - **Host memory and Weight Memory:** they show the 64 KiB pages in use.
+  - **Weight FIFO:** its 4 slots fill in row by row as each tile streams in from DDR3.
+- **The wavefront:** each of the MXU's 256 × 256 PEs is painted orange in the cycles it holds an input value. During a multiply they form diagonal bands that sweep across the array one hop per cycle.
+- **The row inspector** is the one place values show. It lists one row's 256 values, 16 to a line, as the memory stores them (int8, or int32 for the accumulators and the pooling buffer). Tick `hex` for hex.
+  - **Row numbers** are the ones the instructions use: Weight Memory row = tile × 256 + row, and Weight FIFO row = slot × 256 + row.
+  - **MXU entries** show one register (weights, shadow weights, activations or partial sums) across the 256 PEs of a PE row.
+- **The timeline** shows the last 64 cycles, one lane per unit: issue, PCIe, DDR3, weight shift, MXU, activation.
+  - **Bars:** each run of cycles spent on the same work is one bar, labelled with the instruction or tile it works on. Stalls show as amber bars on the issue lane, named by their cause.
+  - **Hovering** a cycle says what every unit did in it.
+
+The server listens on 127.0.0.1 only, trying ports 8008 to 8017. The page can only move the machine forward and back, never load a file. `./tpu --no-open` skips opening a browser, for when the page is already open.
 
 ## Programs
 
 | Program | What it runs | Cycles |
 |---|---|---|
-| `programs/copy.s` | two rows host → Unified Buffer → host | 49 |
+| `programs/copy.s` | one 256-byte row host → Unified Buffer → host | 25 |
 | `programs/weights.s` | two weight tiles into the FIFO; the first moves on into the MXU's shadow plane | 2,733 |
 | `programs/matmul.s` | two rows times a hand-written weight tile | 2,136 |
 | `programs/activate.s` | matmul.s, then ReLU and tanh, back to the host | 2,187 |
@@ -77,7 +92,7 @@ The server listens on 127.0.0.1 only, trying ports 8008 to 8017. `./tpu --no-ope
 | `programs/mlp.s` | 64 → 48 ReLU → 32 tanh → 10 (generated) | 5,084 |
 | `programs/conv.s` | an 8×8×4 image, 3×3 convolution to 8 channels, ReLU, 2×2 max pool (generated) | 2,310 |
 
-The generated programs come from `./build/gen_programs`, which compiles them with random weights and prints what each should leave in host memory, so you can check the result with `host[...]`. A `.s` file holds its data (`.host ROW`, `.weights TILE [ROW]`, then int8 values) and its instructions (`Op key=value …`). [docs/isa.md](docs/isa.md) has the full syntax.
+The generated programs come from `./build/gen_programs`, which compiles them with random weights and prints what each should leave in host memory, so you can check the result in the row inspector under Host memory. A `.s` file holds its data (`.host ROW`, `.weights TILE [ROW]`, then int8 values) and its instructions (`Op key=value …`). [docs/isa.md](docs/isa.md) has the full syntax.
 
 ## What the simulator shows about TPUv1
 
@@ -108,7 +123,7 @@ Mini-TPU/
 │   ├── core/             the machine: in-order issue, interlocks, the cycle loop, the activity log
 │   ├── compiler/         layers, MLPs and convolutions → programs
 │   ├── ref/              reference ops: the same math as plain loops, for checking
-│   ├── ui/               the terminal: commands, line editor, prompt loop
+│   ├── ui/               the terminal and the buttons: load, moves, line editor, prompt loop
 │   └── viz/              the visualizer's snapshot and its local web server
 ├── viz/                  the page: index.html, style.css, app.js
 ├── tools/                tpu_sim (the terminal), gen_programs, check_headers (a lint rule)

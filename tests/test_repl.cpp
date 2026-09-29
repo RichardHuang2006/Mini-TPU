@@ -9,15 +9,15 @@
 TEST(repl_plain_mode_echoes_and_stops_at_quit) {
     Tpu tpu;
     Shell shell(tpu);
-    std::istringstream in("pc\n\nrun\nquit\nrun\n");
+    std::istringstream in("step\n\nload /nonexistent/prog.s\nquit\nstep\n");
     std::ostringstream out;
 
     run_plain(shell, in, out);
     const std::string expected =
-        "tpu> pc\n"
-        "pc 0 (no instruction there)\n"
-        "tpu> run\n"
-        "error: no program loaded; use load FILE\n"
+        "tpu> step\n"
+        "error: unknown command 'step': the terminal takes load FILE and quit; step through the program in the visualizer\n"
+        "tpu> load /nonexistent/prog.s\n"
+        "/nonexistent/prog.s: error: cannot open file\n"
         "tpu> quit\n";
     CHECK_EQ(out.str(), expected);
 }

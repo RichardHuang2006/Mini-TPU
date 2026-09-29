@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- Mini-TPU visualizer: a live, read-only view of the simulator; every command is typed in the terminal. -->
+<!-- Mini-TPU visualizer: the terminal loads a program and the buttons here move it; blocks paint only occupied rows and computing PEs, and the inspector shows values. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -10,136 +10,108 @@
 <body>
 
 <header>
-  <h1>Mini-TPU <span class="dim">TPUv1</span></h1>
-  <span id="file" class="dim">no program loaded</span>
-  <span class="figure">cycle <b id="cycle">0</b></span>
-  <span class="figure">pc <b id="pc">0</b></span>
-  <span class="figure">issued <b id="issued">0</b></span>
+  <h1>Mini-TPU</h1>
+  <span>cycle <b id="cycle">0</b></span>
+  <span>pc <b id="pc">0</b></span>
+  <span>issued <b id="issued">0</b></span>
   <span id="state" class="badge">ready</span>
-  <span id="connection" class="badge off">connecting</span>
+  <div id="controls">
+    <button id="back" type="button">◀ back</button>
+    <div id="unit" role="radiogroup">
+      <label><input type="radio" name="unit" value="instruction" checked>instruction</label>
+      <label><input type="radio" name="unit" value="cycle">cycle</label>
+    </div>
+    <button id="forward" type="button">forward ▶</button>
+  </div>
 </header>
 
 <main>
-  <svg id="diagram" viewBox="0 0 1200 560" role="img" aria-label="TPUv1 block diagram">
-    <defs>
-      <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,10 z" class="arrowhead"></path>
-      </marker>
-    </defs>
+  <div id="stage">
+    <svg id="arrows" aria-hidden="true">
+      <defs>
+        <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="arrowhead"></path>
+        </marker>
+      </defs>
+      <path id="arrow-host-ub" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-ub-host" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-ub-mxu" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-wmem-fifo" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-fifo-mxu" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-mxu-acc" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-acc-act" class="arrow" marker-end="url(#head)"></path>
+      <path id="arrow-act-ub" class="arrow" marker-end="url(#head)"></path>
+    </svg>
 
-    <g id="block-host" class="block">
-      <rect x="20" y="20" width="210" height="150" rx="10"></rect>
-      <text x="36" y="46" class="title">Host memory</text>
-      <text x="36" y="66" class="note">off-chip, over PCIe</text>
-      <text id="host-status" x="36" y="96" class="status">idle</text>
-      <text id="host-status-2" x="36" y="114" class="status"></text>
-      <text id="host-detail" x="36" y="134" class="note"></text>
-      <text id="host-pages" x="36" y="156" class="note"></text>
-    </g>
+    <section id="block-host" class="block">
+      <div class="head"><h2>Host memory</h2><span id="host-status" class="status"></span></div>
+      <canvas id="view-host"></canvas>
+    </section>
 
-    <g id="block-ub" class="block">
-      <rect x="300" y="20" width="300" height="300" rx="10"></rect>
-      <text x="316" y="46" class="title">Unified Buffer</text>
-      <text x="584" y="46" class="note end">24 MiB · 96K rows</text>
-      <g id="ub-map"></g>
-      <text id="ub-status" x="316" y="282" class="status"></text>
-      <text x="316" y="304" class="note">cell = 256 rows · grey: data · green: just written</text>
-    </g>
+    <section id="block-ub" class="block">
+      <div class="head"><h2>Unified Buffer</h2><span id="ub-status" class="status"></span></div>
+      <canvas id="view-ub"></canvas>
+    </section>
 
-    <g id="block-mxu" class="block">
-      <rect x="670" y="20" width="270" height="360" rx="10"></rect>
-      <text x="686" y="46" class="title">Matrix Multiply Unit</text>
-      <text x="924" y="46" class="note end">256 × 256</text>
-      <foreignObject x="690" y="56" width="230" height="230">
-        <canvas id="mxu-canvas" width="256" height="256" xmlns="http://www.w3.org/1999/xhtml"></canvas>
-      </foreignObject>
-      <rect x="686" y="292" width="238" height="6" rx="3" class="track"></rect>
-      <rect id="shadow-bar" x="686" y="292" width="0" height="6" rx="3" class="fill"></rect>
-      <text id="mxu-status" x="686" y="318" class="status">idle</text>
-      <text id="mxu-flow" x="686" y="336" class="note"></text>
-      <text id="mxu-weights" x="686" y="354" class="note"></text>
-      <text id="mxu-shadow" x="686" y="371" class="note"></text>
-    </g>
+    <section id="block-mxu" class="block">
+      <div class="head"><h2>Matrix Multiply Unit</h2><span id="mxu-status" class="status"></span></div>
+      <canvas id="view-mxu"></canvas>
+    </section>
 
-    <g id="block-wmem" class="block">
-      <rect x="990" y="20" width="190" height="150" rx="10"></rect>
-      <text x="1006" y="46" class="title">Weight Memory</text>
-      <text x="1006" y="66" class="note">8 GiB DDR3, off-chip</text>
-      <text id="wmem-status" x="1006" y="100" class="status">idle</text>
-      <text id="wmem-tiles" x="1006" y="124" class="note"></text>
-    </g>
+    <section id="block-wfifo" class="block">
+      <div class="head"><h2>Weight FIFO</h2><span id="wfifo-status" class="status"></span></div>
+      <canvas id="view-wfifo"></canvas>
+    </section>
 
-    <g id="block-wfifo" class="block">
-      <rect x="990" y="210" width="190" height="170" rx="10"></rect>
-      <text x="1006" y="236" class="title">Weight FIFO</text>
-      <text x="1164" y="236" class="note end">4 tiles</text>
-      <g id="fifo-slots"></g>
-    </g>
+    <section id="block-wmem" class="block">
+      <div class="head"><h2>Weight Memory</h2><span id="wmem-status" class="status"></span></div>
+      <canvas id="view-wmem"></canvas>
+    </section>
 
-    <g id="block-acc" class="block">
-      <rect x="670" y="420" width="270" height="125" rx="10"></rect>
-      <text x="686" y="446" class="title">Accumulators</text>
-      <text x="924" y="446" class="note end">4 MiB int32</text>
-      <g id="acc-map"></g>
-      <text id="acc-status" x="686" y="512" class="note"></text>
-      <text id="acc-status-2" x="686" y="530" class="note"></text>
-    </g>
+    <section id="block-act" class="block">
+      <div class="head"><h2>Activation</h2><span id="act-status" class="status"></span></div>
+      <div class="progress"><div id="act-bar"></div></div>
+      <canvas id="view-line"></canvas>
+    </section>
 
-    <g id="block-act" class="block">
-      <rect x="300" y="420" width="300" height="125" rx="10"></rect>
-      <text x="316" y="446" class="title">Activation</text>
-      <text x="584" y="446" class="note end">int32 → int8, pooling</text>
-      <text id="act-status" x="316" y="474" class="status">idle</text>
-      <text id="act-detail" x="316" y="494" class="note"></text>
-      <rect x="316" y="506" width="268" height="6" rx="3" class="track"></rect>
-      <rect id="act-bar" x="316" y="506" width="0" height="6" rx="3" class="fill"></rect>
-      <text id="act-progress" x="316" y="532" class="note"></text>
-    </g>
+    <section id="block-acc" class="block">
+      <div class="head"><h2>Accumulators</h2><span id="acc-status" class="status"></span></div>
+      <canvas id="view-acc"></canvas>
+    </section>
+  </div>
 
-    <g class="arrows">
-      <path id="arrow-host-ub" d="M230,72 L298,72" class="arrow" marker-end="url(#head)"></path>
-      <path id="arrow-ub-host" d="M300,112 L232,112" class="arrow" marker-end="url(#head)"></path>
-      <text x="265" y="60" class="label middle">PCIe</text>
-      <text x="265" y="130" class="label middle">22 B/cycle</text>
+  <div id="bottom">
+    <section id="inspector" class="panel">
+      <div class="panel-head">
+        <h2>Row inspector</h2>
+        <select id="inspect-memory">
+          <option value="ub">Unified Buffer</option>
+          <option value="acc">Accumulators</option>
+          <option value="host">Host memory</option>
+          <option value="wmem">Weight Memory</option>
+          <option value="fifo">Weight FIFO</option>
+          <option value="line">Pooling buffer</option>
+          <option value="mxu_weight">MXU weights</option>
+          <option value="mxu_shadow">MXU shadow weights</option>
+          <option value="mxu_act">MXU activations</option>
+          <option value="mxu_psum">MXU partial sums</option>
+        </select>
+        <label>row <input id="inspect-row" type="text" size="8" spellcheck="false" value="0x0"></label>
+        <label><input id="inspect-hex" type="checkbox">hex</label>
+        <span id="inspect-title" class="readout"></span>
+      </div>
+      <div id="inspect-values"></div>
+    </section>
 
-      <path id="arrow-ub-mxu" d="M600,180 L668,180" class="arrow" marker-end="url(#head)"></path>
-      <text x="635" y="170" class="label middle">rows,</text>
-      <text x="635" y="198" class="label middle">skewed</text>
+    <section id="instructions" class="panel">
+      <div class="panel-head"><h2>Instructions</h2></div>
+      <ol id="program"></ol>
+    </section>
+  </div>
 
-      <path id="arrow-wmem-fifo" d="M1085,170 L1085,208" class="arrow" marker-end="url(#head)"></path>
-      <text x="1093" y="194" class="label">DDR3 48 B/cycle</text>
-
-      <path id="arrow-fifo-mxu" d="M990,300 L942,300" class="arrow" marker-end="url(#head)"></path>
-      <text x="966" y="290" class="label middle">tile</text>
-
-      <path id="arrow-mxu-acc" d="M805,380 L805,418" class="arrow" marker-end="url(#head)"></path>
-      <text x="813" y="404" class="label">column sums</text>
-
-      <path id="arrow-acc-act" d="M670,470 L602,470" class="arrow" marker-end="url(#head)"></path>
-      <path id="arrow-act-ub" d="M450,420 L450,322" class="arrow" marker-end="url(#head)"></path>
-      <text x="458" y="376" class="label">int8 rows</text>
-    </g>
-  </svg>
-
-  <section class="panels">
-    <div class="panel">
-      <h2>Instructions</h2>
-      <ol id="program" class="program"></ol>
-    </div>
-    <div class="panel">
-      <h2>Timeline <span id="timeline-range" class="dim"></span></h2>
-      <canvas id="timeline" width="800" height="150"></canvas>
-      <div id="timeline-key" class="key"></div>
-    </div>
-    <div class="panel">
-      <h2>Stall cycles</h2>
-      <div id="stalls"></div>
-      <p id="utilization" class="dim"></p>
-    </div>
-    <div class="panel">
-      <h2>Pinned <span class="dim">(type a target in the terminal)</span></h2>
-      <div id="pinned"></div>
-    </div>
+  <section id="timeline-panel" class="panel">
+    <div class="panel-head"><h2>Timeline</h2><span id="timeline-readout" class="readout"></span></div>
+    <canvas id="timeline"></canvas>
   </section>
 </main>
 
