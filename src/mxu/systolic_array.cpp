@@ -204,6 +204,15 @@ bool SystolicArray::reads_ub_rows(u32 first, u32 count) const {
     return first < mine_end && ub_row_ < their_end;
 }
 
+bool SystolicArray::writes_acc_rows(u32 first, u32 count) const {
+    if (!busy_ || count == 0 || rows_ == 0) {
+        return false;
+    }
+    const u64 mine_end  = static_cast<u64>(acc_row_) + rows_;
+    const u64 their_end = static_cast<u64>(first) + count;
+    return first < mine_end && acc_row_ < their_end;
+}
+
 u32 SystolicArray::step() const {
     return step_;
 }

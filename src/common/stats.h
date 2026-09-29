@@ -15,9 +15,11 @@ enum class Stall : u8 {
     MxuBusy,             // MatrixMultiply waits for the one in the array
     WeightsNotReady,     // MatrixMultiply waits for a whole tile in the shadow plane
     UbNotReady,          // an instruction waits for UB rows another unit is still reading or writing
+    ActivationBusy,      // Activate waits for the one in the activation unit
+    AccNotReady,         // an instruction waits for accumulator rows another unit is still reading or writing
 };
 
-inline constexpr std::size_t kStallKinds = 7;
+inline constexpr std::size_t kStallKinds = 9;
 
 inline const char* stall_name(Stall stall) {
     switch (stall) {
@@ -35,6 +37,10 @@ inline const char* stall_name(Stall stall) {
             return "weights not ready";
         case Stall::UbNotReady:
             return "Unified Buffer rows not ready";
+        case Stall::ActivationBusy:
+            return "activation unit busy";
+        case Stall::AccNotReady:
+            return "accumulator rows not ready";
     }
     return "?";
 }

@@ -97,6 +97,9 @@ std::vector<std::string> operand_keys(Op op) {
     if (op == Op::MatrixMultiply) {
         return {"ub", "acc", "rows", "accumulate", "new_weights"};
     }
+    if (op == Op::Activate) {
+        return {"acc", "ub", "rows", "shift", "function"};
+    }
     return {};
 }
 
@@ -115,6 +118,8 @@ void set_operand(Instr& in, const std::string& key, u32 value) {
         in.accumulate = value;
     } else if (key == "new_weights") {
         in.new_weights = value;
+    } else if (key == "shift") {
+        in.shift = value;
     }
 }
 
@@ -237,6 +242,16 @@ private:
         fail(mnemonic.col, "unknown instruction '" + mnemonic.text + "'");
     }
 
+    // function= takes a name, not a number.
+    ActivationFunction find_function(const Token& name) const {
+        for (ActivationFunction function : kAllFunctions) {
+            if (name.text == function_name(function)) {
+                return function;
+            }
+        }
+        fail(name.col, "unknown function '" + name.text + "' (expects identity, relu, sigmoid, tanh)");
+    }
+
     // `Op key=value key=value ...`
     void instruction(const std::vector<Token>& tokens) {
         block_ = nullptr;   // an instruction ends any open data block
@@ -268,6 +283,11 @@ private:
             Token value_token;
             value_token.text = token.text.substr(equals + 1);
             value_token.col  = token.col + static_cast<u32>(equals) + 1;   // errors point at the value, not the key
+
+            if (key == "function") {
+                in.function = find_function(value_token);
+                continue;
+            }
 
             const std::int64_t value = number(value_token);
             if (value < 0 || value > 0xFFFFFFFF) {

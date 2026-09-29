@@ -12,7 +12,7 @@
 namespace {
 
 const char* kCommandList = "load FILE, step [N], back [N], next [N], prev [N], run [N], TARGET [hex|dec], quit";
-const char* kTargetList  = "pc, wfifo, mxu, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
+const char* kTargetList  = "pc, wfifo, mxu, act, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
 
 std::vector<std::string> split_words(const std::string& line) {
     std::istringstream stream(line);
@@ -293,6 +293,9 @@ std::string Shell::show(const std::vector<std::string>& words) const {
     if (words[0] == "mxu") {
         return show_mxu();
     }
+    if (words[0] == "act") {
+        return show_activation();
+    }
 
     const View view = parse_view(words[0]);
     if (view.memory == "acc") {
@@ -397,6 +400,19 @@ std::string Shell::show_mxu() const {
         text += "\n" + line;
     }
     return text;
+}
+
+// The running Activate's progress and settings, or "idle".
+std::string Shell::show_activation() const {
+    const ActivationUnit& act = tpu_.activation();
+    if (!act.busy()) {
+        return "activation: idle";
+    }
+
+    const std::string progress = std::to_string(act.rows_done()) + " of " + std::to_string(act.rows_total()) + " rows done";
+    const std::string rows     = "acc " + hex(act.acc_row()) + " -> ub " + hex(act.ub_row());
+    const std::string settings = ", function " + std::string(function_name(act.function())) + ", shift " + std::to_string(act.shift());
+    return "activation: " + progress + "\n" + rows + settings;
 }
 
 // One line per slot, oldest first.

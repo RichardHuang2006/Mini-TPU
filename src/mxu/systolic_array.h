@@ -34,6 +34,7 @@ public:
     bool shifting() const;       // a tile is being shifted into the shadow plane
     bool shadow_ready() const;   // the shadow plane holds a whole tile
     bool reads_ub_rows(u32 first, u32 count) const;
+    bool writes_acc_rows(u32 first, u32 count) const;
 
     // For the terminal: progress, planes and the grid.
     u32 step() const;

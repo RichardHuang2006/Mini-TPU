@@ -37,6 +37,12 @@ void check_flag(u32 value, const char* name) {
     }
 }
 
+void check_shift(u32 value) {
+    if (value > 31) {
+        throw std::out_of_range("shift=" + std::to_string(value) + " must be 0 to 31");
+    }
+}
+
 std::string hex(u32 value) {
     char text[16];
     std::snprintf(text, sizeof text, "0x%X", value);
@@ -61,6 +67,22 @@ const char* op_name(Op op) {
             return "Read_Weights";
         case Op::MatrixMultiply:
             return "MatrixMultiply";
+        case Op::Activate:
+            return "Activate";
+    }
+    return "?";
+}
+
+const char* function_name(ActivationFunction function) {
+    switch (function) {
+        case ActivationFunction::Identity:
+            return "identity";
+        case ActivationFunction::Relu:
+            return "relu";
+        case ActivationFunction::Sigmoid:
+            return "sigmoid";
+        case ActivationFunction::Tanh:
+            return "tanh";
     }
     return "?";
 }
@@ -95,6 +117,16 @@ InstrBytes encode(const Instr& in) {
             check_flag(in.accumulate, "accumulate");
             check_flag(in.new_weights, "new_weights");
             word[1] = static_cast<u8>(in.accumulate | (in.new_weights << 1));   // flag byte: bit 0, bit 1
+            break;
+        }
+
+        case Op::Activate: {
+            write_bytes(word, 3, 3, in.ub_row, "ub");       // bytes 3-5
+            write_bytes(word, 6, 2, in.acc_row, "acc");     // bytes 6-7
+            write_bytes(word, 8, 2, in.rows, "rows");       // bytes 8-9
+            check_shift(in.shift);
+            word[10] = static_cast<u8>(in.shift);           // byte 10
+            word[1]  = static_cast<u8>(in.function);        // flag byte: bits 0-1
             break;
         }
     }
@@ -133,6 +165,15 @@ Instr decode(const InstrBytes& word) {
             break;
         }
 
+        case Op::Activate: {
+            in.function = static_cast<ActivationFunction>(word[1] & 0x3);   // flag byte, bits 0-1
+            in.ub_row   = read_bytes(word, 3, 3);
+            in.acc_row  = read_bytes(word, 6, 2);
+            in.rows     = read_bytes(word, 8, 2);
+            in.shift    = word[10] & 0x1F;                                  // byte 10, bits 0-4
+            break;
+        }
+
         default:
             throw std::invalid_argument("unknown opcode " + hex(word[0]));
     }
@@ -164,6 +205,12 @@ std::string disasm(const Instr& in) {
             const std::string operands = " ub=" + hex(in.ub_row) + " acc=" + hex(in.acc_row) + " rows=" + std::to_string(in.rows);
             const std::string flags    = " accumulate=" + std::to_string(in.accumulate) + " new_weights=" + std::to_string(in.new_weights);
             return name + operands + flags;
+        }
+
+        case Op::Activate: {
+            const std::string operands = " acc=" + hex(in.acc_row) + " ub=" + hex(in.ub_row) + " rows=" + std::to_string(in.rows);
+            const std::string options  = " shift=" + std::to_string(in.shift) + " function=" + function_name(in.function);
+            return name + operands + options;
         }
     }
     return name;

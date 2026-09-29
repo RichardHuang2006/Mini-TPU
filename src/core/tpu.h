@@ -10,6 +10,7 @@
 #include "mem/dram.h"
 #include "mem/unified_buffer.h"
 #include "mxu/systolic_array.h"
+#include "units/activation.h"
 #include "units/host_interface.h"
 #include "units/weight_fifo.h"
 
@@ -50,24 +51,26 @@ public:
     Stall        stall() const;   // why the last cycle issued nothing; Stall::None if something issued
     const Stats& stats() const;
 
-    const Program&       program() const;
-    const UnifiedBuffer& ub() const;
-    const Dram&          host() const;
-    const Dram&          wmem() const;
-    const HostInterface& host_interface() const;
-    const WeightFifo&    weight_fifo() const;
-    const Accumulators&  acc() const;
-    const SystolicArray& mxu() const;
+    const Program&        program() const;
+    const UnifiedBuffer&  ub() const;
+    const Dram&           host() const;
+    const Dram&           wmem() const;
+    const HostInterface&  host_interface() const;
+    const WeightFifo&     weight_fifo() const;
+    const Accumulators&   acc() const;
+    const SystolicArray&  mxu() const;
+    const ActivationUnit& activation() const;
 
 private:
-    Program       program_;
-    UnifiedBuffer ub_;
-    Accumulators  acc_;
-    Dram          host_;
-    Dram          wmem_;
-    HostInterface host_interface_;
-    WeightFifo    weight_fifo_;
-    SystolicArray mxu_;
+    Program        program_;
+    UnifiedBuffer  ub_;
+    Accumulators   acc_;
+    Dram           host_;
+    Dram           wmem_;
+    HostInterface  host_interface_;
+    WeightFifo     weight_fifo_;
+    SystolicArray  mxu_;
+    ActivationUnit activation_;
 
     u32   pc_     = 0;
     bool  halted_ = false;

@@ -93,6 +93,16 @@ bool HostInterface::writes_ub_rows(u32 first, u32 count) const {
     return first < mine_end && mine_first < their_end;
 }
 
+bool HostInterface::reads_ub_rows(u32 first, u32 count) const {
+    if (!busy() || direction_ != Direction::UbToHost || count == 0) {
+        return false;
+    }
+    const u64 mine_first = ub_addr_ / UnifiedBuffer::kRowBytes;
+    const u64 mine_end   = (ub_addr_ + bytes_total_) / UnifiedBuffer::kRowBytes;
+    const u64 their_end  = static_cast<u64>(first) + count;
+    return first < mine_end && mine_first < their_end;
+}
+
 u64 HostInterface::bytes_done() const {
     return bytes_done_;
 }

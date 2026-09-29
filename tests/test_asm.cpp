@@ -36,6 +36,17 @@ Instr matmul(u32 ub_row, u32 acc_row, u32 rows, u32 accumulate, u32 new_weights)
     return in;
 }
 
+Instr activate_op(u32 acc_row, u32 ub_row, u32 rows, u32 shift, ActivationFunction function) {
+    Instr in;
+    in.op       = Op::Activate;
+    in.acc_row  = acc_row;
+    in.ub_row   = ub_row;
+    in.rows     = rows;
+    in.shift    = shift;
+    in.function = function;
+    return in;
+}
+
 Instr no_operands(Op op) {
     Instr in;
     in.op = op;
@@ -113,6 +124,10 @@ TEST(asm_reads_what_disasm_prints) {
         no_operands(Op::Sync),
         read_weights(0x5),
         matmul(0x10, 0x20, 8, 1, 0),
+        activate_op(0x20, 0x30, 8, 31, ActivationFunction::Identity),
+        activate_op(0, 0, 1, 0, ActivationFunction::Relu),
+        activate_op(0, 0, 1, 12, ActivationFunction::Sigmoid),
+        activate_op(0xFFF, 0x17FFF, 1, 7, ActivationFunction::Tanh),
     };
 
     for (const Instr& in : samples) {
@@ -159,6 +174,12 @@ TEST(asm_errors_name_line_and_column) {
              std::string("t.s:1:1: error: accumulate=2 must be 0 or 1"));
     CHECK_EQ(error_of(".host"),
              std::string("t.s:1:1: error: .host takes one address"));
+    CHECK_EQ(error_of("Activate acc=0 ub=0 rows=1 shift=0 function=gelu"),
+             std::string("t.s:1:45: error: unknown function 'gelu' (expects identity, relu, sigmoid, tanh)"));
+    CHECK_EQ(error_of("Activate acc=0 ub=0 rows=1 shift=32 function=relu"),
+             std::string("t.s:1:1: error: shift=32 must be 0 to 31"));
+    CHECK_EQ(error_of("Activate acc=0 ub=0 rows=1 function=relu"),
+             std::string("t.s:1:1: error: Activate is missing operand 'shift'"));
 }
 
 TEST(asm_missing_file_throws) {

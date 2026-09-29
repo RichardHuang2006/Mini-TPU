@@ -86,7 +86,7 @@ TEST(shell_errors_are_text) {
              std::string("error: unknown command 'foo'; commands: load FILE, step [N], back [N], next [N], prev [N], run [N], "
                          "TARGET [hex|dec], quit"));
     CHECK_EQ(shell.execute("mem[0]"),
-             std::string("error: unknown target 'mem' (try pc, wfifo, mxu, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
+             std::string("error: unknown target 'mem' (try pc, wfifo, mxu, act, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC])"));
     CHECK_EQ(shell.execute("ub[0:4]"), std::string("error: expected ROWSxCOLS after ':', got '4'"));
     CHECK_EQ(shell.execute("ub[0:1x300]"), std::string("error: a view is 1 or more rows of 1 to 256 columns"));
     CHECK_EQ(shell.execute("ub[0x20000]"), std::string("error: ub row 131072 is past the last row 98303"));
@@ -134,6 +134,30 @@ TEST(shell_accumulator_and_mxu_views) {
     const std::string mxu = shell.execute("mxu");
     CHECK_EQ(mxu.substr(0, mxu.find("PEs")),
              std::string("MXU: idle\nactive weights: tile 0x0\nshadow weights: empty\n"));
+}
+
+TEST(shell_activation_view) {
+    const char* source =
+        ".host 0\n"
+        "1 2\n"
+        ".weights 0 0\n"
+        "3 -4\n"
+        "Read_Host_Memory host=0 ub=0 rows=1\n"
+        "Read_Weights tile=0\n"
+        "MatrixMultiply ub=0 acc=0 rows=2 accumulate=0 new_weights=1\n"
+        "Activate acc=0 ub=0x10 rows=2 shift=1 function=relu\n"
+        "Halt\n";
+    Tpu tpu;
+    Shell shell(tpu);
+    shell.execute("load " + write_temp_program("mini_tpu_shell_act.s", source));
+    CHECK_EQ(shell.execute("act"), std::string("activation: idle"));
+
+    shell.execute("next 4");   // Activate issues and does its first row that same cycle
+    CHECK_EQ(shell.execute("act"), std::string("activation: 1 of 2 rows done\nacc 0x0 -> ub 0x10, function relu, shift 1"));
+
+    shell.execute("run");
+    CHECK_EQ(shell.execute("act"), std::string("activation: idle"));
+    CHECK_EQ(shell.execute("ub[0x10:2x2]"), std::string("0x10:    2    0\n0x11:    0    0"));   // 3/2 rounds to 2; -4/2 is cut by relu
 }
 
 TEST(shell_quit) {

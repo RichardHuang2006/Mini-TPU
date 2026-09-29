@@ -71,6 +71,29 @@ TEST(isa_matrix_multiply_byte_layout) {
     CHECK_THROWS(encode(in));
 }
 
+TEST(isa_activate_byte_layout) {
+    Instr in;
+    in.op       = Op::Activate;
+    in.ub_row   = 0x030201;
+    in.acc_row  = 0x0504;
+    in.rows     = 0x0706;
+    in.shift    = 0x08;
+    in.function = ActivationFunction::Tanh;
+    const InstrBytes expected = {0x40, 0x03, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0};
+    CHECK(encode(in) == expected);
+
+    const Instr back = decode(encode(in));
+    CHECK_EQ(back.ub_row, u32{0x030201});
+    CHECK_EQ(back.acc_row, u32{0x0504});
+    CHECK_EQ(back.rows, u32{0x0706});
+    CHECK_EQ(back.shift, u32{8});
+    CHECK(back.function == ActivationFunction::Tanh);
+    CHECK_EQ(disasm(in), std::string("Activate acc=0x504 ub=0x30201 rows=1798 shift=8 function=tanh"));
+
+    in.shift = 32;   // shifts are 0 to 31
+    CHECK_THROWS(encode(in));
+}
+
 TEST(isa_round_trips_at_field_limits) {
     for (Op op : {Op::ReadHostMemory, Op::WriteHostMemory}) {
         const Instr largest  = host_op(op, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF);

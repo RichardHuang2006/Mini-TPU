@@ -28,6 +28,9 @@ public:
     // True while a Read_Host_Memory is still writing any of these UB rows.
     bool writes_ub_rows(u32 first, u32 count) const;
 
+    // True while a Write_Host_Memory is still reading any of these UB rows.
+    bool reads_ub_rows(u32 first, u32 count) const;
+
     u64  bytes_done() const;
     u64  bytes_total() const;
 

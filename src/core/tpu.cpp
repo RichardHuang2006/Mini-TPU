@@ -9,7 +9,8 @@ Tpu::Tpu()
       wmem_("wmem", v1::kWeightMemBytes),
       host_interface_(host_, ub_),
       weight_fifo_(wmem_),
-      mxu_(ub_, acc_, weight_fifo_) {}
+      mxu_(ub_, acc_, weight_fifo_),
+      activation_(acc_, ub_) {}
 
 void Tpu::load(const Program& program) {
     program_ = program;
@@ -21,6 +22,7 @@ void Tpu::load(const Program& program) {
     host_interface_.reset();
     weight_fifo_.reset();
     mxu_.reset();
+    activation_.reset();
 
     pc_     = 0;
     halted_ = false;
@@ -69,6 +71,7 @@ void Tpu::tick() {
     host_interface_.tick();
     weight_fifo_.tick();
     mxu_.tick();
+    activation_.tick();
 
     stats_.cycles = stats_.cycles + 1;
     if (stall_ != Stall::None) {
@@ -185,11 +188,16 @@ const SystolicArray& Tpu::mxu() const {
     return mxu_;
 }
 
+const ActivationUnit& Tpu::activation() const {
+    return activation_;
+}
+
 bool Tpu::units_idle() const {
     const bool host_idle   = !host_interface_.busy();
     const bool weight_idle = !weight_fifo_.fetching();
     const bool mxu_idle    = !mxu_.busy() && !mxu_.shifting();
-    return host_idle && weight_idle && mxu_idle;
+    const bool act_idle    = !activation_.busy();
+    return host_idle && weight_idle && mxu_idle && act_idle;
 }
 
 // Stall::None means the instruction can issue this cycle.
@@ -210,10 +218,16 @@ Stall Tpu::why_blocked(const Instr& in) const {
             if (mxu_.reads_ub_rows(in.ub_row, in.rows)) {
                 return Stall::UbNotReady;   // it would overwrite rows the MXU is still reading
             }
+            if (activation_.writes_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // its bytes must land after the Activate's
+            }
             return Stall::None;
         case Op::WriteHostMemory:
             if (host_interface_.busy()) {
                 return Stall::HostInterfaceBusy;
+            }
+            if (activation_.writes_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // its rows are still being written by an Activate
             }
             return Stall::None;
         case Op::ReadWeights:
@@ -230,6 +244,29 @@ Stall Tpu::why_blocked(const Instr& in) const {
             }
             if (host_interface_.writes_ub_rows(in.ub_row, in.rows)) {
                 return Stall::UbNotReady;   // its input rows are still arriving from the host
+            }
+            if (activation_.writes_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // its input rows are still being written by an Activate
+            }
+            if (activation_.reads_acc_rows(in.acc_row, in.rows)) {
+                return Stall::AccNotReady;  // it would overwrite sums an Activate has not read yet
+            }
+            return Stall::None;
+        case Op::Activate:
+            if (activation_.busy()) {
+                return Stall::ActivationBusy;
+            }
+            if (mxu_.writes_acc_rows(in.acc_row, in.rows)) {
+                return Stall::AccNotReady;  // its sums are still coming out of the MXU
+            }
+            if (host_interface_.writes_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // its rows must land after the host's
+            }
+            if (host_interface_.reads_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // it would overwrite rows still going to the host
+            }
+            if (mxu_.reads_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // it would overwrite rows the MXU is still reading
             }
             return Stall::None;
     }
@@ -255,6 +292,9 @@ void Tpu::issue(const Instr& in) {
             break;
         case Op::MatrixMultiply:
             mxu_.start(in.ub_row, in.acc_row, in.rows, in.accumulate == 1, in.new_weights == 1);
+            break;
+        case Op::Activate:
+            activation_.start(in.acc_row, in.ub_row, in.rows, in.shift, in.function);
             break;
     }
 

@@ -20,6 +20,7 @@ enum class Op : u8 {
     WriteHostMemory = 0x11,   // Unified Buffer -> host memory
     ReadWeights     = 0x20,   // Weight Memory tile -> Weight FIFO
     MatrixMultiply  = 0x30,   // UB rows x weights -> accumulator rows
+    Activate        = 0x40,   // accumulator rows -> activation function -> UB rows
 };
 
 // Every opcode, so the assembler can look names up instead of keeping its own list.
@@ -31,6 +32,23 @@ inline constexpr Op kAllOps[] = {
     Op::WriteHostMemory,
     Op::ReadWeights,
     Op::MatrixMultiply,
+    Op::Activate,
+};
+
+// Activate's nonlinear function, held in bits 0-1 of its flag byte.
+enum class ActivationFunction : u8 {
+    Identity = 0,
+    Relu     = 1,
+    Sigmoid  = 2,
+    Tanh     = 3,
+};
+
+// Every function, so the assembler can look names up.
+inline constexpr ActivationFunction kAllFunctions[] = {
+    ActivationFunction::Identity,
+    ActivationFunction::Relu,
+    ActivationFunction::Sigmoid,
+    ActivationFunction::Tanh,
 };
 
 // One instruction with its fields unpacked into plain numbers.
@@ -43,6 +61,8 @@ struct Instr {
     u32 acc_row     = 0;   // 16 bits: accumulator row
     u32 accumulate  = 0;   // flag, 0 or 1: add into the accumulators instead of overwriting
     u32 new_weights = 0;   // flag, 0 or 1: switch to the shadow weight plane first
+    u32 shift       = 0;   // 0-31: Activate reads each accumulator as value / 2^shift
+    ActivationFunction function = ActivationFunction::Identity;   // Activate: identity, relu, sigmoid or tanh
 };
 
 // Bytes to place in a DRAM before the program runs.
@@ -60,6 +80,9 @@ struct Program {
 
 // The instruction's name as the assembler and disassembler spell it, e.g. "Read_Host_Memory".
 const char* op_name(Op op);
+
+// The function's name as the assembler and disassembler spell it, e.g. "relu".
+const char* function_name(ActivationFunction function);
 
 // Instr to 12 bytes; throws std::out_of_range when a field does not fit its width.
 InstrBytes encode(const Instr& in);
