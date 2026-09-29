@@ -4,13 +4,31 @@
 
 #include <stdexcept>
 
+namespace {
+
+// Marks every map cell the rows [first, first + count) touch as written on `cycle`.
+void mark_written(std::vector<Cycle>& cells, u32 first, u32 count, Cycle cycle) {
+    if (count == 0) {
+        return;
+    }
+    const u32 first_cell = first / kMapRows;
+    const u32 last_cell  = (first + count - 1) / kMapRows;
+    for (u32 cell = first_cell; cell <= last_cell && cell < cells.size(); ++cell) {
+        cells[cell] = cycle;
+    }
+}
+
+}  // namespace
+
 Tpu::Tpu()
     : host_("host", kHostMemBytes),
       wmem_("wmem", v1::kWeightMemBytes),
       host_interface_(host_, ub_),
       weight_fifo_(wmem_),
       mxu_(ub_, acc_, weight_fifo_),
-      activation_(acc_, ub_) {}
+      activation_(acc_, ub_) {
+    reset_activity();
+}
 
 void Tpu::load(const Program& program) {
     program_ = program;
@@ -28,6 +46,7 @@ void Tpu::load(const Program& program) {
     halted_ = false;
     stall_  = Stall::None;
     stats_  = Stats();
+    reset_activity();
 
     for (const DataBlock& block : program_.host) {
         host_.write(block.addr, block.bytes.data(), block.bytes.size());
@@ -60,6 +79,7 @@ void Tpu::tick() {
         fail_at_pc(disasm(in) + ": deadlock: " + stall_name(stall_) + ", but no unit is working");
     }
 
+    const u32 pc_before = pc_;
     if (stall_ == Stall::None) {
         try {
             issue(in);
@@ -68,16 +88,67 @@ void Tpu::tick() {
         }
     }
 
+    const u32 shifted_before = mxu_.rows_shifted();
+    const int shadow_before  = mxu_.shadow_tile();
+    const bool mxu_working   = mxu_.busy();
+
+    record_cycle(pc_before);
+
     host_interface_.tick();
     weight_fifo_.tick();
     mxu_.tick();
     activation_.tick();
+
+    // The shifter's work shows only afterwards: a tile row moved if the count changed or a new tile started.
+    const bool shifted = mxu_.rows_shifted() != shifted_before || mxu_.shadow_tile() != shadow_before;
+    activity_.back().shifting = shifted;
+    if (mxu_working) {
+        stats_.mxu_busy_cycles = stats_.mxu_busy_cycles + 1;
+    }
 
     stats_.cycles = stats_.cycles + 1;
     if (stall_ != Stall::None) {
         const std::size_t index = static_cast<std::size_t>(stall_);
         stats_.stall_cycles[index] = stats_.stall_cycles[index] + 1;
     }
+}
+
+// Which units work this cycle, taken before they advance so a unit that finishes now still counts.
+void Tpu::record_cycle(u32 pc_before) {
+    CycleRecord record;
+    record.cycle      = stats_.cycles;
+    record.stall      = stall_;
+    record.host       = host_interface_.busy();
+    record.fetching   = weight_fifo_.fetching();
+    record.mxu        = mxu_.busy();
+    record.activation = activation_.busy();
+    if (stall_ == Stall::None) {
+        record.issued_pc = static_cast<int>(pc_before);
+    }
+
+    // The rows each unit is writing right now glow on the visualizer's maps.
+    const Cycle now = stats_.cycles;
+    if (host_interface_.busy() && host_interface_.direction() == Direction::HostToUb) {
+        mark_written(ub_written_, host_interface_.ub_row(), host_interface_.rows(), now);
+    }
+    if (activation_.busy()) {
+        const u32 out_rows = activate_output_rows(activation_.rows_total(), activation_.pool(), activation_.pool_size());
+        mark_written(ub_written_, activation_.ub_row(), out_rows, now);
+    }
+    if (mxu_.busy()) {
+        mark_written(acc_written_, mxu_.acc_row(), mxu_.rows(), now);
+    }
+
+    activity_.push_back(record);
+    if (activity_.size() > kActivityCycles) {
+        activity_.pop_front();
+    }
+}
+
+void Tpu::reset_activity() {
+    activity_.clear();
+    ub_written_.assign(v1::kUbRows / kMapRows, kNever);
+    acc_written_.assign(v1::kAccRows / kMapRows, kNever);
 }
 
 void Tpu::run_cycles(u64 cycles) {
@@ -192,6 +263,18 @@ const ActivationUnit& Tpu::activation() const {
     return activation_;
 }
 
+const std::deque<CycleRecord>& Tpu::activity() const {
+    return activity_;
+}
+
+const std::vector<Cycle>& Tpu::ub_written() const {
+    return ub_written_;
+}
+
+const std::vector<Cycle>& Tpu::acc_written() const {
+    return acc_written_;
+}
+
 bool Tpu::units_idle() const {
     const bool host_idle   = !host_interface_.busy();
     const bool weight_idle = !weight_fifo_.fetching();
@@ -252,23 +335,26 @@ Stall Tpu::why_blocked(const Instr& in) const {
                 return Stall::AccNotReady;  // it would overwrite sums an Activate has not read yet
             }
             return Stall::None;
-        case Op::Activate:
+        case Op::Activate: {
+            // With pooling it writes fewer UB rows than it reads accumulator rows.
+            const u32 out_rows = activate_output_rows(in.rows, in.pool, in.pool_size);
             if (activation_.busy()) {
                 return Stall::ActivationBusy;
             }
             if (mxu_.writes_acc_rows(in.acc_row, in.rows)) {
                 return Stall::AccNotReady;  // its sums are still coming out of the MXU
             }
-            if (host_interface_.writes_ub_rows(in.ub_row, in.rows)) {
+            if (host_interface_.writes_ub_rows(in.ub_row, out_rows)) {
                 return Stall::UbNotReady;   // its rows must land after the host's
             }
-            if (host_interface_.reads_ub_rows(in.ub_row, in.rows)) {
+            if (host_interface_.reads_ub_rows(in.ub_row, out_rows)) {
                 return Stall::UbNotReady;   // it would overwrite rows still going to the host
             }
-            if (mxu_.reads_ub_rows(in.ub_row, in.rows)) {
+            if (mxu_.reads_ub_rows(in.ub_row, out_rows)) {
                 return Stall::UbNotReady;   // it would overwrite rows the MXU is still reading
             }
             return Stall::None;
+        }
     }
     return Stall::None;
 }
@@ -294,7 +380,7 @@ void Tpu::issue(const Instr& in) {
             mxu_.start(in.ub_row, in.acc_row, in.rows, in.accumulate == 1, in.new_weights == 1);
             break;
         case Op::Activate:
-            activation_.start(in.acc_row, in.ub_row, in.rows, in.shift, in.function);
+            activation_.start(in.acc_row, in.ub_row, in.rows, in.shift, in.function, in.pool, in.pool_size, in.pool_width);
             break;
     }
 

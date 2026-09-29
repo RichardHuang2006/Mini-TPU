@@ -43,6 +43,22 @@ void check_shift(u32 value) {
     }
 }
 
+// With pooling, size is 1-7 and width 1-255; without it both stay 0, so the encoding is unchanged.
+void check_pooling(const Instr& in) {
+    if (in.pool == Pooling::None) {
+        if (in.pool_size != 0 || in.pool_width != 0) {
+            throw std::out_of_range("size= and width= only go with pool=max or pool=avg");
+        }
+        return;
+    }
+    if (in.pool_size < 1 || in.pool_size > 7) {
+        throw std::out_of_range("size=" + std::to_string(in.pool_size) + " must be 1 to 7");
+    }
+    if (in.pool_width < 1) {
+        throw std::out_of_range("pooling needs width=, the feature map's width in rows");
+    }
+}
+
 std::string hex(u32 value) {
     char text[16];
     std::snprintf(text, sizeof text, "0x%X", value);
@@ -87,6 +103,18 @@ const char* function_name(ActivationFunction function) {
     return "?";
 }
 
+const char* pooling_name(Pooling pool) {
+    switch (pool) {
+        case Pooling::None:
+            return "none";
+        case Pooling::Max:
+            return "max";
+        case Pooling::Average:
+            return "avg";
+    }
+    return "?";
+}
+
 InstrBytes encode(const Instr& in) {
     InstrBytes word{};   // all twelve bytes start as zero
     word[0] = static_cast<u8>(in.op);
@@ -125,8 +153,11 @@ InstrBytes encode(const Instr& in) {
             write_bytes(word, 6, 2, in.acc_row, "acc");     // bytes 6-7
             write_bytes(word, 8, 2, in.rows, "rows");       // bytes 8-9
             check_shift(in.shift);
-            word[10] = static_cast<u8>(in.shift);           // byte 10
-            word[1]  = static_cast<u8>(in.function);        // flag byte: bits 0-1
+            check_pooling(in);
+            write_bytes(word, 11, 1, in.pool_width, "width");   // byte 11
+            word[10] = static_cast<u8>(in.shift);               // byte 10
+            const u32 flags = static_cast<u32>(in.function) | (static_cast<u32>(in.pool) << 2) | (in.pool_size << 4);
+            word[1]  = static_cast<u8>(flags);                  // flag byte: bits 0-1 function, 2-3 pool, 4-6 size
             break;
         }
     }
@@ -171,6 +202,12 @@ Instr decode(const InstrBytes& word) {
             in.acc_row  = read_bytes(word, 6, 2);
             in.rows     = read_bytes(word, 8, 2);
             in.shift    = word[10] & 0x1F;                                  // byte 10, bits 0-4
+            in.pool       = static_cast<Pooling>((word[1] >> 2) & 0x3);    // flag byte, bits 2-3
+            in.pool_size  = (word[1] >> 4) & 0x7;                          // flag byte, bits 4-6
+            in.pool_width = word[11];                                      // byte 11
+            if (static_cast<u8>(in.pool) > 2) {
+                throw std::invalid_argument("unknown pooling " + std::to_string(static_cast<u32>(in.pool)));
+            }
             break;
         }
 
@@ -210,7 +247,12 @@ std::string disasm(const Instr& in) {
         case Op::Activate: {
             const std::string operands = " acc=" + hex(in.acc_row) + " ub=" + hex(in.ub_row) + " rows=" + std::to_string(in.rows);
             const std::string options  = " shift=" + std::to_string(in.shift) + " function=" + function_name(in.function);
-            return name + operands + options;
+            if (in.pool == Pooling::None) {
+                return name + operands + options;
+            }
+            const std::string pooling = " pool=" + std::string(pooling_name(in.pool)) + " size=" + std::to_string(in.pool_size) +
+                                        " width=" + std::to_string(in.pool_width);
+            return name + operands + options + pooling;
         }
     }
     return name;

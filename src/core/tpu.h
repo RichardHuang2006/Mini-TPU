@@ -2,9 +2,12 @@
 
 #pragma once
 
+#include <deque>
 #include <string>
+#include <vector>
 
 #include "common/stats.h"
+#include "core/activity.h"
 #include "isa/isa.h"
 #include "mem/accumulators.h"
 #include "mem/dram.h"
@@ -61,6 +64,11 @@ public:
     const SystolicArray&  mxu() const;
     const ActivationUnit& activation() const;
 
+    // For the visualizer: the last 512 cycles, and the cycle each 256-row map cell was last written (kNever if never).
+    const std::deque<CycleRecord>& activity() const;
+    const std::vector<Cycle>&      ub_written() const;
+    const std::vector<Cycle>&      acc_written() const;
+
 private:
     Program        program_;
     UnifiedBuffer  ub_;
@@ -77,9 +85,15 @@ private:
     Stall stall_  = Stall::None;
     Stats stats_;
 
+    std::deque<CycleRecord> activity_;
+    std::vector<Cycle>      ub_written_;
+    std::vector<Cycle>      acc_written_;
+
     bool  units_idle() const;
     Stall why_blocked(const Instr& in) const;
     void  issue(const Instr& in);
     void  reload();
+    void  reset_activity();
+    void  record_cycle(u32 pc_before);
     [[noreturn]] void fail_at_pc(const std::string& what) const;
 };

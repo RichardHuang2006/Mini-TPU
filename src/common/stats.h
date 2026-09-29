@@ -49,6 +49,7 @@ struct Stats {
     Cycle cycles = 0;
     u64   issued = 0;   // instructions issued so far
     std::array<u64, kStallKinds> stall_cycles{};   // cycles charged to each Stall, indexed by its value
+    u64   mxu_busy_cycles = 0;   // cycles the systolic array took a step
 
     u64 stalled(Stall stall) const {
         const std::size_t index = static_cast<std::size_t>(stall);

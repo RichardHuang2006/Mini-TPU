@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,12 @@ std::string fifo_occupancy(const WeightFifo& fifo);
 // The tile arriving now, e.g. "tile 0x1, 1200 of 65536 bytes", or "idle".
 std::string fifo_fetch(const WeightFifo& fifo);
 
+// A target the user looked at, and its current text; the visualizer keeps showing it.
+struct PinnedView {
+    std::string target;
+    std::string text;
+};
+
 class Shell {
 public:
     explicit Shell(Tpu& tpu);
@@ -28,6 +35,12 @@ public:
 
     bool quit_requested() const;
 
+    // Called after every command, and about 20 times a second during `run`, so the visualizer can redraw.
+    void set_observer(std::function<void()> observer);
+
+    // The last 4 targets looked at, each shown as it reads now.
+    std::vector<PinnedView> pinned_views() const;
+
     // The path given to the last successful load, or "" before any load.
     const std::string& loaded_file() const;
 
@@ -35,6 +48,12 @@ private:
     Tpu&        tpu_;
     bool        quit_ = false;
     std::string loaded_file_;
+    std::function<void()>    observer_;
+    std::vector<std::string> pinned_;
+
+    std::string run_command(const std::string& line);
+    void        run_animated(u64 cycles);
+    void        pin(const std::vector<std::string>& words);
 
     std::string load(const std::vector<std::string>& words);
     std::string run(const std::vector<std::string>& words);

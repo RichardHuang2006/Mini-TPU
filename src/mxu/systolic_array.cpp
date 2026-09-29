@@ -217,6 +217,18 @@ u32 SystolicArray::step() const {
     return step_;
 }
 
+u32 SystolicArray::ub_row() const {
+    return ub_row_;
+}
+
+u32 SystolicArray::acc_row() const {
+    return acc_row_;
+}
+
+u32 SystolicArray::rows() const {
+    return rows_;
+}
+
 // Row r's last column sum leaves the bottom at step r + 255 + 255, so B rows take B + 511 steps.
 u32 SystolicArray::total_steps() const {
     return rows_ + 2 * kDim - 1;

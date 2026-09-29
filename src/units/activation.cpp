@@ -1,7 +1,8 @@
-/// The int32-to-int8 arithmetic for each function, and the activation unit's one-row-per-cycle loop.
+/// The int32-to-int8 arithmetic for each function, pooling, and the activation unit's one-row-per-cycle loop.
 
 #include "units/activation.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -98,16 +99,47 @@ i8 activate(i32 value, u32 shift, ActivationFunction function) {
     return 0;
 }
 
+i8 average(i32 sum, u32 count) {
+    const std::int64_t wide = sum;
+    const std::int64_t half = count / 2;
+    if (wide >= 0) {
+        return saturate((wide + half) / count);
+    }
+    return saturate(-((-wide + half) / count));
+}
+
+u32 activate_output_rows(u32 rows, Pooling pool, u32 pool_size) {
+    if (pool == Pooling::None || pool_size == 0) {
+        return rows;
+    }
+    return rows / (pool_size * pool_size);
+}
+
 ActivationUnit::ActivationUnit(const Accumulators& acc, UnifiedBuffer& ub) : acc_(acc), ub_(ub) {}
 
-void ActivationUnit::start(u32 acc_row, u32 ub_row, u32 rows, u32 shift, ActivationFunction function) {
+void ActivationUnit::start(u32 acc_row, u32 ub_row, u32 rows, u32 shift, ActivationFunction function, Pooling pool,
+                           u32 pool_size, u32 pool_width) {
     if (busy()) {
         throw std::logic_error("activation unit: an Activate is already running");
     }
 
+    // Pooling needs whole windows: the width splits into windows, and the rows make whole bands of window-high image rows.
+    if (pool != Pooling::None) {
+        if (pool_width % pool_size != 0) {
+            throw std::invalid_argument("pool width " + std::to_string(pool_width) + " is not a multiple of size " +
+                                        std::to_string(pool_size));
+        }
+        const u32 band_rows = pool_width * pool_size;
+        if (rows % band_rows != 0) {
+            throw std::invalid_argument("pool rows " + std::to_string(rows) + " are not whole bands of " +
+                                        std::to_string(pool_size) + " image rows " + std::to_string(pool_width) +
+                                        " pixels wide");
+        }
+    }
+
     // Both ranges are checked before any row moves, so a bad Activate changes nothing.
     check_rows("acc", acc_row, rows, Accumulators::kRows);
-    check_rows("ub", ub_row, rows, UnifiedBuffer::kRows);
+    check_rows("ub", ub_row, activate_output_rows(rows, pool, pool_size), UnifiedBuffer::kRows);
 
     acc_row_    = acc_row;
     ub_row_     = ub_row;
@@ -115,6 +147,15 @@ void ActivationUnit::start(u32 acc_row, u32 ub_row, u32 rows, u32 shift, Activat
     rows_done_  = 0;
     shift_      = shift;
     function_   = function;
+    pool_       = pool;
+    pool_size_  = pool_size;
+    pool_width_ = pool_width;
+
+    line_.clear();
+    if (pool != Pooling::None) {
+        const u32 pooled_per_band = pool_width / pool_size;
+        line_.assign(static_cast<std::size_t>(pooled_per_band) * Accumulators::kCols, 0);
+    }
 }
 
 void ActivationUnit::tick() {
@@ -122,13 +163,64 @@ void ActivationUnit::tick() {
         return;
     }
 
-    const i32* in  = acc_.row(acc_row_ + rows_done_);
-    i8*        out = ub_.row(ub_row_ + rows_done_);
+    const i32* in = acc_.row(acc_row_ + rows_done_);
+    std::vector<i8> activated(Accumulators::kCols);
     for (u32 n = 0; n < Accumulators::kCols; ++n) {
-        out[n] = activate(in[n], shift_, function_);
+        activated[n] = activate(in[n], shift_, function_);
+    }
+
+    if (pool_ == Pooling::None) {
+        i8* out = ub_.row(ub_row_ + rows_done_);
+        for (u32 n = 0; n < Accumulators::kCols; ++n) {
+            out[n] = activated[n];
+        }
+    } else {
+        pool_row(activated);
     }
 
     rows_done_ = rows_done_ + 1;
+}
+
+// Input row i is pixel (y, x) of the feature map; it joins the window at pooled column x / size of its band.
+void ActivationUnit::pool_row(const std::vector<i8>& activated) {
+    const u32 i = rows_done_;
+    const u32 y = i / pool_width_;
+    const u32 x = i % pool_width_;
+    const u32 slot = x / pool_size_;
+    const bool first_in_window = (y % pool_size_ == 0) && (x % pool_size_ == 0);
+
+    i32* running = line_.data() + static_cast<std::size_t>(slot) * Accumulators::kCols;
+    for (u32 n = 0; n < Accumulators::kCols; ++n) {
+        const i32 value = activated[n];
+        if (first_in_window) {
+            running[n] = value;
+        } else if (pool_ == Pooling::Max) {
+            running[n] = std::max(running[n], value);
+        } else {
+            running[n] = running[n] + value;
+        }
+    }
+
+    // The band's last pixel completes every window in it, so the whole band of pooled pixels goes to the UB.
+    const bool band_done = (y % pool_size_ == pool_size_ - 1) && (x == pool_width_ - 1);
+    if (!band_done) {
+        return;
+    }
+
+    const u32 pooled_per_band = pool_width_ / pool_size_;
+    const u32 band            = y / pool_size_;
+    const u32 window_count    = pool_size_ * pool_size_;
+    for (u32 s = 0; s < pooled_per_band; ++s) {
+        const i32* window = line_.data() + static_cast<std::size_t>(s) * Accumulators::kCols;
+        i8*        out    = ub_.row(ub_row_ + band * pooled_per_band + s);
+        for (u32 n = 0; n < Accumulators::kCols; ++n) {
+            if (pool_ == Pooling::Max) {
+                out[n] = static_cast<i8>(window[n]);
+            } else {
+                out[n] = average(window[n], window_count);
+            }
+        }
+    }
 }
 
 void ActivationUnit::reset() {
@@ -138,6 +230,10 @@ void ActivationUnit::reset() {
     rows_done_  = 0;
     shift_      = 0;
     function_   = ActivationFunction::Identity;
+    pool_       = Pooling::None;
+    pool_size_  = 0;
+    pool_width_ = 0;
+    line_.clear();
 }
 
 bool ActivationUnit::busy() const {
@@ -155,7 +251,7 @@ bool ActivationUnit::writes_ub_rows(u32 first, u32 count) const {
     if (!busy()) {
         return false;
     }
-    return overlaps(ub_row_, rows_total_, first, count);
+    return overlaps(ub_row_, activate_output_rows(rows_total_, pool_, pool_size_), first, count);
 }
 
 u32 ActivationUnit::acc_row() const {
@@ -180,4 +276,16 @@ u32 ActivationUnit::shift() const {
 
 ActivationFunction ActivationUnit::function() const {
     return function_;
+}
+
+Pooling ActivationUnit::pool() const {
+    return pool_;
+}
+
+u32 ActivationUnit::pool_size() const {
+    return pool_size_;
+}
+
+u32 ActivationUnit::pool_width() const {
+    return pool_width_;
 }

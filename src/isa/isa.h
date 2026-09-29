@@ -51,6 +51,20 @@ inline constexpr ActivationFunction kAllFunctions[] = {
     ActivationFunction::Tanh,
 };
 
+// Activate's optional pooling, held in bits 2-3 of its flag byte.
+enum class Pooling : u8 {
+    None    = 0,
+    Max     = 1,
+    Average = 2,
+};
+
+// Every pooling kind, so the assembler can look names up.
+inline constexpr Pooling kAllPoolings[] = {
+    Pooling::None,
+    Pooling::Max,
+    Pooling::Average,
+};
+
 // One instruction with its fields unpacked into plain numbers.
 struct Instr {
     Op  op          = Op::Nop;
@@ -63,6 +77,9 @@ struct Instr {
     u32 new_weights = 0;   // flag, 0 or 1: switch to the shadow weight plane first
     u32 shift       = 0;   // 0-31: Activate reads each accumulator as value / 2^shift
     ActivationFunction function = ActivationFunction::Identity;   // Activate: identity, relu, sigmoid or tanh
+    Pooling pool     = Pooling::None;   // Activate: none, max or avg over size x size windows of UB rows
+    u32 pool_size    = 0;               // 1-7 with pooling, else 0: the window is pool_size x pool_size pixels
+    u32 pool_width   = 0;               // 1-255 with pooling, else 0: the feature map's width, one UB row per pixel
 };
 
 // Bytes to place in a DRAM before the program runs.
@@ -83,6 +100,9 @@ const char* op_name(Op op);
 
 // The function's name as the assembler and disassembler spell it, e.g. "relu".
 const char* function_name(ActivationFunction function);
+
+// The pooling's name as the assembler and disassembler spell it: "none", "max" or "avg".
+const char* pooling_name(Pooling pool);
 
 // Instr to 12 bytes; throws std::out_of_range when a field does not fit its width.
 InstrBytes encode(const Instr& in);

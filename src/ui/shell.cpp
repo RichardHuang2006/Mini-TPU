@@ -2,10 +2,14 @@
 
 #include "ui/shell.h"
 
+#include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 #include "isa/asm.h"
 
@@ -173,6 +177,33 @@ std::string status_line(const Tpu& tpu) {
 Shell::Shell(Tpu& tpu) : tpu_(tpu) {}
 
 std::string Shell::execute(const std::string& line) {
+    const std::string output = run_command(line);
+    if (observer_) {
+        observer_();
+    }
+    return output;
+}
+
+void Shell::set_observer(std::function<void()> observer) {
+    observer_ = std::move(observer);
+}
+
+std::vector<PinnedView> Shell::pinned_views() const {
+    std::vector<PinnedView> views;
+    for (const std::string& target : pinned_) {
+        PinnedView view;
+        view.target = target;
+        try {
+            view.text = show(split_words(target));
+        } catch (const std::exception& e) {
+            view.text = std::string("error: ") + e.what();
+        }
+        views.push_back(view);
+    }
+    return views;
+}
+
+std::string Shell::run_command(const std::string& line) {
     const std::vector<std::string> words = split_words(line);
     if (words.empty()) {
         return "";
@@ -194,7 +225,9 @@ std::string Shell::execute(const std::string& line) {
         if (moves_in_time) {
             return move(words);
         }
-        return show(words);
+        const std::string text = show(words);
+        pin(words);
+        return text;
     } catch (const AsmError& e) {
         return e.what();   // already reads "file:line:col: error: ..."
     } catch (const std::exception& e) {
@@ -236,13 +269,50 @@ std::string Shell::load(const std::vector<std::string>& words) {
 std::string Shell::run(const std::vector<std::string>& words) {
     require_program();
     if (words.size() == 1) {
-        tpu_.run_to_halt();
+        run_animated(std::numeric_limits<u64>::max());
     } else if (words.size() == 2) {
-        tpu_.run_cycles(parse_number(words[1], "cycle count"));
+        run_animated(parse_number(words[1], "cycle count"));
     } else {
         throw std::invalid_argument("usage: run [N]");
     }
     return status_line(tpu_);
+}
+
+// Runs in short slices and tells the observer about 20 times a second, so the visualizer animates a long run.
+void Shell::run_animated(u64 cycles) {
+    using Clock = std::chrono::steady_clock;
+    const auto update_every = std::chrono::milliseconds(50);
+    auto last_update = Clock::now();
+
+    u64 left = cycles;
+    while (left > 0 && !tpu_.halted()) {
+        const u64 slice = std::min<u64>(left, 64);
+        tpu_.run_cycles(slice);
+        left = left - slice;
+
+        const bool time_to_update = Clock::now() - last_update >= update_every;
+        if (observer_ && time_to_update) {
+            observer_();
+            last_update = Clock::now();
+        }
+    }
+}
+
+// The last 4 targets looked at stay pinned on the visualizer; looking at one again moves it to the end.
+void Shell::pin(const std::vector<std::string>& words) {
+    std::string target = words[0];
+    for (std::size_t i = 1; i < words.size(); ++i) {
+        target += " " + words[i];
+    }
+
+    const auto same = std::find(pinned_.begin(), pinned_.end(), target);
+    if (same != pinned_.end()) {
+        pinned_.erase(same);
+    }
+    pinned_.push_back(target);
+    if (pinned_.size() > 4) {
+        pinned_.erase(pinned_.begin());
+    }
 }
 
 // step and back move by cycles, next and prev by instructions; each takes a count, 1 if left out.
@@ -412,7 +482,13 @@ std::string Shell::show_activation() const {
     const std::string progress = std::to_string(act.rows_done()) + " of " + std::to_string(act.rows_total()) + " rows done";
     const std::string rows     = "acc " + hex(act.acc_row()) + " -> ub " + hex(act.ub_row());
     const std::string settings = ", function " + std::string(function_name(act.function())) + ", shift " + std::to_string(act.shift());
-    return "activation: " + progress + "\n" + rows + settings;
+    if (act.pool() == Pooling::None) {
+        return "activation: " + progress + "\n" + rows + settings;
+    }
+    const std::string size    = std::to_string(act.pool_size());
+    const std::string pooling = "\npool " + std::string(pooling_name(act.pool())) + " " + size + "x" + size + " over a map " +
+                                std::to_string(act.pool_width()) + " pixels wide";
+    return "activation: " + progress + "\n" + rows + settings + pooling;
 }
 
 // One line per slot, oldest first.

@@ -103,6 +103,14 @@ std::vector<std::string> operand_keys(Op op) {
     return {};
 }
 
+// Keys an instruction also accepts but does not require.
+std::vector<std::string> optional_keys(Op op) {
+    if (op == Op::Activate) {
+        return {"pool", "size", "width"};
+    }
+    return {};
+}
+
 void set_operand(Instr& in, const std::string& key, u32 value) {
     if (key == "host") {
         in.host_row = value;
@@ -120,6 +128,10 @@ void set_operand(Instr& in, const std::string& key, u32 value) {
         in.new_weights = value;
     } else if (key == "shift") {
         in.shift = value;
+    } else if (key == "size") {
+        in.pool_size = value;
+    } else if (key == "width") {
+        in.pool_width = value;
     }
 }
 
@@ -252,6 +264,16 @@ private:
         fail(name.col, "unknown function '" + name.text + "' (expects identity, relu, sigmoid, tanh)");
     }
 
+    // pool= takes a name, not a number.
+    Pooling find_pooling(const Token& name) const {
+        for (Pooling pool : kAllPoolings) {
+            if (name.text == pooling_name(pool)) {
+                return pool;
+            }
+        }
+        fail(name.col, "unknown pooling '" + name.text + "' (expects none, max, avg)");
+    }
+
     // `Op key=value key=value ...`
     void instruction(const std::vector<Token>& tokens) {
         block_ = nullptr;   // an instruction ends any open data block
@@ -260,7 +282,8 @@ private:
         Instr in;
         in.op = find_op(mnemonic);
 
-        const std::vector<std::string> keys = operand_keys(in.op);
+        const std::vector<std::string> keys     = operand_keys(in.op);
+        const std::vector<std::string> optional = optional_keys(in.op);
         std::vector<std::string> given;
 
         for (std::size_t i = 1; i < tokens.size(); ++i) {
@@ -272,8 +295,8 @@ private:
             }
             const std::string key = token.text.substr(0, equals);
 
-            if (!contains(keys, key)) {
-                fail(token.col, mnemonic.text + " has no operand '" + key + "'" + expects_hint(keys));
+            if (!contains(keys, key) && !contains(optional, key)) {
+                fail(token.col, mnemonic.text + " has no operand '" + key + "'" + expects_hint(keys, optional));
             }
             if (contains(given, key)) {
                 fail(token.col, "operand '" + key + "' given twice");
@@ -286,6 +309,10 @@ private:
 
             if (key == "function") {
                 in.function = find_function(value_token);
+                continue;
+            }
+            if (key == "pool") {
+                in.pool = find_pooling(value_token);
                 continue;
             }
 
@@ -310,22 +337,91 @@ private:
         }
     }
 
-    static std::string expects_hint(const std::vector<std::string>& keys) {
+    static std::string expects_hint(const std::vector<std::string>& keys, const std::vector<std::string>& optional) {
         if (keys.empty()) {
             return " (it takes none)";
         }
-        std::string hint = " (expects ";
-        for (std::size_t k = 0; k < keys.size(); ++k) {
-            if (k > 0) {
-                hint += ", ";
-            }
-            hint += keys[k];
+        std::string hint = " (expects " + join(keys);
+        if (!optional.empty()) {
+            hint += "; optional " + join(optional);
         }
         return hint + ")";
+    }
+
+    static std::string join(const std::vector<std::string>& words) {
+        std::string text;
+        for (std::size_t k = 0; k < words.size(); ++k) {
+            if (k > 0) {
+                text += ", ";
+            }
+            text += words[k];
+        }
+        return text;
     }
 };
 
 }  // namespace
+
+namespace {
+
+// One 256-byte row of data: the directive that places it, then its values 16 per line, trailing zeros left out.
+std::string data_row(const std::string& directive, const i8* bytes, u32 count) {
+    u32 used = count;
+    while (used > 0 && bytes[used - 1] == 0) {
+        used = used - 1;
+    }
+    if (used == 0) {
+        return "";   // memory starts zeroed, so an all-zero row needs no text
+    }
+
+    std::string text = directive + "\n";
+    for (u32 i = 0; i < used; ++i) {
+        text += std::to_string(static_cast<int>(bytes[i]));
+        const bool end_of_line = (i % 16 == 15) || (i + 1 == used);
+        if (end_of_line) {
+            text += "\n";
+        } else {
+            text += " ";
+        }
+    }
+    return text;
+}
+
+// Every row a data block covers; blocks from the compiler always start on a row.
+std::string data_text(const std::vector<DataBlock>& blocks, bool weights) {
+    const u64 row_bytes = v1::kMxuDim;
+    std::string text;
+    for (const DataBlock& block : blocks) {
+        if (block.addr % row_bytes != 0) {
+            throw std::invalid_argument("a data block at byte " + std::to_string(block.addr) + " does not start on a row");
+        }
+        for (u64 offset = 0; offset < block.bytes.size(); offset += row_bytes) {
+            const u64 row = (block.addr + offset) / row_bytes;
+            std::string directive = ".host " + std::to_string(row);
+            if (weights) {
+                const u64 rows_per_tile = v1::kTileBytes / row_bytes;
+                directive = ".weights " + std::to_string(row / rows_per_tile) + " " + std::to_string(row % rows_per_tile);
+            }
+            const u64 left  = block.bytes.size() - offset;
+            const u32 count = static_cast<u32>(std::min<u64>(left, row_bytes));
+            text += data_row(directive, block.bytes.data() + offset, count);
+        }
+    }
+    return text;
+}
+
+}  // namespace
+
+std::string program_text(const Program& program, const std::string& header) {
+    std::string text = "# " + header + "\n\n";
+    text += data_text(program.host, false);
+    text += data_text(program.weights, true);
+    text += "\n";
+    for (const InstrBytes& word : program.code) {
+        text += disasm(decode(word)) + "\n";
+    }
+    return text;
+}
 
 Program assemble(const std::string& source, const std::string& name) {
     Assembler assembler(name);

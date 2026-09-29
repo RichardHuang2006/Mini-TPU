@@ -26,6 +26,16 @@ public:
         return pages_.size();
     }
 
+    // The page numbers written so far, smallest first.
+    std::vector<u64> allocated_pages() const {
+        std::vector<u64> numbers;
+        for (const auto& entry : pages_) {
+            numbers.push_back(entry.first);
+        }
+        std::sort(numbers.begin(), numbers.end());
+        return numbers;
+    }
+
     // A copy can cross page boundaries, so it is done one page-sized piece at a time.
     void write(u64 addr, const i8* src, u64 n) {
         check_range(addr, n);

@@ -38,6 +38,9 @@ public:
 
     // For the terminal: progress, planes and the grid.
     u32 step() const;
+    u32 ub_row() const;
+    u32 acc_row() const;
+    u32 rows() const;
     u32 total_steps() const;
     u32 rows_shifted() const;
     int active_tile() const;     // -1 before any tile was made active
