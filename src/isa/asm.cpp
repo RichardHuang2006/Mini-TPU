@@ -94,6 +94,9 @@ std::vector<std::string> operand_keys(Op op) {
     if (op == Op::ReadWeights) {
         return {"tile"};
     }
+    if (op == Op::MatrixMultiply) {
+        return {"ub", "acc", "rows", "accumulate", "new_weights"};
+    }
     return {};
 }
 
@@ -106,6 +109,12 @@ void set_operand(Instr& in, const std::string& key, u32 value) {
         in.rows = value;
     } else if (key == "tile") {
         in.tile = value;
+    } else if (key == "acc") {
+        in.acc_row = value;
+    } else if (key == "accumulate") {
+        in.accumulate = value;
+    } else if (key == "new_weights") {
+        in.new_weights = value;
     }
 }
 
@@ -155,14 +164,18 @@ private:
         return value;
     }
 
-    // `.host ROW` or `.weights TILE`: later data lines fill a block starting there.
+    // `.host ROW` or `.weights TILE [ROW]`: later data lines fill a block starting there.
     void directive(const std::vector<Token>& tokens) {
         const Token& name = tokens[0];
-        if (name.text != ".host" && name.text != ".weights") {
+        const bool is_host = name.text == ".host";
+        if (!is_host && name.text != ".weights") {
             fail(name.col, "unknown directive '" + name.text + "' (expects .host or .weights)");
         }
-        if (tokens.size() != 2) {
-            fail(name.col, name.text + " takes one address");
+        if (is_host && tokens.size() != 2) {
+            fail(name.col, ".host takes one address");
+        }
+        if (!is_host && (tokens.size() < 2 || tokens.size() > 3)) {
+            fail(name.col, ".weights takes a tile and an optional row");
         }
 
         const std::int64_t address = number(tokens[1]);
@@ -176,7 +189,15 @@ private:
             prog_.host.push_back(block);
             block_ = &prog_.host.back();
         } else {
-            block.addr = static_cast<u64>(address) * v1::kTileBytes;    // Weight Memory is addressed in tiles
+            // Weight Memory is addressed in tiles; the optional row picks one of the tile's 256 rows of 256 bytes.
+            std::int64_t row = 0;
+            if (tokens.size() == 3) {
+                row = number(tokens[2]);
+                if (row < 0 || row > 255) {
+                    fail(tokens[2].col, "row " + tokens[2].text + " is past the tile's last row 255");
+                }
+            }
+            block.addr = static_cast<u64>(address) * v1::kTileBytes + static_cast<u64>(row) * v1::kMxuDim;
             prog_.weights.push_back(block);
             block_ = &prog_.weights.back();
         }

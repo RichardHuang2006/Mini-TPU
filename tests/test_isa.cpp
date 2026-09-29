@@ -49,6 +49,28 @@ TEST(isa_read_weights_byte_layout) {
     CHECK_EQ(disasm(in), std::string("Read_Weights tile=0xFFFFFFFF"));
 }
 
+TEST(isa_matrix_multiply_byte_layout) {
+    Instr in;
+    in.op          = Op::MatrixMultiply;
+    in.ub_row      = 0x030201;
+    in.acc_row     = 0x0504;
+    in.rows        = 0x09080706;
+    in.accumulate  = 1;
+    in.new_weights = 1;
+    const InstrBytes expected = {0x30, 0x03, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
+    CHECK(encode(in) == expected);
+
+    const Instr back = decode(encode(in));
+    CHECK_EQ(back.acc_row, u32{0x0504});
+    CHECK_EQ(back.rows, u32{0x09080706});
+    CHECK_EQ(back.accumulate, u32{1});
+    CHECK_EQ(back.new_weights, u32{1});
+    CHECK_EQ(disasm(in), std::string("MatrixMultiply ub=0x30201 acc=0x504 rows=151521030 accumulate=1 new_weights=1"));
+
+    in.accumulate = 2;   // flags are 0 or 1
+    CHECK_THROWS(encode(in));
+}
+
 TEST(isa_round_trips_at_field_limits) {
     for (Op op : {Op::ReadHostMemory, Op::WriteHostMemory}) {
         const Instr largest  = host_op(op, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF);

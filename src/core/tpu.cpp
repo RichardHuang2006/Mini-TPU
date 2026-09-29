@@ -8,16 +8,19 @@ Tpu::Tpu()
     : host_("host", kHostMemBytes),
       wmem_("wmem", v1::kWeightMemBytes),
       host_interface_(host_, ub_),
-      weight_fifo_(wmem_) {}
+      weight_fifo_(wmem_),
+      mxu_(ub_, acc_, weight_fifo_) {}
 
 void Tpu::load(const Program& program) {
     program_ = program;
 
     ub_   = UnifiedBuffer();
+    acc_  = Accumulators();
     host_ = Dram("host", kHostMemBytes);
     wmem_ = Dram("wmem", v1::kWeightMemBytes);
     host_interface_.reset();
     weight_fifo_.reset();
+    mxu_.reset();
 
     pc_     = 0;
     halted_ = false;
@@ -65,6 +68,7 @@ void Tpu::tick() {
 
     host_interface_.tick();
     weight_fifo_.tick();
+    mxu_.tick();
 
     stats_.cycles = stats_.cycles + 1;
     if (stall_ != Stall::None) {
@@ -173,10 +177,19 @@ const WeightFifo& Tpu::weight_fifo() const {
     return weight_fifo_;
 }
 
+const Accumulators& Tpu::acc() const {
+    return acc_;
+}
+
+const SystolicArray& Tpu::mxu() const {
+    return mxu_;
+}
+
 bool Tpu::units_idle() const {
     const bool host_idle   = !host_interface_.busy();
     const bool weight_idle = !weight_fifo_.fetching();
-    return host_idle && weight_idle;
+    const bool mxu_idle    = !mxu_.busy() && !mxu_.shifting();
+    return host_idle && weight_idle && mxu_idle;
 }
 
 // Stall::None means the instruction can issue this cycle.
@@ -191,6 +204,13 @@ Stall Tpu::why_blocked(const Instr& in) const {
             }
             return Stall::None;
         case Op::ReadHostMemory:
+            if (host_interface_.busy()) {
+                return Stall::HostInterfaceBusy;
+            }
+            if (mxu_.reads_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // it would overwrite rows the MXU is still reading
+            }
+            return Stall::None;
         case Op::WriteHostMemory:
             if (host_interface_.busy()) {
                 return Stall::HostInterfaceBusy;
@@ -199,6 +219,17 @@ Stall Tpu::why_blocked(const Instr& in) const {
         case Op::ReadWeights:
             if (weight_fifo_.full()) {
                 return Stall::WeightFifoFull;
+            }
+            return Stall::None;
+        case Op::MatrixMultiply:
+            if (mxu_.busy()) {
+                return Stall::MxuBusy;
+            }
+            if (in.new_weights == 1 && !mxu_.shadow_ready()) {
+                return Stall::WeightsNotReady;
+            }
+            if (host_interface_.writes_ub_rows(in.ub_row, in.rows)) {
+                return Stall::UbNotReady;   // its input rows are still arriving from the host
             }
             return Stall::None;
     }
@@ -221,6 +252,9 @@ void Tpu::issue(const Instr& in) {
             break;
         case Op::ReadWeights:
             weight_fifo_.push(in.tile);   // issues at once; the tile arrives over the next ~1366 cycles
+            break;
+        case Op::MatrixMultiply:
+            mxu_.start(in.ub_row, in.acc_row, in.rows, in.accumulate == 1, in.new_weights == 1);
             break;
     }
 

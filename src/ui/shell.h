@@ -42,5 +42,7 @@ private:
     std::string show(const std::vector<std::string>& words) const;
     std::string show_pc() const;
     std::string show_fifo() const;
+    std::string show_mxu() const;
+    std::string show_acc(u64 first_row, u64 rows, u64 cols, bool as_hex) const;
     void        require_program() const;
 };

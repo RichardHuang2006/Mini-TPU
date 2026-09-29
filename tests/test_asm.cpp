@@ -25,6 +25,17 @@ Instr read_weights(u32 tile) {
     return in;
 }
 
+Instr matmul(u32 ub_row, u32 acc_row, u32 rows, u32 accumulate, u32 new_weights) {
+    Instr in;
+    in.op          = Op::MatrixMultiply;
+    in.ub_row      = ub_row;
+    in.acc_row     = acc_row;
+    in.rows        = rows;
+    in.accumulate  = accumulate;
+    in.new_weights = new_weights;
+    return in;
+}
+
 Instr no_operands(Op op) {
     Instr in;
     in.op = op;
@@ -85,6 +96,14 @@ TEST(asm_data_blocks) {
     CHECK(p.weights[0].bytes == weight_bytes);
 }
 
+TEST(asm_weights_can_start_at_a_tile_row) {
+    const Program p = assemble(".weights 1 2\n7 8\n");
+    CHECK_EQ(p.weights.size(), std::size_t{1});
+    if (p.weights.size() == 1) {
+        CHECK_EQ(p.weights[0].addr, v1::kTileBytes + 2 * u64{v1::kMxuDim});   // tile 1, row 2
+    }
+}
+
 TEST(asm_reads_what_disasm_prints) {
     const std::vector<Instr> samples = {
         host_op(Op::ReadHostMemory, 0xFFFFFF, 0xFFFFFFFF, 0xFFFF),
@@ -93,6 +112,7 @@ TEST(asm_reads_what_disasm_prints) {
         no_operands(Op::Halt),
         no_operands(Op::Sync),
         read_weights(0x5),
+        matmul(0x10, 0x20, 8, 1, 0),
     };
 
     for (const Instr& in : samples) {
@@ -131,6 +151,12 @@ TEST(asm_errors_name_line_and_column) {
              std::string("t.s:1:1: error: unknown directive '.data' (expects .host or .weights)"));
     CHECK_EQ(error_of("Read_Weights"),
              std::string("t.s:1:1: error: Read_Weights is missing operand 'tile'"));
+    CHECK_EQ(error_of(".weights 0 300"),
+             std::string("t.s:1:12: error: row 300 is past the tile's last row 255"));
+    CHECK_EQ(error_of(".weights"),
+             std::string("t.s:1:1: error: .weights takes a tile and an optional row"));
+    CHECK_EQ(error_of("MatrixMultiply ub=0 acc=0 rows=1 accumulate=2 new_weights=0"),
+             std::string("t.s:1:1: error: accumulate=2 must be 0 or 1"));
     CHECK_EQ(error_of(".host"),
              std::string("t.s:1:1: error: .host takes one address"));
 }

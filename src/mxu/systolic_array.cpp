@@ -1,0 +1,234 @@
+/// The weight shifter and one step of the systolic array: activations move right, partial sums move down.
+
+#include "mxu/systolic_array.h"
+
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+// PE (k, n) lives at index k * 256 + n: k is the array row (input feature), n the column (output).
+std::size_t at(u32 k, u32 n) {
+    return static_cast<std::size_t>(k) * SystolicArray::kDim + n;
+}
+
+// Checked as two steps rather than `first + count > limit`, which a huge count could wrap around.
+void check_rows(const std::string& memory, u32 first, u32 count, u32 limit) {
+    bool fits = true;
+    if (count > limit) {
+        fits = false;
+    } else if (first > limit - count) {
+        fits = false;
+    }
+
+    if (!fits) {
+        const std::string range = "[" + std::to_string(first) + ", +" + std::to_string(count) + ")";
+        throw std::out_of_range(memory + " rows " + range + " run past the last row " + std::to_string(limit - 1));
+    }
+}
+
+}  // namespace
+
+SystolicArray::SystolicArray(const UnifiedBuffer& ub, Accumulators& acc, WeightFifo& fifo)
+    : ub_(ub), acc_(acc), fifo_(fifo) {
+    reset();
+}
+
+void SystolicArray::reset() {
+    const std::size_t pe_count = static_cast<std::size_t>(kDim) * kDim;
+    planes_[0].assign(pe_count, 0);
+    planes_[1].assign(pe_count, 0);
+    active_plane_ = 0;
+    active_tile_  = -1;
+
+    shifting_tile_.clear();
+    shadow_tile_  = -1;
+    rows_shifted_ = 0;
+    shadow_full_  = false;
+
+    grid_.assign(pe_count, Pe{});
+    next_grid_.assign(pe_count, Pe{});
+    busy_       = false;
+    ub_row_     = 0;
+    acc_row_    = 0;
+    rows_       = 0;
+    accumulate_ = false;
+    step_       = 0;
+}
+
+void SystolicArray::start(u32 ub_row, u32 acc_row, u32 rows, bool accumulate, bool new_weights) {
+    if (busy_) {
+        throw std::logic_error("MXU: a MatrixMultiply is already running");
+    }
+    if (new_weights && !shadow_full_) {
+        throw std::logic_error("MXU: the shadow plane has no complete tile to switch to");
+    }
+    check_rows("ub", ub_row, rows, UnifiedBuffer::kRows);
+    check_rows("acc", acc_row, rows, Accumulators::kRows);
+
+    // Switching planes is free: the shadow plane becomes active, and the old active plane becomes the empty shadow.
+    if (new_weights) {
+        active_plane_ = shadow_plane();
+        active_tile_  = shadow_tile_;
+        shadow_tile_  = -1;
+        shadow_full_  = false;
+        rows_shifted_ = 0;
+    }
+
+    ub_row_     = ub_row;
+    acc_row_    = acc_row;
+    rows_       = rows;
+    accumulate_ = accumulate;
+    step_       = 0;
+    busy_       = rows > 0;
+}
+
+void SystolicArray::tick() {
+    shift_weights();
+    if (busy_) {
+        step_array();
+    }
+}
+
+// The shadow plane takes the next ready tile from the FIFO, then one 256-byte tile row per cycle.
+void SystolicArray::shift_weights() {
+    if (shadow_full_) {
+        return;
+    }
+
+    const bool idle_shifter = shifting_tile_.empty();
+    if (idle_shifter) {
+        if (!fifo_.front_ready()) {
+            return;
+        }
+        shadow_tile_   = static_cast<int>(fifo_.tiles().front().tile);
+        shifting_tile_ = fifo_.pop();
+        rows_shifted_  = 0;
+    }
+
+    const std::size_t row_start = static_cast<std::size_t>(rows_shifted_) * kDim;
+    std::vector<i8>& shadow = planes_[shadow_plane()];
+    for (u32 n = 0; n < kDim; ++n) {
+        shadow[row_start + n] = shifting_tile_[row_start + n];
+    }
+    rows_shifted_ = rows_shifted_ + 1;
+
+    if (rows_shifted_ == kDim) {
+        shadow_full_ = true;
+        shifting_tile_.clear();
+    }
+}
+
+// One step: every PE takes the activation from its left and the partial sum from above, adds its product, and passes both on.
+void SystolicArray::step_array() {
+    const std::vector<i8>& weights = planes_[active_plane_];
+
+    for (u32 k = 0; k < kDim; ++k) {
+        for (u32 n = 0; n < kDim; ++n) {
+            Pe incoming;
+
+            if (n == 0) {
+                // The left edge: array row k takes input row (step - k), so each row starts k cycles later (the skew).
+                const long long input_row = static_cast<long long>(step_) - static_cast<long long>(k);
+                const bool has_input = input_row >= 0 && input_row < static_cast<long long>(rows_);
+                if (has_input) {
+                    const u32 r = static_cast<u32>(input_row);
+                    incoming.act = ub_.row(ub_row_ + r)[k];
+                    incoming.row = static_cast<int>(r);
+                }
+            } else {
+                const Pe& left = grid_[at(k, n - 1)];
+                incoming.act = left.act;
+                incoming.row = left.row;
+            }
+
+            Pe& next = next_grid_[at(k, n)];
+            if (incoming.row < 0) {
+                next = Pe{};
+                continue;
+            }
+
+            i32 psum_in = 0;
+            if (k > 0) {
+                psum_in = grid_[at(k - 1, n)].psum;
+            }
+            const i32 product = static_cast<i32>(incoming.act) * static_cast<i32>(weights[at(k, n)]);
+
+            next.act  = incoming.act;
+            next.row  = incoming.row;
+            next.psum = psum_in + product;
+        }
+    }
+
+    // The bottom row now holds finished column sums: input row r, column n, arrives at step r + 255 + n.
+    for (u32 n = 0; n < kDim; ++n) {
+        const Pe& bottom = next_grid_[at(kDim - 1, n)];
+        if (bottom.row < 0) {
+            continue;
+        }
+        i32& target = acc_.row(acc_row_ + static_cast<u32>(bottom.row))[n];
+        if (accumulate_) {
+            // Wrapping add, as 32-bit hardware does; plain signed overflow would be undefined in C++.
+            const u32 sum = static_cast<u32>(target) + static_cast<u32>(bottom.psum);
+            target = static_cast<i32>(sum);
+        } else {
+            target = bottom.psum;
+        }
+    }
+
+    grid_.swap(next_grid_);
+    step_ = step_ + 1;
+    if (step_ == total_steps()) {
+        busy_ = false;
+    }
+}
+
+bool SystolicArray::busy() const {
+    return busy_;
+}
+
+bool SystolicArray::shifting() const {
+    return !shifting_tile_.empty();
+}
+
+bool SystolicArray::shadow_ready() const {
+    return shadow_full_;
+}
+
+bool SystolicArray::reads_ub_rows(u32 first, u32 count) const {
+    if (!busy_ || count == 0 || rows_ == 0) {
+        return false;
+    }
+    const u64 mine_end  = static_cast<u64>(ub_row_) + rows_;
+    const u64 their_end = static_cast<u64>(first) + count;
+    return first < mine_end && ub_row_ < their_end;
+}
+
+u32 SystolicArray::step() const {
+    return step_;
+}
+
+// Row r's last column sum leaves the bottom at step r + 255 + 255, so B rows take B + 511 steps.
+u32 SystolicArray::total_steps() const {
+    return rows_ + 2 * kDim - 1;
+}
+
+u32 SystolicArray::rows_shifted() const {
+    return rows_shifted_;
+}
+
+int SystolicArray::active_tile() const {
+    return active_tile_;
+}
+
+int SystolicArray::shadow_tile() const {
+    return shadow_tile_;
+}
+
+const Pe& SystolicArray::pe(u32 k, u32 n) const {
+    return grid_[at(k, n)];
+}
+
+int SystolicArray::shadow_plane() const {
+    return 1 - active_plane_;
+}

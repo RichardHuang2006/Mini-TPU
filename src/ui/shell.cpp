@@ -12,7 +12,7 @@
 namespace {
 
 const char* kCommandList = "load FILE, step [N], back [N], next [N], prev [N], run [N], TARGET [hex|dec], quit";
-const char* kTargetList  = "pc, wfifo, ub[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
+const char* kTargetList  = "pc, wfifo, mxu, ub[ROW:RxC], acc[ROW:RxC], host[ROW:RxC], wmem[ROW:RxC]";
 
 std::vector<std::string> split_words(const std::string& line) {
     std::istringstream stream(line);
@@ -290,8 +290,14 @@ std::string Shell::show(const std::vector<std::string>& words) const {
     if (words[0] == "wfifo") {
         return show_fifo();
     }
+    if (words[0] == "mxu") {
+        return show_mxu();
+    }
 
     const View view = parse_view(words[0]);
+    if (view.memory == "acc") {
+        return show_acc(view.row, view.rows, view.cols, as_hex);
+    }
 
     // Labels are padded to the widest one, so the columns line up.
     std::vector<std::string> labels;
@@ -324,6 +330,73 @@ std::string Shell::show_pc() const {
         return "pc " + std::to_string(pc) + " (no instruction there)";
     }
     return "pc " + std::to_string(pc) + ": " + disasm(decode(code[pc]));
+}
+
+// Accumulator rows are int32, so they get wider columns than the byte memories.
+std::string Shell::show_acc(u64 first_row, u64 rows, u64 cols, bool as_hex) const {
+    std::string text;
+    for (u64 i = 0; i < rows; ++i) {
+        const u64 row = first_row + i;
+        if (row >= Accumulators::kRows) {
+            throw std::out_of_range("acc row " + std::to_string(row) + " is past the last row " +
+                                    std::to_string(Accumulators::kRows - 1));
+        }
+        const i32* values = tpu_.acc().row(static_cast<u32>(row));
+
+        std::string line = hex(row) + ":";
+        for (u64 col = 0; col < cols; ++col) {
+            char cell[16];
+            if (as_hex) {
+                std::snprintf(cell, sizeof cell, " %08X", static_cast<u32>(values[col]));
+            } else {
+                std::snprintf(cell, sizeof cell, "%9d", values[col]);
+            }
+            line += cell;
+        }
+        if (i > 0) {
+            text += "\n";
+        }
+        text += line;
+    }
+    return text;
+}
+
+// The MXU's state, then a map of its top-left 16x16 PEs: '#' holds data this cycle, '.' is empty.
+std::string Shell::show_mxu() const {
+    const SystolicArray& mxu = tpu_.mxu();
+
+    std::string state = "idle";
+    if (mxu.busy()) {
+        state = "step " + std::to_string(mxu.step()) + " of " + std::to_string(mxu.total_steps());
+    }
+
+    std::string active = "none";
+    if (mxu.active_tile() >= 0) {
+        active = "tile " + hex(static_cast<u64>(mxu.active_tile()));
+    }
+
+    std::string shadow = "empty";
+    if (mxu.shadow_ready()) {
+        shadow = "tile " + hex(static_cast<u64>(mxu.shadow_tile())) + ", ready";
+    } else if (mxu.shifting()) {
+        shadow = "tile " + hex(static_cast<u64>(mxu.shadow_tile())) + ", " + std::to_string(mxu.rows_shifted()) +
+                 " of 256 rows shifted in";
+    }
+
+    std::string text = "MXU: " + state + "\nactive weights: " + active + "\nshadow weights: " + shadow +
+                       "\nPEs 0-15 x 0-15 (# = holds data):";
+    for (u32 k = 0; k < 16; ++k) {
+        std::string line = "  ";
+        for (u32 n = 0; n < 16; ++n) {
+            if (mxu.pe(k, n).row >= 0) {
+                line += '#';
+            } else {
+                line += '.';
+            }
+        }
+        text += "\n" + line;
+    }
+    return text;
 }
 
 // One line per slot, oldest first.

@@ -1,4 +1,4 @@
-/// Encoding, decoding and disassembly of the TPUv1 instructions.
+/// Encoding, decoding and disassembly of the TPUv1 instructions: one switch case per instruction, fields inline.
 
 #include "isa/isa.h"
 
@@ -7,52 +7,40 @@
 
 namespace {
 
-// Where each host-transfer field sits in the 12 bytes, and how many bytes it takes.
-constexpr u32 kUbRowAt      = 3;
-constexpr u32 kUbRowWidth   = 3;
-constexpr u32 kHostRowAt    = 6;
-constexpr u32 kHostRowWidth = 4;
-constexpr u32 kRowsAt       = 10;
-constexpr u32 kRowsWidth    = 2;
-
-// Read_Weights: the tile number in bytes 3-6.
-constexpr u32 kTileAt       = 3;
-constexpr u32 kTileWidth    = 4;
-
-// Writes value into `width` bytes starting at `at`, lowest byte first (little-endian).
-void put(InstrBytes& bytes, u32 at, u32 width, u64 value, const char* field) {
-    const u32 bits = 8 * width;
-    const u64 largest = (u64{1} << bits) - 1;
-    if (value > largest) {
-        const std::string what = std::string(field) + "=" + std::to_string(value);
-        throw std::out_of_range(what + " does not fit in " + std::to_string(bits) + " bits");
-    }
-
-    for (u32 i = 0; i < width; ++i) {
-        const u64 shifted = value >> (8 * i);
-        const u8 low_byte = static_cast<u8>(shifted & 0xFF);
-        bytes[at + i] = low_byte;
-    }
-}
-
-// Reads `width` bytes starting at `at`, lowest byte first, back into a number.
-u32 get(const InstrBytes& bytes, u32 at, u32 width) {
+// Reads `count` bytes starting at byte `first`, lowest byte first (little-endian).
+u32 read_bytes(const InstrBytes& word, u32 first, u32 count) {
     u32 value = 0;
-    for (u32 i = 0; i < width; ++i) {
-        const u32 byte = bytes[at + i];
+    for (u32 i = 0; i < count; ++i) {
+        const u32 byte = word[first + i];
         value = value | (byte << (8 * i));
     }
     return value;
+}
+
+// Writes `value` into `count` bytes starting at byte `first`, lowest byte first; throws if it does not fit.
+void write_bytes(InstrBytes& word, u32 first, u32 count, u64 value, const char* name) {
+    const u32 bits = 8 * count;
+    const u64 largest = (u64{1} << bits) - 1;
+    if (value > largest) {
+        const std::string field = std::string(name) + "=" + std::to_string(value);
+        throw std::out_of_range(field + " does not fit in " + std::to_string(bits) + " bits");
+    }
+
+    for (u32 i = 0; i < count; ++i) {
+        word[first + i] = static_cast<u8>((value >> (8 * i)) & 0xFF);
+    }
+}
+
+void check_flag(u32 value, const char* name) {
+    if (value > 1) {
+        throw std::out_of_range(std::string(name) + "=" + std::to_string(value) + " must be 0 or 1");
+    }
 }
 
 std::string hex(u32 value) {
     char text[16];
     std::snprintf(text, sizeof text, "0x%X", value);
     return text;
-}
-
-bool is_host_transfer(Op op) {
-    return op == Op::ReadHostMemory || op == Op::WriteHostMemory;
 }
 
 }  // namespace
@@ -71,64 +59,112 @@ const char* op_name(Op op) {
             return "Write_Host_Memory";
         case Op::ReadWeights:
             return "Read_Weights";
+        case Op::MatrixMultiply:
+            return "MatrixMultiply";
     }
     return "?";
 }
 
 InstrBytes encode(const Instr& in) {
-    InstrBytes bytes{};   // all twelve bytes start as zero
-    bytes[0] = static_cast<u8>(in.op);
-
-    if (is_host_transfer(in.op)) {
-        put(bytes, kUbRowAt, kUbRowWidth, in.ub_row, "ub");
-        put(bytes, kHostRowAt, kHostRowWidth, in.host_row, "host");
-        put(bytes, kRowsAt, kRowsWidth, in.rows, "rows");
-    }
-    if (in.op == Op::ReadWeights) {
-        put(bytes, kTileAt, kTileWidth, in.tile, "tile");
-    }
-    return bytes;
-}
-
-Instr decode(const InstrBytes& bytes) {
-    Instr in;
-    in.op = static_cast<Op>(bytes[0]);
+    InstrBytes word{};   // all twelve bytes start as zero
+    word[0] = static_cast<u8>(in.op);
 
     switch (in.op) {
         case Op::Nop:
         case Op::Halt:
         case Op::Sync:
             break;
+
         case Op::ReadHostMemory:
-        case Op::WriteHostMemory:
-            in.ub_row   = get(bytes, kUbRowAt, kUbRowWidth);
-            in.host_row = get(bytes, kHostRowAt, kHostRowWidth);
-            in.rows     = get(bytes, kRowsAt, kRowsWidth);
+        case Op::WriteHostMemory: {
+            write_bytes(word, 3, 3, in.ub_row, "ub");       // bytes 3-5
+            write_bytes(word, 6, 4, in.host_row, "host");   // bytes 6-9
+            write_bytes(word, 10, 2, in.rows, "rows");      // bytes 10-11
             break;
-        case Op::ReadWeights:
-            in.tile = get(bytes, kTileAt, kTileWidth);
+        }
+
+        case Op::ReadWeights: {
+            write_bytes(word, 3, 4, in.tile, "tile");       // bytes 3-6
             break;
+        }
+
+        case Op::MatrixMultiply: {
+            write_bytes(word, 3, 3, in.ub_row, "ub");       // bytes 3-5
+            write_bytes(word, 6, 2, in.acc_row, "acc");     // bytes 6-7
+            write_bytes(word, 8, 4, in.rows, "rows");       // bytes 8-11
+            check_flag(in.accumulate, "accumulate");
+            check_flag(in.new_weights, "new_weights");
+            word[1] = static_cast<u8>(in.accumulate | (in.new_weights << 1));   // flag byte: bit 0, bit 1
+            break;
+        }
+    }
+    return word;
+}
+
+Instr decode(const InstrBytes& word) {
+    Instr in;
+    in.op = static_cast<Op>(word[0]);
+
+    switch (in.op) {
+        case Op::Nop:
+        case Op::Halt:
+        case Op::Sync:
+            break;
+
+        case Op::ReadHostMemory:
+        case Op::WriteHostMemory: {
+            in.ub_row   = read_bytes(word, 3, 3);    // bytes 3-5
+            in.host_row = read_bytes(word, 6, 4);    // bytes 6-9
+            in.rows     = read_bytes(word, 10, 2);   // bytes 10-11
+            break;
+        }
+
+        case Op::ReadWeights: {
+            in.tile = read_bytes(word, 3, 4);        // bytes 3-6
+            break;
+        }
+
+        case Op::MatrixMultiply: {
+            in.accumulate  = word[1] & 0x1;          // flag byte, bit 0
+            in.new_weights = (word[1] >> 1) & 0x1;   // flag byte, bit 1
+            in.ub_row      = read_bytes(word, 3, 3);
+            in.acc_row     = read_bytes(word, 6, 2);
+            in.rows        = read_bytes(word, 8, 4);
+            break;
+        }
+
         default:
-            throw std::invalid_argument("unknown opcode " + hex(bytes[0]));
+            throw std::invalid_argument("unknown opcode " + hex(word[0]));
     }
     return in;
 }
 
 std::string disasm(const Instr& in) {
-    std::string       name = op_name(in.op);
-    const std::string ub   = "ub=" + hex(in.ub_row);
-    const std::string host = "host=" + hex(in.host_row);
-    const std::string rows = "rows=" + std::to_string(in.rows);
+    std::string name = op_name(in.op);
 
-    // Operands are listed source first, then destination.
-    if (in.op == Op::ReadHostMemory) {
-        return name + " " + host + " " + ub + " " + rows;
-    }
-    if (in.op == Op::WriteHostMemory) {
-        return name + " " + ub + " " + host + " " + rows;
-    }
-    if (in.op == Op::ReadWeights) {
-        return name + " tile=" + hex(in.tile);
+    switch (in.op) {
+        case Op::Nop:
+        case Op::Halt:
+        case Op::Sync:
+            return name;
+
+        case Op::ReadHostMemory: {
+            return name + " host=" + hex(in.host_row) + " ub=" + hex(in.ub_row) + " rows=" + std::to_string(in.rows);
+        }
+
+        case Op::WriteHostMemory: {
+            return name + " ub=" + hex(in.ub_row) + " host=" + hex(in.host_row) + " rows=" + std::to_string(in.rows);
+        }
+
+        case Op::ReadWeights: {
+            return name + " tile=" + hex(in.tile);
+        }
+
+        case Op::MatrixMultiply: {
+            const std::string operands = " ub=" + hex(in.ub_row) + " acc=" + hex(in.acc_row) + " rows=" + std::to_string(in.rows);
+            const std::string flags    = " accumulate=" + std::to_string(in.accumulate) + " new_weights=" + std::to_string(in.new_weights);
+            return name + operands + flags;
+        }
     }
     return name;
 }

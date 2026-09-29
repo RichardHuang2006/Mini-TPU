@@ -12,9 +12,12 @@ enum class Stall : u8 {
     HostInterfaceBusy,   // a host transfer waits for the one in progress
     WaitForIdle,         // Sync or Halt waits for every unit to finish
     WeightFifoFull,      // Read_Weights waits for a free FIFO slot
+    MxuBusy,             // MatrixMultiply waits for the one in the array
+    WeightsNotReady,     // MatrixMultiply waits for a whole tile in the shadow plane
+    UbNotReady,          // an instruction waits for UB rows another unit is still reading or writing
 };
 
-inline constexpr std::size_t kStallKinds = 4;
+inline constexpr std::size_t kStallKinds = 7;
 
 inline const char* stall_name(Stall stall) {
     switch (stall) {
@@ -26,6 +29,12 @@ inline const char* stall_name(Stall stall) {
             return "waiting for units to finish";
         case Stall::WeightFifoFull:
             return "weight FIFO full";
+        case Stall::MxuBusy:
+            return "MXU busy";
+        case Stall::WeightsNotReady:
+            return "weights not ready";
+        case Stall::UbNotReady:
+            return "Unified Buffer rows not ready";
     }
     return "?";
 }

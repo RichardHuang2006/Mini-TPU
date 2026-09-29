@@ -164,13 +164,16 @@ TEST(tpu_read_weights_issues_before_the_tile_arrives) {
     CHECK_EQ(tpu.pc(), u32{1});
     CHECK(tpu.weight_fifo().fetching());
 
-    tpu.run_to_halt();   // Halt waits for the 1366-cycle fetch
-    CHECK_EQ(tpu.cycle(), Cycle{1367});
-    CHECK_EQ(tpu.stats().stalled(Stall::WaitForIdle), u64{1365});
-    CHECK(tpu.weight_fifo().front_ready());
+    // The tile arrives on cycle 1365 and the MXU takes it the same cycle, shifting one row per cycle through 1620.
+    tpu.run_to_halt();
+    CHECK_EQ(tpu.cycle(), Cycle{1622});
+    CHECK_EQ(tpu.stats().stalled(Stall::WaitForIdle), u64{1620});
+    CHECK(tpu.weight_fifo().tiles().empty());
+    CHECK(tpu.mxu().shadow_ready());
+    CHECK_EQ(tpu.mxu().shadow_tile(), 0);
 }
 
-TEST(tpu_fifth_read_weights_deadlocks_without_a_consumer) {
+TEST(tpu_mxu_frees_a_fifo_slot_for_the_fifth_tile) {
     const char* source =
         "Read_Weights tile=0\n"
         "Read_Weights tile=1\n"
@@ -184,10 +187,20 @@ TEST(tpu_fifth_read_weights_deadlocks_without_a_consumer) {
     tpu.run_cycles(100);
     CHECK(tpu.stall() == Stall::WeightFifoFull);
 
-    // Once all four tiles have arrived nothing can free a slot, so the machine reports it instead of spinning.
-    CHECK_EQ(error_of_run(tpu), std::string("pc 4: Read_Weights tile=0x4: deadlock: weight FIFO full, but no unit is working"));
-    CHECK_EQ(tpu.cycle(), Cycle{4 * 1366});
-    CHECK_EQ(tpu.stats().stalled(Stall::WeightFifoFull), u64{4 * 1366 - 4});
+    // Tile 0 arrives on cycle 1365 and moves into the shadow plane, so the fifth Read_Weights issues on cycle 1366.
+    tpu.run_to_halt();
+    CHECK_EQ(tpu.stats().stalled(Stall::WeightFifoFull), u64{1362});
+    CHECK_EQ(tpu.cycle(), Cycle{5 * 1366 + 1});   // Halt waits for the fifth tile, which arrives on cycle 6829
+    CHECK_EQ(tpu.weight_fifo().tiles().size(), std::size_t{4});
+}
+
+TEST(tpu_new_weights_with_none_coming_deadlocks) {
+    Tpu tpu;
+    tpu.load(assemble("MatrixMultiply ub=0 acc=0 rows=1 accumulate=0 new_weights=1\nHalt\n"));
+    const std::string expected =
+        "pc 0: MatrixMultiply ub=0x0 acc=0x0 rows=1 accumulate=0 new_weights=1: deadlock: weights not ready, but no unit is working";
+    CHECK_EQ(error_of_run(tpu), expected);
+    CHECK_EQ(tpu.cycle(), Cycle{0});
 }
 
 TEST(tpu_errors_name_the_pc_and_leave_the_cycle_alone) {

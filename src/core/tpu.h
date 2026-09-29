@@ -6,8 +6,10 @@
 
 #include "common/stats.h"
 #include "isa/isa.h"
+#include "mem/accumulators.h"
 #include "mem/dram.h"
 #include "mem/unified_buffer.h"
+#include "mxu/systolic_array.h"
 #include "units/host_interface.h"
 #include "units/weight_fifo.h"
 
@@ -54,14 +56,18 @@ public:
     const Dram&          wmem() const;
     const HostInterface& host_interface() const;
     const WeightFifo&    weight_fifo() const;
+    const Accumulators&  acc() const;
+    const SystolicArray& mxu() const;
 
 private:
     Program       program_;
     UnifiedBuffer ub_;
+    Accumulators  acc_;
     Dram          host_;
     Dram          wmem_;
     HostInterface host_interface_;
     WeightFifo    weight_fifo_;
+    SystolicArray mxu_;
 
     u32   pc_     = 0;
     bool  halted_ = false;

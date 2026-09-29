@@ -19,6 +19,7 @@ enum class Op : u8 {
     ReadHostMemory  = 0x10,   // host memory -> Unified Buffer
     WriteHostMemory = 0x11,   // Unified Buffer -> host memory
     ReadWeights     = 0x20,   // Weight Memory tile -> Weight FIFO
+    MatrixMultiply  = 0x30,   // UB rows x weights -> accumulator rows
 };
 
 // Every opcode, so the assembler can look names up instead of keeping its own list.
@@ -29,15 +30,19 @@ inline constexpr Op kAllOps[] = {
     Op::ReadHostMemory,
     Op::WriteHostMemory,
     Op::ReadWeights,
+    Op::MatrixMultiply,
 };
 
 // One instruction with its fields unpacked into plain numbers.
 struct Instr {
-    Op  op       = Op::Nop;
-    u32 ub_row   = 0;   // 24 bits: Unified Buffer row
-    u32 host_row = 0;   // 32 bits: host memory is addressed in 256-byte rows
-    u32 rows     = 0;   // 16 bits: rows moved
-    u32 tile     = 0;   // 32 bits: Weight Memory tile (64 KiB each)
+    Op  op          = Op::Nop;
+    u32 ub_row      = 0;   // 24 bits: Unified Buffer row
+    u32 host_row    = 0;   // 32 bits: host memory is addressed in 256-byte rows
+    u32 rows        = 0;   // rows moved (16 bits) or multiplied (32 bits)
+    u32 tile        = 0;   // 32 bits: Weight Memory tile (64 KiB each)
+    u32 acc_row     = 0;   // 16 bits: accumulator row
+    u32 accumulate  = 0;   // flag, 0 or 1: add into the accumulators instead of overwriting
+    u32 new_weights = 0;   // flag, 0 or 1: switch to the shadow weight plane first
 };
 
 // Bytes to place in a DRAM before the program runs.
