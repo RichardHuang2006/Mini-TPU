@@ -1,4 +1,4 @@
-/// Shell: the terminal's load and quit, button moves by cycle and by instruction, and errors as text.
+/// Shell: the terminal's load and quit, button moves by cycle and by instruction, jumps to a cycle, and errors as text.
 
 #include <filesystem>
 #include <fstream>
@@ -70,6 +70,19 @@ TEST(shell_moves_by_cycles_and_instructions) {
     CHECK_EQ(shell.move("forward", "instruction"), std::string("cycle 49, pc 2, halted"));
     CHECK_EQ(shell.move("forward", "cycle"), std::string("cycle 49, pc 2, halted"));   // nothing runs past Halt
     CHECK_EQ(shell.move("back", "cycle"), std::string("cycle 48, pc 2, stalled: waiting for units to finish"));
+}
+
+TEST(shell_jumps_to_a_cycle) {
+    Tpu tpu;
+    Shell shell(tpu);
+    CHECK_EQ(shell.jump(5), std::string("error: no program loaded; use load FILE"));
+
+    shell.execute("load " + write_temp_program("mini_tpu_shell_jump.s", kCopy));
+    CHECK_EQ(shell.jump(25), std::string("cycle 25, pc 2, running"));                        // forward
+    CHECK_EQ(shell.jump(5), std::string("cycle 5, pc 1, stalled: host interface busy"));     // back, by replay
+    CHECK_EQ(shell.jump(5), std::string("cycle 5, pc 1, stalled: host interface busy"));     // already there
+    CHECK_EQ(shell.jump(1000), std::string("cycle 49, pc 2, halted"));                       // forward stops at Halt
+    CHECK_EQ(shell.jump(0), std::string("cycle 0, pc 0, ready"));
 }
 
 TEST(shell_move_errors_are_text) {

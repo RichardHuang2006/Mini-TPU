@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
     VizServer* server = viz.get();
     shell.set_observer([server, &tpu]() { server->publish(snapshot_json(tpu), capture(tpu)); });
     viz->on_move([&shell](const std::string& direction, const std::string& unit) { return shell.move(direction, unit); });
+    viz->on_jump([&shell](u64 cycle) { return shell.jump(cycle); });
     server->publish(snapshot_json(tpu), capture(tpu));
     if (open_it) {
         open_browser(url);

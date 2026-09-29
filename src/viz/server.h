@@ -34,6 +34,10 @@ public:
     using MoveHandler = std::function<std::string(const std::string& direction, const std::string& unit)>;
     void on_move(MoveHandler handler);
 
+    // What POST /jump?cycle=N calls, replying the same way.
+    using JumpHandler = std::function<std::string(u64 cycle)>;
+    void on_jump(JumpHandler handler);
+
 private:
     std::string root_;   // the folder holding index.html, style.css and app.js
     int         listen_fd_ = -1;
@@ -43,12 +47,13 @@ private:
     std::thread              accept_thread_;
     std::vector<std::thread> client_threads_;   // one per connection
 
-    std::mutex              mutex_;   // guards latest_, state_, version_, move_ and client_threads_
+    std::mutex              mutex_;   // guards latest_, state_, version_, move_, jump_ and client_threads_
     std::condition_variable changed_;
     std::string             latest_;
     std::shared_ptr<const MachineState> state_;
     u64                     version_ = 0;
     MoveHandler             move_;
+    JumpHandler             jump_;
 
     void accept_loop();
     void serve(int fd);
@@ -56,4 +61,5 @@ private:
     void serve_events(int fd);
     void serve_data(int fd, const std::string& path, const std::string& query);
     void serve_move(int fd, const std::string& query);
+    void serve_jump(int fd, const std::string& query);
 };

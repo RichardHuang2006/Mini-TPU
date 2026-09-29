@@ -16,6 +16,7 @@
   <span>issued <b id="issued">0</b></span>
   <span id="state" class="badge">ready</span>
   <div id="controls">
+    <label>go to cycle <input id="jump" type="text" size="6" spellcheck="false"></label>
     <button id="back" type="button">◀ back</button>
     <div id="unit" role="radiogroup">
       <label><input type="radio" name="unit" value="instruction" checked>instruction</label>
@@ -84,23 +85,22 @@
     <section id="inspector" class="panel">
       <div class="panel-head">
         <h2>Row inspector</h2>
-        <select id="inspect-memory">
-          <option value="ub">Unified Buffer</option>
-          <option value="acc">Accumulators</option>
-          <option value="host">Host memory</option>
-          <option value="wmem">Weight Memory</option>
-          <option value="fifo">Weight FIFO</option>
-          <option value="line">Pooling buffer</option>
-          <option value="mxu_weight">MXU weights</option>
-          <option value="mxu_shadow">MXU shadow weights</option>
-          <option value="mxu_act">MXU activations</option>
-          <option value="mxu_psum">MXU partial sums</option>
-        </select>
-        <label>row <input id="inspect-row" type="text" size="8" spellcheck="false" value="0x0"></label>
-        <label><input id="inspect-hex" type="checkbox">hex</label>
-        <span id="inspect-title" class="readout"></span>
+        <select id="left-select"></select>
+        <label>row <input id="left-row" type="text" size="8" spellcheck="false"></label>
       </div>
-      <div id="inspect-values"></div>
+      <div class="panel-head right-half">
+        <select id="right-select"></select>
+        <label>PE row <input id="right-row" type="text" size="8" spellcheck="false"></label>
+        <label><input id="inspect-hex" type="checkbox">hex</label>
+      </div>
+      <div class="values-box">
+        <canvas id="left-values"></canvas>
+        <div id="left-scroll" class="values-scroll"><div id="left-spacer"></div></div>
+      </div>
+      <div class="values-box right-half">
+        <canvas id="right-values"></canvas>
+        <div id="right-scroll" class="values-scroll"><div id="right-spacer"></div></div>
+      </div>
     </section>
 
     <section id="instructions" class="panel">

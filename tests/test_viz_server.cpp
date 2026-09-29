@@ -1,4 +1,4 @@
-/// Visualizer server over real sockets: the page, a 404, snapshots as Server-Sent Events, exact values and button presses.
+/// Visualizer server over real sockets: the page, a 404, snapshots as Server-Sent Events, exact values and button presses and jumps.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -172,4 +172,22 @@ TEST(viz_server_passes_button_presses_to_the_machine) {
     CHECK(has(get(fetched, "/move?direction=forward&unit=cycle", "not found"), "404 Not Found"));   // a GET never moves it
     ::close(fetched);
     CHECK_EQ(pressed, std::string(""));
+}
+
+TEST(viz_server_passes_jumps_to_the_machine) {
+    VizServer server(make_root(), 0);
+    u64 asked = 99;
+    server.on_jump([&asked](u64 cycle) {
+        asked = cycle;
+        return std::string("cycle 25, pc 2, running");
+    });
+
+    const int jump = connect_to(server.port());
+    CHECK(has(send_request(jump, "POST", "/jump?cycle=25", "running"), "200 OK"));
+    ::close(jump);
+    CHECK_EQ(asked, u64{25});
+
+    const int bad = connect_to(server.port());
+    CHECK(has(send_request(bad, "POST", "/jump?cycle=x", "cycle=N"), "400 Bad Request"));
+    ::close(bad);
 }

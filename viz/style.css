@@ -174,23 +174,23 @@ input[type="checkbox"] {
 main {
   display: grid;
   flex: 1;
-  grid-template-rows: minmax(0, 1fr) clamp(190px, 31vh, 260px) clamp(130px, 19vh, 175px);
+  grid-template-rows: 294px minmax(0, 1fr) clamp(130px, 19vh, 175px);
   gap: 10px;
   min-height: 0;
   padding: 10px 16px;
 }
 
-/* The block diagram: a grid that stretches with the window; the arrows are laid across its gaps by app.js. */
+/* The block diagram: one short band around the MXU's fixed column; the arrows are laid across its gaps by app.js. */
 
 #stage {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr 1.3fr 1.3fr 0.9fr 0.9fr;
-  grid-template-rows: 2fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr 275px 0.8fr 0.8fr;
+  grid-template-rows: 1fr 1fr;
   grid-template-areas:
-    "host ub  mxu fifo wmem"
-    "host act acc fifo wmem";
-  gap: 22px 34px;
+    "host ub  ub  mxu fifo wmem"
+    "host act acc mxu fifo wmem";
+  gap: 22px 30px;
   min-height: 0;
 }
 
@@ -303,6 +303,14 @@ main {
   pointer-events: none;
 }
 
+/* One CSS pixel per PE: 2 x 2 device pixels on a Retina screen, so all 256 x 256 PEs show crisply. */
+
+#view-mxu {
+  flex: none;
+  width: 256px;
+  height: 256px;
+}
+
 .progress {
   flex: none;
   height: 4px;
@@ -343,26 +351,51 @@ main {
   gap: 12px;
 }
 
-#inspect-values {
+/* The row inspector in two halves: memories on the left, the MXU's registers on the right. */
+
+#inspector {
   display: grid;
-  flex: 1;
-  grid-template-columns: auto repeat(16, minmax(5ch, max-content));
-  align-content: start;
-  justify-content: start;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px 12px;
+}
+
+.right-half {
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+/* Each half is a scrollable grid: a canvas draws the visible cells, and a transparent scroller on top holds the scrollbars. */
+
+.values-box {
+  position: relative;
+  min-width: 0;
   min-height: 0;
+}
+
+.values-box canvas,
+.values-scroll {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.values-box canvas {
+  pointer-events: none;
+}
+
+.values-scroll {
   overflow: auto;
-  font: 10.5px/12px ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-variant-numeric: tabular-nums;
 }
 
-#inspect-values span {
-  padding: 0 5px;
-  text-align: right;
-  white-space: pre;
-}
+/* The right half's divider padding sits outside its grid. */
 
-#inspect-values .label {
-  font-weight: 700;
+.values-box.right-half canvas,
+.values-box.right-half .values-scroll {
+  left: 12px;
+  width: calc(100% - 12px);
 }
 
 #program {

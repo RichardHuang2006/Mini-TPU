@@ -47,8 +47,9 @@ Everything else happens on the page:
 - **◀ back** and **forward ▶** move the machine one step. The switch between them sets the step:
   - **instruction:** forward runs until the next instruction issues; back undoes the last one
   - **cycle:** exactly one clock cycle
+- **go to cycle:** type a cycle number in this box in the header and press Enter to jump straight to it, forward or back. Going forward stops at Halt.
 - Going back reloads the program and replays it, which is exact because the machine is deterministic.
-- **The row inspector** shows all 256 values of any row. Pick a memory and type a row (`36` or `0x24`). It updates with every step.
+- **The row inspector** shows values in two scrollable halves: memories on the left, and the MXU's 256 × 256 PEs on the right. Type a row (`36` or `0x24`) to scroll to it. Both halves update with every step.
 
 ## The visualizer
 
@@ -71,9 +72,13 @@ The whole page fits the window, and nothing on it scrolls except the instruction
   - **Host memory and Weight Memory:** they show the 64 KiB pages in use.
   - **Weight FIFO:** its 4 slots fill in row by row as each tile streams in from DDR3.
 - **The wavefront:** each of the MXU's 256 × 256 PEs is painted orange in the cycles it holds an input value. During a multiply they form diagonal bands that sweep across the array one hop per cycle.
-- **The row inspector** is the one place values show. It lists one row's 256 values, 16 to a line, as the memory stores them (int8, or int32 for the accumulators and the pooling buffer). Tick `hex` for hex.
-  - **Row numbers** are the ones the instructions use: Weight Memory row = tile × 256 + row, and Weight FIFO row = slot × 256 + row.
-  - **MXU entries** show one register (weights, shadow weights, activations or partial sums) across the 256 PEs of a PE row.
+  - **One pixel per PE:** the MXU is drawn one CSS pixel per PE (a crisp 2 × 2 block of device pixels on a Retina screen), so the whole array is always in view. The diagram around it is a fixed 294 px band, and the rest of the window goes to the inspector, the instructions and the timeline.
+- **The row inspector** is the one place values show. Each half is a grid with one row per line and 256 columns across. You scroll it both ways, with the column numbers pinned along the top and the row numbers down the left. Typing a row scrolls it to the top and highlights it. Tick `hex` for hex.
+  - **The left half** shows a memory: host memory (its pages in use), the Unified Buffer, Weight Memory (its tiles in use), the Weight FIFO, the accumulators or the pooling buffer. Values show as each memory stores them: int8, or int32 for the accumulators and the pooling buffer. Row numbers are the ones the instructions use: Weight Memory row = tile × 256 + row, and Weight FIFO row = slot × 256 + row.
+  - **The right half** shows one MXU register (weights, shadow weights, activations or partial sums) for all 256 × 256 PEs. Line k is PE row k, and column n is PE column n.
+  - **Only the rows on screen are fetched,** so even the Unified Buffer's 98,304 rows scroll smoothly.
+  - **Every view has the same column spacing,** and its columns start at the same place, so the two halves line up whichever views you pick.
+  - **An empty memory shows as zeros,** as the hardware would read it: the Weight FIFO always lists its 4 slots, host and Weight Memory show page 0 until a page is used, and the pooling buffer shows one row.
 - **The timeline** shows the last 64 cycles, one lane per unit: issue, PCIe, DDR3, weight shift, MXU, activation.
   - **Bars:** each run of cycles spent on the same work is one bar, labelled with the instruction or tile it works on. Stalls show as amber bars on the issue lane, named by their cause.
   - **Hovering** a cycle says what every unit did in it.

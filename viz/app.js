@@ -7,6 +7,11 @@ const FIFO_SLOTS = 4;
 const UB_ROWS = 98304;
 const ACC_ROWS = 4096;
 const GAP_FROM = 6;               // cells this many pixels or larger get a gap between them
+const VIEW_FONT = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+const VIEW_ROW = 15;              // pixels per row in the inspector's viewers
+const VIEW_HEADER = 16;           // the viewers' pinned line of column numbers
+const LABEL_CHARS = 7;            // row numbers up to 0x17FFF, the Unified Buffer's last, so every view's columns start in the same place
+const MOST_ROWS_ASKED = 4096;     // the server sends at most this many rows at once
 const TIMELINE_GUTTER = 92;       // the timeline's lane-name column
 const TIMELINE_RULER = 16;        // the cycle ruler above the lanes
 
@@ -77,7 +82,7 @@ function fitCanvas(canvas) {
     canvas.height = Math.max(1, Math.round(height * scale));
     const context = canvas.getContext("2d");
     context.setTransform(scale, 0, 0, scale, 0, 0);
-    return { context: context, width: width, height: height };
+    return { context: context, width: width, height: height, scale: scale };
 }
 
 // Host memory and Weight Memory blocks show only the pages in use; this finds a real row's place among them (-1: not in use).
@@ -121,7 +126,7 @@ function drawGaps(context, layout, left, color) {
 
 // Paints `count` cells line by line: a cell whose flag is 1 in `color`, the rest empty; `across` fixes the cells per line.
 function paintCells(canvas, flags, count, color, across) {
-    const { context, width, height } = fitCanvas(canvas);
+    const { context, width, height, scale } = fitCanvas(canvas);
     context.clearRect(0, 0, width, height);
     if (count === 0) {
         return;
@@ -132,7 +137,13 @@ function paintCells(canvas, flags, count, color, across) {
         layout = { across: across, down: down, size: Math.min(width / across, height / down) };
     }
 
-    // One pixel per cell, stretched to size; smoothing only when cells are smaller than a pixel, so painted ones still show.
+    // Cells a device pixel or larger are rounded down to whole device pixels, so every cell and gap comes out the same size.
+    const tiny = layout.size * scale < 1;
+    if (!tiny) {
+        layout.size = Math.floor(layout.size * scale) / scale;
+    }
+
+    // One pixel per cell, stretched to size; smoothing only for cells under a device pixel, so painted ones still show.
     const palette = readPalette();
     const image = context.createImageData(layout.across, layout.down);
     for (let i = 0; i < count; i++) {
@@ -149,8 +160,8 @@ function paintCells(canvas, flags, count, color, across) {
     pixels.width = layout.across;
     pixels.height = layout.down;
     pixels.getContext("2d").putImageData(image, 0, 0);
-    const left = (width - layout.across * layout.size) / 2;   // centred across the block
-    context.imageSmoothingEnabled = layout.size < 1;
+    const left = Math.floor((width - layout.across * layout.size) / 2 * scale) / scale;   // centred, on a device pixel
+    context.imageSmoothingEnabled = tiny;
     context.drawImage(pixels, left, 0, layout.across * layout.size, layout.down * layout.size);
     if (layout.size >= GAP_FROM) {
         drawGaps(context, layout, left, palette.panel);
@@ -480,6 +491,21 @@ async function press(direction) {
     pressing = false;
 }
 
+// Goes to the typed cycle, forward or back; anything but a number is ignored.
+async function jump(text) {
+    const cycle = parseNumber(text);
+    if (pressing || cycle < 0) {
+        return;
+    }
+    pressing = true;
+    try {
+        await fetch("/jump?cycle=" + cycle, { method: "POST" });
+    } catch (error) {
+        // the simulator has gone away
+    }
+    pressing = false;
+}
+
 function listenButtons() {
     byId("back").addEventListener("click", function () {
         press("back");
@@ -487,9 +513,14 @@ function listenButtons() {
     byId("forward").addEventListener("click", function () {
         press("forward");
     });
+    byId("jump").addEventListener("keydown", function (event) {
+        if (event.key === "Enter") {
+            jump(byId("jump").value);
+        }
+    });
 }
 
-// ---------------------------------------------------------------- the row inspector: the one place values show
+// ---------------------------------------------------------------- the row inspector: two scrollable viewers, the one place values show
 
 // One value from a /rows or /pes reply: an int8, a little-endian int32, or a PE's 12 bytes of registers.
 function decodeValue(kind, bytes, i) {
@@ -522,75 +553,75 @@ function decodeRows(kind, bytes, count) {
     return rows;
 }
 
-// A memory whose /rows numbering is its real row numbering.
-function directRow(s, row) {
-    return row;
+// Host memory and Weight Memory show only the pages in use; this is the real row a view row stands for.
+function pagedRealRow(pages, viewRow) {
+    return pages[Math.floor(viewRow / ROWS_PER_PAGE)] * ROWS_PER_PAGE + (viewRow % ROWS_PER_PAGE);
 }
 
-// Each memory's name, value kind, row count, and where a real row sits in its /rows numbering (-1: page not in use); MXU entries read one PE register.
-const MEMORIES = {
-    ub: {
-        name: "Unified Buffer", kind: "i8", changes: false,
-        rows: function () { return UB_ROWS; },
-        viewRow: directRow,
-    },
-    acc: {
-        name: "Accumulators", kind: "i32", changes: false,
-        rows: function () { return ACC_ROWS; },
-        viewRow: directRow,
-    },
-    host: {
-        name: "Host memory", kind: "i8", changes: false,
-        rows: function () { return 16777216; },   // 4 GiB of 256-byte rows
-        viewRow: function (s, row) { return pagedViewRow(s.host.pages, row); },
-    },
-    wmem: {
-        name: "Weight Memory", kind: "i8", changes: false,
-        rows: function () { return 33554432; },   // 8 GiB of 256-byte rows
-        viewRow: function (s, row) { return pagedViewRow(s.wmem.tiles, row); },
-    },
-    fifo: {
-        name: "Weight FIFO", kind: "i8", changes: true,
-        rows: function (s) { return s.wfifo.slots.length * ROWS_PER_PAGE; },
-        viewRow: directRow,
-    },
-    line: {
-        name: "Pooling buffer", kind: "i32", changes: true,
-        rows: function (s) { return s.act.line_rows; },
-        viewRow: directRow,
-    },
-    mxu_weight: {
-        name: "MXU weights", kind: "i8", field: "weight", changes: false,
-        rows: function () { return COLS; },
-        viewRow: directRow,
-    },
-    mxu_shadow: {
-        name: "MXU shadow weights", kind: "i8", field: "shadow", changes: false,
-        rows: function () { return COLS; },
-        viewRow: directRow,
-    },
-    mxu_act: {
-        name: "MXU activations", kind: "i8", field: "act", changes: false,
-        rows: function () { return COLS; },
-        viewRow: directRow,
-    },
-    mxu_psum: {
-        name: "MXU partial sums", kind: "i32", field: "psum", changes: false,
-        rows: function () { return COLS; },
-        viewRow: directRow,
-    },
+// Every view in data-flow order: the memories go in the left half's menu, the MXU's registers (a PE `field`) in the right's.
+const VIEWS = {
+    host: { name: "Host memory", kind: "i8", pages: function (s) { return s.host.pages; } },
+    ub: { name: "Unified Buffer", kind: "i8", rows: function () { return UB_ROWS; } },
+    wmem: { name: "Weight Memory", kind: "i8", pages: function (s) { return s.wmem.tiles; } },
+    fifo: { name: "Weight FIFO", kind: "i8", rows: function (s) { return s.wfifo.slots.length * ROWS_PER_PAGE; }, atLeast: FIFO_SLOTS * ROWS_PER_PAGE },
+    acc: { name: "Accumulators", kind: "i32", rows: function () { return ACC_ROWS; } },
+    line: { name: "Pooling buffer", kind: "i32", rows: function (s) { return s.act.line_rows; }, atLeast: 1 },
+    mxu_weight: { name: "MXU weights", kind: "i8", field: "weight", rows: function () { return COLS; } },
+    mxu_shadow: { name: "MXU shadow weights", kind: "i8", field: "shadow", rows: function () { return COLS; } },
+    mxu_act: { name: "MXU activations", kind: "i8", field: "act", rows: function () { return COLS; } },
+    mxu_psum: { name: "MXU partial sums", kind: "i32", field: "psum", rows: function () { return COLS; } },
 };
 
-const inspector = {
-    memory: "ub",
-    row: 0,           // the real row; -1 when the row box does not hold a number
-    values: null,     // the row's 256 values, or null when there is nothing to show
-    cycle: -1,        // the cycle the values belong to
-    ticket: 0,        // each fetch takes a ticket, and only the newest one's reply is kept
-};
+// A paged view lists the pages in use, or page 0 when none is, so an empty memory still shows a page of zeros.
+function shownPages(view, s) {
+    const pages = view.pages(s);
+    if (pages.length === 0) {
+        return [0];
+    }
+    return pages;
+}
+
+// The rows the simulator holds for a view; the viewer shows any rows past these as zeros.
+function servedRowCount(view, s) {
+    if (view.pages !== undefined) {
+        return view.pages(s).length * ROWS_PER_PAGE;
+    }
+    return view.rows(s);
+}
+
+// How many rows a view scrolls through: at least a page, all four FIFO slots and one pooling row, so an empty memory shows as zeros.
+function viewRowCount(view, s) {
+    if (view.pages !== undefined) {
+        return shownPages(view, s).length * ROWS_PER_PAGE;
+    }
+    let rows = view.rows(s);
+    if (view.atLeast !== undefined) {
+        rows = Math.max(rows, view.atLeast);
+    }
+    return rows;
+}
+
+function realRowOf(view, s, viewRow) {
+    if (view.pages !== undefined) {
+        return pagedRealRow(shownPages(view, s), viewRow);
+    }
+    return viewRow;
+}
+
+// Where a real row sits in the view, or -1 when the view does not show it.
+function viewRowOf(view, s, realRow) {
+    let viewRow = realRow;
+    if (view.pages !== undefined) {
+        viewRow = pagedViewRow(shownPages(view, s), realRow);
+    }
+    if (viewRow < 0 || viewRow >= viewRowCount(view, s)) {
+        return -1;
+    }
+    return viewRow;
+}
 
 // "36" or "0x24"; -1 for anything else.
-function parseRow(text) {
+function parseNumber(text) {
     const trimmed = text.trim();
     if (/^0x[0-9a-f]+$/i.test(trimmed)) {
         return parseInt(trimmed.slice(2), 16);
@@ -599,65 +630,6 @@ function parseRow(text) {
         return parseInt(trimmed, 10);
     }
     return -1;
-}
-
-function inspectedViewRow(s) {
-    const memory = MEMORIES[inspector.memory];
-    if (inspector.row < 0 || inspector.row >= memory.rows(s)) {
-        return -1;
-    }
-    return memory.viewRow(s, inspector.row);
-}
-
-// A PE row comes from /pes and keeps one register; a memory row comes from /rows.
-function inspectorUrl(viewRow) {
-    if (MEMORIES[inspector.memory].field !== undefined) {
-        return "/pes?first=" + viewRow + "&count=1";
-    }
-    return "/rows?memory=" + inspector.memory + "&first=" + viewRow + "&count=1";
-}
-
-function inspectorValues(bytes) {
-    const memory = MEMORIES[inspector.memory];
-    if (memory.field === undefined) {
-        return decodeRows(memory.kind, bytes, 1)[0];
-    }
-    return decodeRows("pe", bytes, 1)[0].map(function (pe) {
-        return pe[memory.field];
-    });
-}
-
-// Fetches the inspected row for the latest cycle; a page not in use reads as zeros, as it does in the machine.
-async function loadInspector() {
-    if (latest === null) {
-        return;
-    }
-    inspector.ticket = inspector.ticket + 1;
-    const ticket = inspector.ticket;
-    const memory = MEMORIES[inspector.memory];
-    const s = latest;
-    inspector.cycle = s.cycle;
-
-    const inRange = inspector.row >= 0 && inspector.row < memory.rows(s);
-    const viewRow = inspectedViewRow(s);
-    if (!inRange) {
-        inspector.values = null;
-    } else if (viewRow < 0) {
-        inspector.values = new Array(COLS).fill(0);
-    } else {
-        try {
-            const response = await fetch(inspectorUrl(viewRow));
-            if (!response.ok || ticket !== inspector.ticket) {
-                return;
-            }
-            inspector.values = inspectorValues(new DataView(await response.arrayBuffer()));
-        } catch (error) {
-            return;   // the simulator has gone away
-        }
-    }
-    if (ticket === inspector.ticket) {
-        renderInspector();
-    }
 }
 
 function formatValue(value, kind, asHex) {
@@ -670,92 +642,297 @@ function formatValue(value, kind, asHex) {
     return (value >>> 0).toString(16).toUpperCase().padStart(8, "0");
 }
 
-// Where the row is, in words: the real row, plus the tile or slot it falls in when that helps.
-function inspectorTitle(s) {
-    const memory = MEMORIES[inspector.memory];
-    const row = inspector.row;
-    let where = memory.name + " row " + hex(row);
-    if (memory.field !== undefined) {
-        where = memory.name + ", PE row " + row;
+// The width value columns start at, in characters: an int32 in hex, or in decimal up to six characters.
+function startingChars(asHex) {
+    if (asHex) {
+        return 8;
     }
-    if (inspector.memory === "wmem") {
-        where = where + " (tile " + hex(Math.floor(row / ROWS_PER_PAGE)) + ", row " + (row % ROWS_PER_PAGE) + ")";
-    }
-    if (inspector.memory === "fifo") {
-        const slot = Math.floor(row / ROWS_PER_PAGE);
-        where = where + " (slot " + slot + ", tile " + hex(s.wfifo.slots[slot].tile) + ", row " + (row % ROWS_PER_PAGE) + ")";
-    }
-    where = where + " at cycle " + inspector.cycle;
-    if (inspectedViewRow(s) < 0) {
-        where = where + ": never written, so every value is 0";
-    }
-    return where;
+    return 6;
 }
 
-// Why there is nothing to show: the row is past the memory's end; a row box that is not a number shows nothing at all.
-function inspectorProblem(s) {
-    const memory = MEMORIES[inspector.memory];
-    if (inspector.row < 0) {
-        return "";
-    }
-    const rows = memory.rows(s);
-    let now = "";
-    if (memory.changes) {
-        now = " right now";
-    }
-    if (rows === 0) {
-        return memory.name + " is empty" + now;
-    }
-    return memory.name + " has rows 0x0-" + hex(rows - 1) + now;
-}
+// Both viewers share one column width, so every memory's columns line up; it widens to the widest value drawn, never narrows.
+let columnChars = 0;
 
-// The 256 values, 16 to a line, each line labelled with its first column.
-function renderInspector() {
-    const grid = byId("inspect-values");
-    if (inspector.values === null) {
-        byId("inspect-title").textContent = inspectorProblem(latest);
-        grid.textContent = "";
-        return;
+// One half of the inspector: every row of one view, 256 values across, scrolled both ways; only the visible cells are drawn.
+class Viewer {
+    constructor(prefix, view) {
+        this.prefix = prefix;
+        this.view = view;          // a key of VIEWS
+        this.canvas = byId(prefix + "-values");
+        this.scroller = byId(prefix + "-scroll");
+        this.spacer = byId(prefix + "-spacer");
+        this.values = new Map();   // view row -> its 256 values, all from `cycle`
+        this.cycle = -1;
+        this.marked = -1;          // the view row typed into the row box, drawn highlighted
+        this.loading = false;
+        this.loadAgain = false;
+        const viewer = this;
+        this.scroller.addEventListener("scroll", function () {
+            viewer.draw();
+            viewer.load();
+        });
     }
-    byId("inspect-title").textContent = inspectorTitle(latest);
 
-    const kind = MEMORIES[inspector.memory].kind;
-    const asHex = byId("inspect-hex").checked;
-    const cells = [];
-    const corner = document.createElement("span");
-    corner.className = "label";
-    cells.push(corner);
-    for (let col = 0; col < 16; col++) {
-        const heading = document.createElement("span");
-        heading.className = "label";
-        heading.textContent = "+" + col.toString(16).toUpperCase();
-        cells.push(heading);
+    rowCount() {
+        if (latest === null) {
+            return 0;
+        }
+        return viewRowCount(VIEWS[this.view], latest);
     }
-    for (let line = 0; line < 16; line++) {
-        const label = document.createElement("span");
-        label.className = "label";
-        label.textContent = hex(line * 16);
-        cells.push(label);
-        for (let col = 0; col < 16; col++) {
-            const cell = document.createElement("span");
-            cell.textContent = formatValue(inspector.values[line * 16 + col], kind, asHex);
-            cells.push(cell);
+
+    // Memory rows are numbered in hex, PE rows in decimal, as elsewhere on the page.
+    rowLabel(viewRow) {
+        const view = VIEWS[this.view];
+        const realRow = realRowOf(view, latest, viewRow);
+        if (view.field !== undefined) {
+            return String(realRow);
+        }
+        return hex(realRow);
+    }
+
+    // Switches to another view, starting at its top.
+    show(view) {
+        this.view = view;
+        this.values.clear();
+        this.marked = -1;
+        this.scroller.scrollTop = 0;
+        this.scroller.scrollLeft = 0;
+        this.draw();
+        this.load();
+    }
+
+    // Scrolls a typed row to the top and highlights it; a row the view does not show is ignored.
+    goToRow(realRow) {
+        this.marked = -1;
+        if (latest !== null && realRow >= 0) {
+            this.marked = viewRowOf(VIEWS[this.view], latest, realRow);
+        }
+        if (this.marked >= 0) {
+            this.scroller.scrollTop = this.marked * VIEW_ROW;
+        }
+        this.draw();
+        this.load();
+    }
+
+    // A new snapshot: every value held belongs to an older cycle.
+    refresh(s) {
+        if (s.cycle !== this.cycle) {
+            this.values.clear();
+            this.cycle = s.cycle;
+        }
+        this.draw();
+        this.load();
+    }
+
+    visibleRows() {
+        const first = Math.floor(this.scroller.scrollTop / VIEW_ROW);
+        const shown = Math.ceil((this.scroller.clientHeight - VIEW_HEADER) / VIEW_ROW) + 1;
+        const count = Math.max(0, Math.min(shown, this.rowCount() - first));
+        return { first: first, count: count };
+    }
+
+    url(first, count) {
+        if (VIEWS[this.view].field !== undefined) {
+            return "/pes?first=" + first + "&count=" + count;
+        }
+        return "/rows?memory=" + this.view + "&first=" + first + "&count=" + count;
+    }
+
+    decode(bytes, count) {
+        const view = VIEWS[this.view];
+        if (view.field === undefined) {
+            return decodeRows(view.kind, bytes, count);
+        }
+        return decodeRows("pe", bytes, count).map(function (row) {
+            return row.map(function (pe) {
+                return pe[view.field];
+            });
+        });
+    }
+
+    // Fetches the visible rows not held yet; a call while one is in flight runs again once it lands.
+    async load() {
+        if (latest === null) {
+            return;
+        }
+        if (this.loading) {
+            this.loadAgain = true;
+            return;
+        }
+        const { first, count } = this.visibleRows();
+        const served = Math.min(first + count, servedRowCount(VIEWS[this.view], latest));
+        let filled = false;
+        for (let r = Math.max(first, served); r < first + count; r++) {
+            if (!this.values.has(r)) {
+                this.values.set(r, new Array(COLS).fill(0));   // not held by the simulator, so it reads as zeros
+                filled = true;
+            }
+        }
+        let missing = -1;
+        for (let r = first; r < served && missing < 0; r++) {
+            if (!this.values.has(r)) {
+                missing = r;
+            }
+        }
+        if (missing < 0) {
+            if (filled) {
+                this.draw();
+            }
+            return;
+        }
+
+        this.loading = true;
+        const view = this.view;
+        const cycle = this.cycle;
+        const asked = Math.min(served - missing, MOST_ROWS_ASKED);
+        try {
+            const response = await fetch(this.url(missing, asked));
+            if (response.ok && view === this.view && cycle === this.cycle) {
+                const rows = this.decode(new DataView(await response.arrayBuffer()), asked);
+                for (let i = 0; i < rows.length; i++) {
+                    this.values.set(missing + i, rows[i]);
+                }
+            }
+        } catch (error) {
+            // the simulator has gone away; the next snapshot will try again
+        }
+        this.loading = false;
+        this.draw();
+        if (this.loadAgain) {
+            this.loadAgain = false;
+            this.load();
         }
     }
-    grid.replaceChildren(...cells);
+
+    draw() {
+        const { context, width, height } = fitCanvas(this.canvas);
+        context.clearRect(0, 0, width, height);
+        if (latest === null) {
+            return;
+        }
+        const palette = readPalette();
+        const view = VIEWS[this.view];
+        const asHex = byId("inspect-hex").checked;
+        const { first, count } = this.visibleRows();
+        context.font = VIEW_FONT;
+        context.textBaseline = "middle";
+        context.textAlign = "right";
+
+        // Columns fit the widest value either viewer has drawn, so every value shows in full and both halves line up.
+        let widest = startingChars(asHex);
+        for (let r = first; r < first + count; r++) {
+            const values = this.values.get(r);
+            if (values === undefined) {
+                continue;
+            }
+            for (const value of values) {
+                widest = Math.max(widest, formatValue(value, view.kind, asHex).length);
+            }
+        }
+        if (widest > columnChars) {
+            columnChars = widest;
+            for (const other of viewers) {
+                if (other !== this) {
+                    other.draw();
+                }
+            }
+        }
+        const digit = context.measureText("0").width;
+        const column = Math.ceil(digit * columnChars) + 10;
+        let labelChars = LABEL_CHARS;
+        if (this.rowCount() > 0) {
+            labelChars = Math.max(LABEL_CHARS, this.rowLabel(this.rowCount() - 1).length);
+        }
+        const labels = Math.ceil(digit * labelChars) + 14;
+        this.spacer.style.width = (labels + COLS * column) + "px";
+        this.spacer.style.height = (VIEW_HEADER + this.rowCount() * VIEW_ROW) + "px";
+
+        const left = this.scroller.scrollLeft;
+        const top = this.scroller.scrollTop;
+        const firstCol = Math.max(0, Math.floor(left / column));
+        const lastCol = Math.min(COLS - 1, Math.floor((left + width - labels) / column));
+        const rowY = function (r) {
+            return VIEW_HEADER + r * VIEW_ROW - top;
+        };
+
+        if (this.marked >= first && this.marked < first + count) {
+            context.fillStyle = cssColor("--busy-soft");
+            context.fillRect(0, rowY(this.marked), width, VIEW_ROW);
+        }
+        context.fillStyle = palette.ink;
+        for (let r = first; r < first + count; r++) {
+            const values = this.values.get(r);
+            if (values === undefined) {
+                continue;
+            }
+            for (let c = firstCol; c <= lastCol; c++) {
+                context.fillText(formatValue(values[c], view.kind, asHex), labels + (c + 1) * column - left - 5, rowY(r) + VIEW_ROW / 2);
+            }
+        }
+
+        // Column numbers stay pinned along the top and row numbers down the left.
+        context.fillStyle = palette.panel;
+        context.fillRect(0, 0, width, VIEW_HEADER);
+        context.fillRect(0, VIEW_HEADER, labels, height);
+        if (this.marked >= first && this.marked < first + count) {
+            context.fillStyle = cssColor("--busy-soft");
+            context.fillRect(0, rowY(this.marked), labels, VIEW_ROW);
+        }
+        context.font = "bold " + VIEW_FONT;
+        context.fillStyle = palette.ink;
+        context.save();
+        context.beginPath();
+        context.rect(labels, 0, width - labels, VIEW_HEADER);
+        context.clip();   // a column number half under the row labels is cut off, not left as a sliver
+        for (let c = firstCol; c <= lastCol; c++) {
+            context.fillText(String(c), labels + (c + 1) * column - left - 5, VIEW_HEADER / 2);
+        }
+        context.restore();
+        for (let r = first; r < first + count; r++) {
+            if (rowY(r) + VIEW_ROW > VIEW_HEADER) {
+                context.fillText(this.rowLabel(r), labels - 8, rowY(r) + VIEW_ROW / 2);
+            }
+        }
+        context.fillStyle = palette.panel;
+        context.fillRect(0, 0, labels, VIEW_HEADER);
+    }
+}
+
+// Memories on the left, starting at host memory; the MXU's registers on the right, starting at its weights.
+const viewers = [new Viewer("left", "host"), new Viewer("right", "mxu_weight")];
+
+// The left menu lists the memories and the right menu the MXU's registers.
+function fillMenus() {
+    for (const viewer of viewers) {
+        const menu = byId(viewer.prefix + "-select");
+        for (const key of Object.keys(VIEWS)) {
+            const isMxu = VIEWS[key].field !== undefined;
+            if (isMxu === (viewer.prefix === "right")) {
+                const option = document.createElement("option");
+                option.value = key;
+                option.textContent = VIEWS[key].name;
+                menu.appendChild(option);
+            }
+        }
+        menu.value = viewer.view;
+    }
 }
 
 function listenInspector() {
-    const pick = function () {
-        inspector.memory = byId("inspect-memory").value;
-        inspector.row = parseRow(byId("inspect-row").value);
-        loadInspector();
-    };
-    byId("inspect-memory").addEventListener("change", pick);
-    byId("inspect-row").addEventListener("input", pick);
+    for (const viewer of viewers) {
+        const rowBox = byId(viewer.prefix + "-row");
+        byId(viewer.prefix + "-select").addEventListener("change", function (event) {
+            viewer.show(event.target.value);
+            viewer.goToRow(parseNumber(rowBox.value));
+        });
+        rowBox.addEventListener("input", function () {
+            viewer.goToRow(parseNumber(rowBox.value));
+        });
+    }
     byId("inspect-hex").addEventListener("change", function () {
-        if (inspector.values !== null) {
-            renderInspector();
+        columnChars = 0;
+        for (const viewer of viewers) {
+            viewer.draw();
         }
     });
 }
@@ -979,7 +1156,9 @@ function render(s) {
     paintBlocks(s);
     drawTimeline();
     showTimelineHover();
-    loadInspector();
+    for (const viewer of viewers) {
+        viewer.refresh(s);
+    }
 }
 
 function connect() {
@@ -995,9 +1174,14 @@ window.addEventListener("resize", function () {
         paintBlocks(latest);
         drawTimeline();
     }
+    for (const viewer of viewers) {
+        viewer.draw();
+        viewer.load();
+    }
 });
 
 listenButtons();
+fillMenus();
 listenInspector();
 listenTimeline();
 layoutArrows();

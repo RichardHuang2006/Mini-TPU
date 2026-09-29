@@ -51,10 +51,19 @@ std::string Shell::execute(const std::string& line) {
 }
 
 std::string Shell::move(const std::string& direction, const std::string& unit) {
+    return press([&]() { return move_once(direction, unit); });
+}
+
+std::string Shell::jump(Cycle cycle) {
+    return press([&]() { return jump_to(cycle); });
+}
+
+// A page button's work: under the lock, with an exception turned into "error: ..." text, then the observer told.
+std::string Shell::press(const std::function<std::string()>& work) {
     const std::lock_guard<std::mutex> lock(mutex_);
     std::string output;
     try {
-        output = move_once(direction, unit);
+        output = work();
     } catch (const std::exception& e) {
         output = std::string("error: ") + e.what();
     }
@@ -140,6 +149,17 @@ std::string Shell::move_once(const std::string& direction, const std::string& un
         }
     } else {
         throw std::invalid_argument("unit must be cycle or instruction, got '" + unit + "'");
+    }
+    return status_line(tpu_);
+}
+
+// Forward runs the cycles in between and stops early at Halt; back reloads and replays.
+std::string Shell::jump_to(Cycle cycle) {
+    require_program();
+    if (cycle > tpu_.cycle()) {
+        tpu_.run_cycles(cycle - tpu_.cycle());
+    } else if (cycle < tpu_.cycle()) {
+        tpu_.back_cycles(tpu_.cycle() - cycle);
     }
     return status_line(tpu_);
 }

@@ -120,6 +120,17 @@ void send_bad_request(int fd, const std::string& why) {
     send_all(fd, response);
 }
 
+// A button's reply: its text, sent as 400 when it starts with "error: ".
+void send_reply(int fd, const std::string& reply) {
+    if (reply.compare(0, 7, "error: ") == 0) {
+        send_bad_request(fd, reply);
+        return;
+    }
+    const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
+                             std::to_string(reply.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    send_all(fd, head + reply);
+}
+
 void send_not_found(int fd, const std::string& why) {
     const std::string response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: " +
                                  std::to_string(why.size()) + "\r\nConnection: close\r\n\r\n" + why;
@@ -201,6 +212,11 @@ void VizServer::on_move(MoveHandler handler) {
     move_ = std::move(handler);
 }
 
+void VizServer::on_jump(JumpHandler handler) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    jump_ = std::move(handler);
+}
+
 // Waits for connections, checking every 100 ms whether the server is shutting down.
 void VizServer::accept_loop() {
     while (!stopping_) {
@@ -237,9 +253,11 @@ void VizServer::serve(int fd) {
         query = target.substr(mark + 1);
     }
 
-    // The only POST is /move, so a page can step the machine but never load a file; everything else is a GET.
+    // The only POSTs are /move and /jump, so a page can step the machine but never load a file; everything else is a GET.
     if (method == "POST" && path == "/move") {
         serve_move(fd, query);
+    } else if (method == "POST" && path == "/jump") {
+        serve_jump(fd, query);
     } else if (method != "GET") {
         send_not_found(fd, "not found");
     } else if (path == "/rows" || path == "/pes") {
@@ -318,14 +336,22 @@ void VizServer::serve_move(int fd, const std::string& query) {
         return;
     }
 
-    const std::string reply = move(query_text(query, "direction"), query_text(query, "unit"));
-    if (reply.compare(0, 7, "error: ") == 0) {
-        send_bad_request(fd, reply);
+    send_reply(fd, move(query_text(query, "direction"), query_text(query, "unit")));
+}
+
+// A jump to a cycle, run outside the lock like a button press.
+void VizServer::serve_jump(int fd, const std::string& query) {
+    JumpHandler jump;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        jump = jump_;
+    }
+    u64 cycle = 0;
+    if (!jump || !query_number(query, "cycle", cycle)) {
+        send_bad_request(fd, "expected ?cycle=N");
         return;
     }
-    const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
-                             std::to_string(reply.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-    send_all(fd, head + reply);
+    send_reply(fd, jump(cycle));
 }
 
 // Every new snapshot goes out as `data: <json>`; a comment line every second finds pages that have gone away.

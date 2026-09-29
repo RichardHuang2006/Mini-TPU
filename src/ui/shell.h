@@ -1,4 +1,4 @@
-/// The command shell: the terminal loads programs, and the visualizer's buttons move them forward and back.
+/// The command shell: the terminal loads programs, and the visualizer's buttons move them forward, back or to a cycle.
 
 #pragma once
 
@@ -25,6 +25,9 @@ public:
     // One button press: direction is forward or back, unit is cycle or instruction; returns the status line or "error: ...".
     std::string move(const std::string& direction, const std::string& unit);
 
+    // Goes to cycle N, forward (stopping at Halt) or back from wherever the machine is; returns the status line or "error: ...".
+    std::string jump(Cycle cycle);
+
     bool quit_requested() const;
 
     // Called after every line and every press, so the visualizer can redraw.
@@ -37,7 +40,9 @@ private:
     std::function<void()> observer_;
 
     std::string run_command(const std::string& line);
+    std::string press(const std::function<std::string()>& work);
     std::string move_once(const std::string& direction, const std::string& unit);
+    std::string jump_to(Cycle cycle);
     std::string load(const std::vector<std::string>& words);
     void        require_program() const;
 };
