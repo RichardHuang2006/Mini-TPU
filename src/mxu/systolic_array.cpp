@@ -41,7 +41,6 @@ void SystolicArray::reset() {
     active_plane_ = 0;
     active_tile_  = -1;
 
-    shifting_tile_.clear();
     shadow_tile_  = -1;
     rows_shifted_ = 0;
     shadow_full_  = false;
@@ -90,32 +89,30 @@ void SystolicArray::tick() {
     }
 }
 
-// The shadow plane takes the next ready tile from the FIFO, then one 256-byte tile row per cycle.
+// The shadow plane copies the oldest ready FIFO tile one 256-byte row per cycle; the tile leaves the FIFO after its last row.
 void SystolicArray::shift_weights() {
     if (shadow_full_) {
         return;
     }
+    if (!fifo_.front_ready()) {
+        return;
+    }
 
-    const bool idle_shifter = shifting_tile_.empty();
-    if (idle_shifter) {
-        if (!fifo_.front_ready()) {
-            return;
-        }
-        shadow_tile_   = static_cast<int>(fifo_.tiles().front().tile);
-        shifting_tile_ = fifo_.pop();
-        rows_shifted_  = 0;
+    const FifoTile& front = fifo_.tiles().front();
+    if (rows_shifted_ == 0) {
+        shadow_tile_ = static_cast<int>(front.tile);
     }
 
     const std::size_t row_start = static_cast<std::size_t>(rows_shifted_) * kDim;
     std::vector<i8>& shadow = planes_[shadow_plane()];
     for (u32 n = 0; n < kDim; ++n) {
-        shadow[row_start + n] = shifting_tile_[row_start + n];
+        shadow[row_start + n] = front.bytes[row_start + n];
     }
     rows_shifted_ = rows_shifted_ + 1;
 
     if (rows_shifted_ == kDim) {
         shadow_full_ = true;
-        shifting_tile_.clear();
+        fifo_.pop();
     }
 }
 
@@ -188,7 +185,8 @@ bool SystolicArray::busy() const {
 }
 
 bool SystolicArray::shifting() const {
-    return !shifting_tile_.empty();
+    const bool started = rows_shifted_ > 0;
+    return started && !shadow_full_;
 }
 
 bool SystolicArray::shadow_ready() const {

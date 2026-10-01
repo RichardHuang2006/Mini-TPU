@@ -62,8 +62,7 @@ private:
     int active_plane_ = 0;
     int active_tile_  = -1;
 
-    // The weight shifter: fills the shadow plane from the FIFO, one tile row per cycle.
-    std::vector<i8> shifting_tile_;
+    // The weight shifter: fills the shadow plane from the oldest FIFO slot, one tile row per cycle.
     int  shadow_tile_  = -1;
     u32  rows_shifted_ = 0;
     bool shadow_full_  = false;

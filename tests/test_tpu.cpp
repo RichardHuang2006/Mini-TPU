@@ -164,7 +164,12 @@ TEST(tpu_read_weights_issues_before_the_tile_arrives) {
     CHECK_EQ(tpu.pc(), u32{1});
     CHECK(tpu.weight_fifo().fetching());
 
-    // The tile arrives on cycle 1365 and the MXU takes it the same cycle, shifting one row per cycle through 1620.
+    // The tile arrives on cycle 1365 and stays in its FIFO slot while the MXU copies one row per cycle through 1620.
+    tpu.run_cycles(1400);
+    CHECK(tpu.mxu().shifting());
+    CHECK_EQ(tpu.mxu().rows_shifted(), u32{36});
+    CHECK_EQ(tpu.weight_fifo().tiles().size(), std::size_t{1});
+
     tpu.run_to_halt();
     CHECK_EQ(tpu.cycle(), Cycle{1622});
     CHECK_EQ(tpu.stats().stalled(Stall::WaitForIdle), u64{1620});
@@ -187,9 +192,9 @@ TEST(tpu_mxu_frees_a_fifo_slot_for_the_fifth_tile) {
     tpu.run_cycles(100);
     CHECK(tpu.stall() == Stall::WeightFifoFull);
 
-    // Tile 0 arrives on cycle 1365 and moves into the shadow plane, so the fifth Read_Weights issues on cycle 1366.
+    // Tile 0 arrives on cycle 1365 and leaves the FIFO after its last row shifts in on 1620, so the fifth Read_Weights issues on 1621.
     tpu.run_to_halt();
-    CHECK_EQ(tpu.stats().stalled(Stall::WeightFifoFull), u64{1362});
+    CHECK_EQ(tpu.stats().stalled(Stall::WeightFifoFull), u64{1617});
     CHECK_EQ(tpu.cycle(), Cycle{5 * 1366 + 1});   // Halt waits for the fifth tile, which arrives on cycle 6829
     CHECK_EQ(tpu.weight_fifo().tiles().size(), std::size_t{4});
 }

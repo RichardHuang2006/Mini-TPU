@@ -23,7 +23,7 @@ The machine is deterministic, and `load` is the only way data enters it. That ma
 **Weight FIFO (DDR3).** Four slots of 64 KiB. `Read_Weights` reserves a slot, and one DDR3 channel fills the slots in order at 48 bytes per cycle, so a tile takes 1,366 cycles (1,365 full cycles and one of 16 bytes). This is decoupled access: the instruction issues as soon as a slot is free, without waiting for the data.
 
 **Weight shifter and the two weight planes.** Each PE holds two weights: an active one, and a shadow one being loaded.
-- **Filling the shadow plane:** when the shadow plane is empty and the oldest FIFO tile has fully arrived, the shifter takes that tile and moves it in one 256-byte row per cycle, 256 cycles in all. This frees its FIFO slot.
+- **Filling the shadow plane:** when the shadow plane is empty and the oldest FIFO tile has fully arrived, the shifter copies that tile in one 256-byte row per cycle, straight from its FIFO slot, 256 cycles in all. The slot frees after the last row.
 - **Switching planes:** `MatrixMultiply new_weights=1` makes the full shadow plane active at no cost, and the old active plane becomes the next shadow.
 - **Overlap:** the next tile shifts in while the array computes with the current one.
 
